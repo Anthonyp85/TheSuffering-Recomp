@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[Desktop Entry]
+Type=Application
+Name=The Suffering (Native Recomp)
+GenericName=Action Horror Game
+Comment=The Suffering (USA) Native Linux Static Recompilation (Vulkan 1.2 + SDL3)
+Exec=suffering
+Icon=the-suffering-recomp
+Terminal=false
+Categories=Game;ActionGame;
+StartupNotify=true

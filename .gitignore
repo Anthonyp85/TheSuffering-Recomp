@@ -1,0 +1,72 @@
+# Copyrighted Xbox disc images, archives, executables, and extracted game assets
+/Suffering, The (USA)/
+*.7z
+*.iso
+*.xiso
+*.xiso.iso
+*.xbe
+*.gdf
+*.vdu
+*.sdu
+*.tdu
+*.mdu
+*.adu
+*.ldu
+*.lvl
+*.odu
+*.wdu
+*.qdu
+*.xdu
+*.fdu
+*.xpu
+
+# Private local workspace (extracted XBE, forensic reports, XDK analysis scratch)
+/.local/
+.local/
+
+# Build outputs
+/out/
+/build/
+/build*/
+/compiler/
+*.zip
+*.pdb
+*.exe
+*.dll
+*.lib
+*.exp
+*.obj
+*.o
+
+# Recompiled code derived from the original XBE
+/generated/
+
+# User's own game files
+/assets/
+
+# Runtime files, logs, virtual Xbox HDD, captures, and crash dumps
+settings.toml
+display.bin
+launch.bin
+/logs/
+/cache/
+cache/
+/hdd/
+/hdd*/
+/CrashDumps/
+/textures/dumps/
+*.dmp
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Reverse engineering artifacts (Ghidra databases, exported PEs)
+*.gpr
+*.rep/
+*.pe
+
+# Editors / IDEs
+.vs/
+.vscode/
+.idea/

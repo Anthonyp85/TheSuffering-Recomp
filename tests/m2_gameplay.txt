@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Reproducible Milestone 2 gameplay verification script for The Suffering (USA)
+# Format: <start_ms> <end_ms> <BUTTON_OR_AXIS>
+
+# Advance through startup logos / legal screen to Title Screen (~22.5s)
+3000 3300 A
+7000 7300 A
+11000 11300 A
+15000 15300 A
+
+# Hold on Title Screen for capture (~23.5s), then select New Game -> Difficulty -> Brightness -> Level 1
+24500 24850 A
+26500 26850 A
+28000 28350 A
+
+# Skip opening Level 1 in-engine cutscene (A only; do not press BACK which opens Map)
+36500 36850 A
+38500 38850 A
+
+# Active 3D gameplay in Abbott State Penitentiary (capture #4 at 41.5s before movement)
+# Walk forward, turn camera right, attack/interact
+42500 44500 LY+
+44500 46500 RX+
+47000 47400 RT
+47800 48200 X
+
+# Capture #5 at 49.5s after movement/camera pan, then open Pause Menu
+50500 50850 START
+
+# Capture #6 at 52.0s on Pause Menu, then resume and move/look left
+53000 53350 START
+54000 56500 LY+
+54000 56500 RX-

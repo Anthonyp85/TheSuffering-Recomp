@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Milestone 3 Deterministic Regression Source Script for The Suffering (USA)
+# Timestamps are in milliseconds relative to poll_id == 0 (first guest XInputGetState poll).
+# Format: <start_ms> <end_ms> <TOKEN>  (supports parameterized tokens e.g. LY:6000, RT:100)
+# Menu D-pad / button taps use crisp 100 ms holds (6 frames) to avoid UI auto-repeat (~200 ms).
+
+# ==============================================================================
+# Stage 1: Startup logos/FMVs -> Title Screen -> Options -> Controller -> Title
+# ==============================================================================
+3000 3100 A
+7000 7100 A
+11000 11100 A
+15000 15100 A
+
+# Title Screen active (~21-22s): DOWN x2 to Options (Continue is disabled), A -> Options Menu
+23000 23100 DOWN
+23800 23900 DOWN
+24600 24700 A
+
+# Options Menu -> A (Controller Settings), hold 1.2s, B (Options), B (Title Screen)
+26000 26100 A
+27800 27900 B
+28800 28900 B
+
+# Return to New Game (UP x2 from Options), then New Game -> Difficulty -> Brightness
+29800 29900 UP
+30500 30600 UP
+31500 31600 A
+33500 33600 A
+35500 35600 A
+
+# ==============================================================================
+# Stage 2: Enter 1a PrisonDeathRow & Skip Opening In-Engine Cutscene
+# ==============================================================================
+43500 43600 A
+45500 45600 A
+
+# ==============================================================================
+# Stage 3: Deadzone / Trigger Threshold Audit & Full Gameplay Action Coverage
+# ==============================================================================
+# Sub-deadzone stick (LY:6000 < 9830) + sub-threshold trigger (RT:100 < 141): must keep cam stationary
+47500 48400 LY:6000
+47500 48400 RT:100
+
+# Active movement: forward, strafe left, strafe right, walk backward
+49200 50800 LY:28000
+51000 51800 LX:-26000
+52000 52800 LX:26000
+53000 53700 LY:-26000
+
+# Camera look: yaw right, pitch up, yaw left
+54000 55000 RX:22000
+55100 55700 RY:16000
+55800 56800 RX:-22000
+
+# Gameplay buttons: Jump (A), Use (X), Attack (RT:255 >= 141), 1st-Person (WHITE toggle),
+# Xombium (BLACK), D-Pad (UP, RIGHT)
+57100 57250 A
+57600 57750 X
+58100 58450 RT:255
+58800 58950 WHITE
+59600 59750 WHITE
+60200 60350 BLACK
+60800 60900 UP
+61300 61400 RIGHT
+
+# ==============================================================================
+# Stage 4: Pause -> Resume -> Move -> Pause -> Revert To Last Checkpoint
+# ==============================================================================
+# Pause (START), hold 1.4s, Resume (START)
+62200 62300 START
+63900 64000 START
+
+# Walk forward + look right so position clearly diverges from spawn before Revert
+64700 66200 LY:28000
+64700 66200 RX:18000
+
+# Open Pause -> DOWN x3 (Revert To Last Checkpoint) -> A -> LEFT (Yes) -> A (Confirm)
+66800 66900 START
+67800 67900 DOWN
+68400 68500 DOWN
+69000 69100 DOWN
+69800 69900 A
+70800 70900 LEFT
+71600 71700 A
+
+# Skip post-revert intro cutscene so Torque spawns back in cell at exact spawn_cam
+75800 75900 A
+77300 77400 A
+
+# ==============================================================================
+# Stage 5: Pause -> Quit Game -> Title Screen -> New Game Restart -> Clean Exit
+# ==============================================================================
+# Open Pause -> DOWN x6 (Quit Game) -> A -> LEFT (Yes) -> A (Confirm)
+80500 80600 START
+81500 81600 DOWN
+82000 82100 DOWN
+82500 82600 DOWN
+83000 83100 DOWN
+83500 83600 DOWN
+84000 84100 DOWN
+84800 84900 A
+85800 85900 LEFT
+86600 86700 A
+
+# Title Screen returns (~89-91s, session=3 mode=1 level=""): New Game -> Difficulty -> Brightness
+92000 92100 A
+94000 94100 A
+96000 96100 A
+
+# Skip restarted opening cutscene so Torque re-enters active cell gameplay
+101500 101600 A
+103000 103100 A
