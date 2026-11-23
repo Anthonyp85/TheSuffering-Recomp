@@ -147,6 +147,37 @@ void MkbNotifyScheme1HookApplied();
 bool MkbIsMouseLookActive();
 bool MkbConsumeMouseLook(float dt, float guest_sens_x, float guest_sens_y, float& out_look_x, float& out_look_y);
 
+// Host physical backbuffer pixels -> Xbox guest UI pixel coordinates (nominally 640x480).
+struct GuestUiPoint {
+    float gx = 320.0f;          // unclamped guest X
+    float gy = 240.0f;          // unclamped guest Y
+    float gx_clamped = 320.0f;  // clamped to [0..guest_w]
+    float gy_clamped = 240.0f;  // clamped to [0..guest_h]
+    bool in_viewport = false;
+};
+
+GuestUiPoint MkbTransformPhysicalToGuestUi(float phys_x, float phys_y, uint32_t bb_w, uint32_t bb_h, uint32_t vp_w,
+                                           uint32_t vp_h, uint32_t render_w, uint32_t render_h,
+                                           uint32_t active_upscaler_mode, bool widescreen, float guest_w = 640.0f,
+                                           float guest_h = 480.0f);
+
+// Per-frame menu mouse snapshot consumed on guest thread by CUIMgr::Update hook in src/game/hooks.cpp.
+struct MenuMouseFrame {
+    bool active = false;        // false when replay/autotest, ControllerOnly, unfocused, or ImGui overlay open
+    bool moved = false;         // true ONLY when host cursor physical pixel coords actually changed
+    bool has_pos = false;
+    GuestUiPoint pt{};
+    bool lmb_pressed = false;   // rising edge this UI frame
+    bool lmb_down = false;      // currently held (for continuous slider drag / map pan)
+    bool lmb_released = false;  // falling edge this UI frame
+    bool rmb_pressed = false;   // rising edge this UI frame
+    int wheel_steps = 0;        // +up / -down notches accumulated since last consume
+};
+
+MenuMouseFrame MkbConsumeMenuMouse(float guest_w = 640.0f, float guest_h = 480.0f);
+void MkbSetLastMenuDebugState(uint32_t top_vt, int32_t focused_idx, float guest_gx, float guest_gy, bool in_vp);
+bool MkbRunMenuCoordSelfTest();
+
 // Automated test harness support (--test-mkb / --mkb-telemetry)
 bool MkbIsSyntheticTestActive();
 void MkbAdvanceSyntheticEvents();

@@ -642,7 +642,7 @@ bool RunLauncher(void* hinstance) {
     RegisterClassExW(&wc);
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    HWND hwnd = CreateWindowExW(0, class_name.c_str(), L"The Suffering - PC Recompilation Launcher (v1.3.1)", style,
+    HWND hwnd = CreateWindowExW(0, class_name.c_str(), L"The Suffering - PC Recompilation Launcher (v1.4.0)", style,
                                 work.left + 40, work.top + 40, 920, 620, nullptr, nullptr, inst, nullptr);
     if (!hwnd) {
         UnregisterClassW(class_name.c_str(), inst);
@@ -798,7 +798,7 @@ bool RunLauncher(void* hinstance) {
             if (lctx.fonts.heading) ImGui::PushFont(lctx.fonts.heading);
             ImGui::TextColored(ImVec4(0.96f, 0.34f, 0.34f, 1.0f), "THE SUFFERING");
             ImGui::SameLine();
-            ImGui::TextUnformatted("- PC Recompilation Launcher v1.3.1");
+            ImGui::TextUnformatted("- PC Recompilation Launcher v1.4.0");
             if (lctx.fonts.heading) ImGui::PopFont();
 
             std::string gpu_line = active_gpu ? active_gpu->name : "Default D3D12 GPU";
@@ -1192,7 +1192,7 @@ bool RunLauncher(void* /*hinstance*/) {
         wflags |= SDL_WINDOW_RESIZABLE;
     }
 
-    SDL_Window* win = SDL_CreateWindow("The Suffering - PC Recompilation Launcher (v1.3.1)", init_w, init_h, wflags);
+    SDL_Window* win = SDL_CreateWindow("The Suffering - PC Recompilation Launcher (v1.4.0)", init_w, init_h, wflags);
     if (!win) {
         LOGW("launcher: SDL_CreateWindow failed (%s); continuing directly to game", SDL_GetError());
         return true;
@@ -1342,7 +1342,7 @@ bool RunLauncher(void* /*hinstance*/) {
             if (fonts.heading) ImGui::PushFont(fonts.heading);
             ImGui::TextColored(ImVec4(0.96f, 0.34f, 0.34f, 1.0f), "THE SUFFERING");
             ImGui::SameLine();
-            ImGui::TextUnformatted("- PC Recompilation Launcher v1.3.1");
+            ImGui::TextUnformatted("- PC Recompilation Launcher v1.4.0");
             if (fonts.heading) ImGui::PopFont();
 
             std::string gpu_line = active_gpu ? active_gpu->name : "Default Vulkan 1.2 GPU";

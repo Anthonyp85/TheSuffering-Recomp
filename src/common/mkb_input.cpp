@@ -19,7 +19,10 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <climits>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +39,7 @@
 #include "app/app.h"
 #include "core/input.h"
 #include "core/log.h"
+#include "gpu/backend.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 
@@ -272,6 +276,9 @@ struct MkbRuntimeState {
     std::mutex input_lock;
     std::array<bool, 256> keys{};
     std::array<bool, 5> mouse_buttons{};  // 0=L, 1=R, 2=M, 3=X1, 4=X2
+    uint8_t suppressed_mouse_mask = 0;    // bits 0..4: latched on menu click or menu->3D transition until button-up
+    bool prev_in_3d_gameplay = false;
+    int cutscene_lmb_skip_polls = 0;
     double raw_dx = 0.0;
     double raw_dy = 0.0;
     float smooth_dx = 0.0f;
@@ -284,6 +291,30 @@ struct MkbRuntimeState {
     int wheel_down_gap = 0;
     bool esc_was_down = false;
     EscLatch esc_latch = EscLatch::None;
+
+    // Native menu mouse state (protected by input_lock)
+    float menu_phys_x = 0.0f;
+    float menu_phys_y = 0.0f;
+    int menu_last_px = INT_MIN;
+    int menu_last_py = INT_MIN;
+    uint64_t menu_move_seq = 0;
+    uint64_t menu_consumed_move_seq = 0;
+    bool menu_has_pos = false;
+    bool menu_lmb_pressed = false;
+    bool menu_lmb_down = false;
+    bool menu_lmb_released = false;
+    bool menu_rmb_pressed = false;
+    int menu_wheel_steps = 0;
+    int menu_wheel_rem = 0;
+    float menu_wheel_frem = 0.0f;
+    bool menu_captured_hwnd = false;
+
+    // Last observed menu UI state for telemetry (updated on guest thread)
+    std::atomic<uint32_t> dbg_top_vt{0};
+    std::atomic<int32_t> dbg_focused_idx{-1};
+    std::atomic<float> dbg_guest_gx{0.0f};
+    std::atomic<float> dbg_guest_gy{0.0f};
+    std::atomic<bool> dbg_in_vp{false};
 
     // Focus, window, & cursor capture state
     std::atomic<void*> game_hwnd{nullptr};
@@ -384,9 +415,86 @@ uint16_t NormalizeVirtualKey(WPARAM wp, LPARAM lp) {
 }
 #endif
 
+void ClearMenuPendingLocked(MkbRuntimeState& rt) {
+    rt.menu_lmb_pressed = false;
+    rt.menu_lmb_down = false;
+    rt.menu_lmb_released = false;
+    rt.menu_rmb_pressed = false;
+    rt.menu_wheel_steps = 0;
+    rt.menu_wheel_rem = 0;
+    rt.menu_wheel_frem = 0.0f;
+}
+
+void UpdateMenuCursorPhysLocked(MkbRuntimeState& rt, float phys_x, float phys_y) {
+    rt.menu_phys_x = phys_x;
+    rt.menu_phys_y = phys_y;
+    rt.menu_has_pos = true;
+    int ix = int(std::lround(phys_x));
+    int iy = int(std::lround(phys_y));
+    if (ix != rt.menu_last_px || iy != rt.menu_last_py) {
+        rt.menu_last_px = ix;
+        rt.menu_last_py = iy;
+        ++rt.menu_move_seq;
+    }
+}
+
+void ReleaseMenuDragCapture(MkbRuntimeState& rt, void* hwnd_ptr) {
+    if (!rt.menu_captured_hwnd) return;
+    rt.menu_captured_hwnd = false;
+#ifdef _WIN32
+    HWND hwnd = static_cast<HWND>(hwnd_ptr);
+    if (hwnd && GetCapture() == hwnd) ReleaseCapture();
+#else
+    (void)hwnd_ptr;
+    SDL_CaptureMouse(false);
+#endif
+}
+
+void ClientToPhysicalCoords(void* hwnd_ptr, float cx, float cy, float& out_px, float& out_py) {
+    gpu::UpscalerStatus us = gpu::GetUpscalerStatus();
+#ifdef _WIN32
+    HWND hwnd = static_cast<HWND>(hwnd_ptr);
+    RECT rc{};
+    if (hwnd && GetClientRect(hwnd, &rc)) {
+        int cw = rc.right - rc.left;
+        int ch = rc.bottom - rc.top;
+        if (cw > 0 && ch > 0 && us.bb_w > 0 && us.bb_h > 0) {
+            out_px = cx * (float(us.bb_w) / float(cw));
+            out_py = cy * (float(us.bb_h) / float(ch));
+            return;
+        }
+    }
+    out_px = cx;
+    out_py = cy;
+#else
+    SDL_Window* win = static_cast<SDL_Window*>(hwnd_ptr);
+    if (win) {
+        int lw = 0, lh = 0;
+        SDL_GetWindowSize(win, &lw, &lh);
+        uint32_t bw = us.bb_w;
+        uint32_t bh = us.bb_h;
+        if (bw == 0 || bh == 0) {
+            int pw = 0, ph = 0;
+            SDL_GetWindowSizeInPixels(win, &pw, &ph);
+            bw = uint32_t(std::max(pw, 0));
+            bh = uint32_t(std::max(ph, 0));
+        }
+        if (lw > 0 && lh > 0 && bw > 0 && bh > 0) {
+            out_px = cx * (float(bw) / float(lw));
+            out_py = cy * (float(bh) / float(lh));
+            return;
+        }
+    }
+    out_px = cx;
+    out_py = cy;
+#endif
+}
+
 void ClearAllHeldInputsLocked(MkbRuntimeState& rt) {
     rt.keys.fill(false);
     rt.mouse_buttons.fill(false);
+    rt.suppressed_mouse_mask = 0;
+    rt.cutscene_lmb_skip_polls = 0;
     rt.raw_dx = 0.0;
     rt.raw_dy = 0.0;
     rt.smooth_dx = 0.0f;
@@ -399,6 +507,7 @@ void ClearAllHeldInputsLocked(MkbRuntimeState& rt) {
     rt.wheel_down_gap = 0;
     rt.esc_was_down = false;
     rt.esc_latch = EscLatch::None;
+    ClearMenuPendingLocked(rt);
 }
 
 bool IsKeyPressedLocked(const MkbRuntimeState& rt, uint16_t vk) {
@@ -415,11 +524,11 @@ bool IsSlotActiveLocked(const MkbRuntimeState& rt, const BindSlot& slot) {
     switch (slot.kind) {
         case BindKind::None: return false;
         case BindKind::Key: return IsKeyPressedLocked(rt, slot.vk);
-        case BindKind::MouseLeft: return rt.mouse_buttons[0];
-        case BindKind::MouseRight: return rt.mouse_buttons[1];
-        case BindKind::MouseMiddle: return rt.mouse_buttons[2];
-        case BindKind::Mouse4: return rt.mouse_buttons[3];
-        case BindKind::Mouse5: return rt.mouse_buttons[4];
+        case BindKind::MouseLeft: return rt.mouse_buttons[0] && ((rt.suppressed_mouse_mask & uint8_t(1u << 0)) == 0u);
+        case BindKind::MouseRight: return rt.mouse_buttons[1] && ((rt.suppressed_mouse_mask & uint8_t(1u << 1)) == 0u);
+        case BindKind::MouseMiddle: return rt.mouse_buttons[2] && ((rt.suppressed_mouse_mask & uint8_t(1u << 2)) == 0u);
+        case BindKind::Mouse4: return rt.mouse_buttons[3] && ((rt.suppressed_mouse_mask & uint8_t(1u << 3)) == 0u);
+        case BindKind::Mouse5: return rt.mouse_buttons[4] && ((rt.suppressed_mouse_mask & uint8_t(1u << 4)) == 0u);
         case BindKind::WheelUp: return rt.wheel_up_hold > 0;
         case BindKind::WheelDown: return rt.wheel_down_hold > 0;
     }
@@ -450,7 +559,9 @@ void AdvanceWheelQueue(int& queue, int& hold, int& gap) {
 #ifdef _WIN32
 void ApplyClipRect(HWND hwnd, bool capture) {
     MkbRuntimeState& rt = Rt();
+    if (app::IsReplayOrAutotestActive()) return;
     if (capture && hwnd && IsWindow(hwnd)) {
+        ReleaseMenuDragCapture(rt, hwnd);
         RECT cr{};
         if (GetClientRect(hwnd, &cr) && cr.right > cr.left + 2 && cr.bottom > cr.top + 2) {
             POINT tl{cr.left + 1, cr.top + 1};
@@ -467,8 +578,15 @@ void ApplyClipRect(HWND hwnd, bool capture) {
     ClipCursor(nullptr);
     rt.cursor_captured.store(false, std::memory_order_release);
     if (hwnd && IsWindow(hwnd)) {
-        bool show = UiIsOverlayOpen() || app::Get().display_mode == app::DisplayMode::Windowed ||
-                    rt.cfg.input_mode != InputMode::ControllerOnly;
+        bool show = UiIsOverlayOpen() || rt.cfg.input_mode != InputMode::ControllerOnly;
+        if (show) {
+            CURSORINFO ci{};
+            ci.cbSize = sizeof(ci);
+            if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) == 0) {
+                for (int i = 0; i < 8 && ShowCursor(TRUE) < 0; ++i) {
+                }
+            }
+        }
         POINT pt{};
         RECT rc{};
         if (GetCursorPos(&pt) && ScreenToClient(hwnd, &pt) && GetClientRect(hwnd, &rc) && PtInRect(&rc, pt)) {
@@ -479,8 +597,10 @@ void ApplyClipRect(HWND hwnd, bool capture) {
 #else
 void ApplyClipRect(void* win_ptr, bool capture) {
     MkbRuntimeState& rt = Rt();
+    if (app::IsReplayOrAutotestActive()) return;
     SDL_Window* win = static_cast<SDL_Window*>(win_ptr);
     if (capture && win) {
+        ReleaseMenuDragCapture(rt, win_ptr);
         SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, "0");
         if (SDL_SetWindowRelativeMouseMode(win, true)) {
             rt.cursor_captured.store(true, std::memory_order_release);
@@ -490,8 +610,7 @@ void ApplyClipRect(void* win_ptr, bool capture) {
     if (win) SDL_SetWindowRelativeMouseMode(win, false);
     rt.cursor_captured.store(false, std::memory_order_release);
     if (win) {
-        bool show = UiIsOverlayOpen() || app::Get().display_mode == app::DisplayMode::Windowed ||
-                    rt.cfg.input_mode != InputMode::ControllerOnly;
+        bool show = UiIsOverlayOpen() || rt.cfg.input_mode != InputMode::ControllerOnly;
         if (show) SDL_ShowCursor();
         else SDL_HideCursor();
     }
@@ -522,6 +641,20 @@ void WriteTelemetryLine(MkbRuntimeState& rt, uint64_t poll_id, uint64_t ms, cons
             SafeReadF32(player + 0x59Au, pitch_deg);
         }
     }
+    float audio_sfx = -1.0f;
+    float sens_x = -1.0f;
+    SafeReadF32(0x002DB218u + 0x0Cu, audio_sfx);
+    SafeReadF32(0x002DB23Cu, sens_x);
+    uint8_t suppressed_mask = 0;
+    {
+        std::lock_guard<std::mutex> lock(rt.input_lock);
+        suppressed_mask = rt.suppressed_mouse_mask;
+    }
+    uint32_t top_vt = rt.dbg_top_vt.load(std::memory_order_relaxed);
+    int32_t focus_idx = rt.dbg_focused_idx.load(std::memory_order_relaxed);
+    float guest_gx = rt.dbg_guest_gx.load(std::memory_order_relaxed);
+    float guest_gy = rt.dbg_guest_gy.load(std::memory_order_relaxed);
+    bool in_vp = rt.dbg_in_vp.load(std::memory_order_relaxed);
     std::fprintf(
         rt.telemetry_file,
         "{\"poll\":%llu,\"ms\":%llu,\"session\":%u,\"mode\":%u,\"pause\":%u,\"ui_stack\":%d,\"loading\":%u,"
@@ -529,7 +662,8 @@ void WriteTelemetryLine(MkbRuntimeState& rt, uint64_t poll_id, uint64_t ms, cons
         "\"captured\":%s,\"mouse_look\":%s,\"scheme1\":%s,\"pad_conn\":%s,\"pad_btns\":%u,\"pad_a0\":%u,"
         "\"pad_a1\":%u,\"pad_a2\":%u,\"pad_a3\":%u,\"pad_a4\":%u,\"pad_a5\":%u,\"pad_lt\":%u,\"pad_rt\":%u,"
         "\"pad_lx\":%d,\"pad_ly\":%d,\"cam_pos\":[%.4f,%.4f,%.4f],\"cam_fwd\":[%.6f,%.6f,%.6f],"
-        "\"pitch\":%.5f,\"event\":\"%s\"}\n",
+        "\"pitch\":%.5f,\"top_vt\":%u,\"focus_idx\":%d,\"suppressed_mask\":%u,"
+        "\"guest_gx\":%.2f,\"guest_gy\":%.2f,\"in_vp\":%s,\"audio_sfx\":%.3f,\"sens_x\":%.3f,\"event\":\"%s\"}\n",
         (unsigned long long)poll_id, (unsigned long long)ms, gc.session, gc.mode, gc.pause_flags, gc.ui_stack,
         gc.loading_ptr != 0 ? 1u : 0u, gc.fmv ? "true" : "false", gc.cutscene ? "true" : "false",
         gc.in_active_3d_gameplay ? "true" : "false", overlay_open ? "true" : "false",
@@ -540,7 +674,8 @@ void WriteTelemetryLine(MkbRuntimeState& rt, uint64_t poll_id, uint64_t ms, cons
         unsigned(pad.buttons), unsigned(pad.analog[0]), unsigned(pad.analog[1]), unsigned(pad.analog[2]),
         unsigned(pad.analog[3]), unsigned(pad.analog[4]), unsigned(pad.analog[5]), unsigned(pad.analog[6]),
         unsigned(pad.analog[7]), int(pad.lx), int(pad.ly), cam_x, cam_y, cam_z, fwd_x, fwd_y, fwd_z, pitch_deg,
-        event_tag ? event_tag : "");
+        top_vt, focus_idx, unsigned(suppressed_mask), guest_gx, guest_gy, in_vp ? "true" : "false", audio_sfx,
+        sens_x, event_tag ? event_tag : "");
     std::fflush(rt.telemetry_file);
 }
 
@@ -558,9 +693,9 @@ void LoadSyntheticTestScript(MkbRuntimeState& rt, const fs::path& script_path) {
         SyntheticEvent ev{};
         if (!(iss >> ev.at_ms >> ev.cmd)) continue;
         ev.cmd = LowerAscii(ev.cmd);
-        if (ev.cmd == "mouse") {
+        if (ev.cmd == "mouse" || ev.cmd == "menu_cursor") {
             iss >> ev.val1 >> ev.val2;
-        } else if (ev.cmd == "wheel" || ev.cmd == "overlay" || ev.cmd == "focus") {
+        } else if (ev.cmd == "wheel" || ev.cmd == "menu_wheel" || ev.cmd == "overlay" || ev.cmd == "focus") {
             iss >> ev.val1;
         } else if (ev.cmd == "keydown" || ev.cmd == "keyup" || ev.cmd == "mbtn_down" || ev.cmd == "mbtn_up") {
             iss >> ev.arg1;
@@ -937,6 +1072,10 @@ void MkbInit() {
     LOGR("mkb: initialized (mode=%s, sens=%.2f, invert_y=%s, raw_aim=%s, smoothing=%s)",
          InputModeToken(rt.cfg.input_mode), rt.cfg.mouse_sensitivity, rt.cfg.mouse_invert_y ? "true" : "false",
          rt.cfg.mouse_raw_aim ? "true" : "false", rt.cfg.mouse_smoothing ? "true" : "false");
+    if (rt.test_active || rt.telemetry_file) {
+        bool ok = MkbRunMenuCoordSelfTest();
+        LOGR("mkb: menu_coord_selftest=%s", ok ? "PASS" : "FAIL");
+    }
 }
 
 void MkbOnWindow(void* hwnd_ptr) {
@@ -955,12 +1094,13 @@ void MkbOnWindow(void* hwnd_ptr) {
     if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
         LOGW("mkb: RegisterRawInputDevices(mouse) failed (err=%lu)", GetLastError());
     }
-    rt.focused.store(GetForegroundWindow() == hwnd, std::memory_order_release);
+    rt.focused.store(rt.test_active || GetForegroundWindow() == hwnd, std::memory_order_release);
 #else
     SDL_Window* win = static_cast<SDL_Window*>(hwnd_ptr);
     if (!win) return;
     SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, "0");
-    rt.focused.store((SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) != 0, std::memory_order_release);
+    rt.focused.store(rt.test_active || (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) != 0,
+                     std::memory_order_release);
 #endif
 }
 
@@ -1235,6 +1375,7 @@ void MkbForceReleaseCursor(void* hwnd_ptr) {
         std::lock_guard<std::mutex> lock(rt.input_lock);
         ClearAllHeldInputsLocked(rt);
     }
+    ReleaseMenuDragCapture(rt, hwnd_ptr);
     rt.last_desired_capture.store(false, std::memory_order_release);
 #ifdef _WIN32
     ApplyClipRect(static_cast<HWND>(hwnd_ptr), false);
@@ -1260,6 +1401,7 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
     // 1. Always handle focus / lifecycle / sizemove messages and return FALSE so main.cpp runs too!
     switch (msg) {
         case WM_ACTIVATE: {
+            if (rt.test_active) return false;
             bool active = LOWORD(wp) != WA_INACTIVE;
             rt.focused.store(active, std::memory_order_release);
             if (!active) MkbForceReleaseCursor(hwnd);
@@ -1267,6 +1409,7 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
             return false;
         }
         case WM_ACTIVATEAPP: {
+            if (rt.test_active) return false;
             bool active = wp != 0;
             rt.focused.store(active, std::memory_order_release);
             if (!active) MkbForceReleaseCursor(hwnd);
@@ -1274,10 +1417,12 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
             return false;
         }
         case WM_KILLFOCUS:
+            if (rt.test_active) return false;
             rt.focused.store(false, std::memory_order_release);
             MkbForceReleaseCursor(hwnd);
             return false;
         case WM_SETFOCUS:
+            if (rt.test_active) return false;
             rt.focused.store(true, std::memory_order_release);
             MkbSyncCursorOnWindowThread(hwnd);
             return false;
@@ -1292,6 +1437,16 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
         case WM_SIZE:
             if (rt.cursor_captured.load(std::memory_order_acquire)) MkbSyncCursorOnWindowThread(hwnd);
             return false;
+        case WM_CAPTURECHANGED:
+        case WM_CANCELMODE: {
+            std::lock_guard<std::mutex> lock(rt.input_lock);
+            if (rt.menu_lmb_down) {
+                rt.menu_lmb_down = false;
+                rt.menu_lmb_released = true;
+            }
+            rt.menu_captured_hwnd = false;
+            return false;
+        }
         case WM_CLOSE:
         case WM_DESTROY:
             MkbForceReleaseCursor(hwnd);
@@ -1309,8 +1464,20 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
         return false;
     }
 
-    // 2. Gameplay mouse & keyboard capture
+    // 2. Gameplay & Menu mouse/keyboard capture
     switch (msg) {
+        case WM_MOUSEMOVE: {
+            if (!rt.focused.load(std::memory_order_acquire)) return false;
+            if (!MkbIsInActive3DGameplay()) {
+                float cx = float(static_cast<int16_t>(LOWORD(lp)));
+                float cy = float(static_cast<int16_t>(HIWORD(lp)));
+                float px = cx, py = cy;
+                ClientToPhysicalCoords(hwnd, cx, cy, px, py);
+                std::lock_guard<std::mutex> lock(rt.input_lock);
+                UpdateMenuCursorPhysLocked(rt, px, py);
+            }
+            return false;
+        }
         case WM_INPUT: {
             if (!rt.focused.load(std::memory_order_acquire)) return false;
             UINT sz = 0;
@@ -1367,64 +1534,130 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
         }
         case WM_LBUTTONDOWN:
         case WM_LBUTTONDBLCLK: {
-            if (!rt.cursor_captured.load(std::memory_order_acquire) && MkbShouldCaptureCursor()) {
-                MkbSyncCursorOnWindowThread(hwnd);
+            bool in_3d = MkbIsInActive3DGameplay();
+            if (in_3d) {
+                if (!rt.cursor_captured.load(std::memory_order_acquire) && MkbShouldCaptureCursor()) {
+                    MkbSyncCursorOnWindowThread(hwnd);
+                }
+                std::lock_guard<std::mutex> lock(rt.input_lock);
+                rt.mouse_buttons[0] = true;
+            } else {
+                float cx = float(static_cast<int16_t>(LOWORD(lp)));
+                float cy = float(static_cast<int16_t>(HIWORD(lp)));
+                float px = cx, py = cy;
+                ClientToPhysicalCoords(hwnd, cx, cy, px, py);
+                {
+                    std::lock_guard<std::mutex> lock(rt.input_lock);
+                    UpdateMenuCursorPhysLocked(rt, px, py);
+                    rt.mouse_buttons[0] = true;
+                    rt.suppressed_mouse_mask |= uint8_t(1u << 0);
+                    rt.menu_lmb_pressed = true;
+                    rt.menu_lmb_down = true;
+                }
+                if (hwnd && IsWindow(hwnd)) {
+                    SetCapture(hwnd);
+                    rt.menu_captured_hwnd = true;
+                }
             }
-            std::lock_guard<std::mutex> lock(rt.input_lock);
-            rt.mouse_buttons[0] = true;
             if (result) *result = 0;
             return true;
         }
         case WM_LBUTTONUP: {
-            std::lock_guard<std::mutex> lock(rt.input_lock);
-            rt.mouse_buttons[0] = false;
+            {
+                std::lock_guard<std::mutex> lock(rt.input_lock);
+                rt.mouse_buttons[0] = false;
+                rt.suppressed_mouse_mask &= ~uint8_t(1u << 0);
+                if (rt.menu_lmb_down) {
+                    rt.menu_lmb_down = false;
+                    rt.menu_lmb_released = true;
+                }
+            }
+            ReleaseMenuDragCapture(rt, hwnd);
             return false;
         }
         case WM_RBUTTONDOWN:
         case WM_RBUTTONDBLCLK: {
-            std::lock_guard<std::mutex> lock(rt.input_lock);
-            rt.mouse_buttons[1] = true;
+            bool in_3d = MkbIsInActive3DGameplay();
+            if (in_3d) {
+                std::lock_guard<std::mutex> lock(rt.input_lock);
+                rt.mouse_buttons[1] = true;
+            } else {
+                float cx = float(static_cast<int16_t>(LOWORD(lp)));
+                float cy = float(static_cast<int16_t>(HIWORD(lp)));
+                float px = cx, py = cy;
+                ClientToPhysicalCoords(hwnd, cx, cy, px, py);
+                std::lock_guard<std::mutex> lock(rt.input_lock);
+                UpdateMenuCursorPhysLocked(rt, px, py);
+                rt.mouse_buttons[1] = true;
+                rt.suppressed_mouse_mask |= uint8_t(1u << 1);
+                rt.menu_rmb_pressed = true;
+            }
             if (result) *result = 0;
             return true;
         }
         case WM_RBUTTONUP: {
             std::lock_guard<std::mutex> lock(rt.input_lock);
             rt.mouse_buttons[1] = false;
+            rt.suppressed_mouse_mask &= ~uint8_t(1u << 1);
             return false;
         }
         case WM_MBUTTONDOWN:
         case WM_MBUTTONDBLCLK: {
+            bool in_3d = MkbIsInActive3DGameplay();
             std::lock_guard<std::mutex> lock(rt.input_lock);
             rt.mouse_buttons[2] = true;
+            if (!in_3d) rt.suppressed_mouse_mask |= uint8_t(1u << 2);
             if (result) *result = 0;
             return true;
         }
         case WM_MBUTTONUP: {
             std::lock_guard<std::mutex> lock(rt.input_lock);
             rt.mouse_buttons[2] = false;
+            rt.suppressed_mouse_mask &= ~uint8_t(1u << 2);
             return false;
         }
         case WM_XBUTTONDOWN:
         case WM_XBUTTONDBLCLK: {
             WORD xbtn = HIWORD(wp);
+            size_t idx = (xbtn == XBUTTON1) ? 3u : 4u;
+            bool in_3d = MkbIsInActive3DGameplay();
             std::lock_guard<std::mutex> lock(rt.input_lock);
-            rt.mouse_buttons[xbtn == XBUTTON1 ? 3 : 4] = true;
+            rt.mouse_buttons[idx] = true;
+            if (!in_3d) rt.suppressed_mouse_mask |= uint8_t(1u << idx);
             if (result) *result = TRUE;
             return true;
         }
         case WM_XBUTTONUP: {
             WORD xbtn = HIWORD(wp);
+            size_t idx = (xbtn == XBUTTON1) ? 3u : 4u;
             std::lock_guard<std::mutex> lock(rt.input_lock);
-            rt.mouse_buttons[xbtn == XBUTTON1 ? 3 : 4] = false;
+            rt.mouse_buttons[idx] = false;
+            rt.suppressed_mouse_mask &= ~uint8_t(1u << idx);
             return false;
         }
         case WM_MOUSEWHEEL: {
             short delta = GET_WHEEL_DELTA_WPARAM(wp);
-            int notches = delta / WHEEL_DELTA;
-            if (notches == 0 && delta != 0) notches = (delta > 0) ? 1 : -1;
-            std::lock_guard<std::mutex> lock(rt.input_lock);
-            if (notches > 0) rt.wheel_up_queue = std::min(rt.wheel_up_queue + notches, kMaxWheelQueue);
-            else if (notches < 0) rt.wheel_down_queue = std::min(rt.wheel_down_queue - notches, kMaxWheelQueue);
+            bool in_3d = MkbIsInActive3DGameplay();
+            if (!in_3d) {
+                POINT pt{static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp))};
+                bool have_pt = hwnd && ScreenToClient(hwnd, &pt);
+                float px = 0.0f, py = 0.0f;
+                if (have_pt) ClientToPhysicalCoords(hwnd, float(pt.x), float(pt.y), px, py);
+                std::lock_guard<std::mutex> lock(rt.input_lock);
+                if (have_pt) UpdateMenuCursorPhysLocked(rt, px, py);
+                rt.menu_wheel_rem += int(delta);
+                int notches = rt.menu_wheel_rem / WHEEL_DELTA;
+                rt.menu_wheel_rem -= notches * WHEEL_DELTA;
+                if (notches != 0) {
+                    rt.menu_wheel_steps = std::clamp(rt.menu_wheel_steps + notches, -16, 16);
+                }
+            } else {
+                int notches = delta / WHEEL_DELTA;
+                if (notches == 0 && delta != 0) notches = (delta > 0) ? 1 : -1;
+                std::lock_guard<std::mutex> lock(rt.input_lock);
+                if (notches > 0) rt.wheel_up_queue = std::min(rt.wheel_up_queue + notches, kMaxWheelQueue);
+                else if (notches < 0) rt.wheel_down_queue = std::min(rt.wheel_down_queue - notches, kMaxWheelQueue);
+            }
             if (result) *result = 0;
             return true;
         }
@@ -1440,10 +1673,15 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
     // 1. Focus / window lifecycle events
     switch (msg) {
         case SDL_EVENT_WINDOW_FOCUS_GAINED:
+            if (rt.test_active) return false;
             rt.focused.store(true, std::memory_order_release);
             MkbSyncCursorOnWindowThread(hwnd_ptr);
             return false;
         case SDL_EVENT_WINDOW_FOCUS_LOST:
+            if (rt.test_active) return false;
+            rt.focused.store(false, std::memory_order_release);
+            MkbForceReleaseCursor(hwnd_ptr);
+            return false;
         case SDL_EVENT_WINDOW_MINIMIZED:
             rt.focused.store(false, std::memory_order_release);
             MkbForceReleaseCursor(hwnd_ptr);
@@ -1469,15 +1707,22 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
         return false;
     }
 
-    // 2. Gameplay mouse & keyboard capture via SDL3 relative mouse + scancode->VK mapping
+    // 2. Gameplay & Menu mouse/keyboard capture via SDL3 relative/logical mouse + scancode->VK mapping
     switch (msg) {
         case SDL_EVENT_MOUSE_MOTION: {
             if (!rt.focused.load(std::memory_order_acquire)) return false;
-            if ((ev->motion.xrel != 0.0f || ev->motion.yrel != 0.0f) && MkbIsInActive3DGameplay()) {
+            if (MkbIsInActive3DGameplay()) {
+                if (ev->motion.xrel != 0.0f || ev->motion.yrel != 0.0f) {
+                    std::lock_guard<std::mutex> lock(rt.input_lock);
+                    rt.raw_dx += double(ev->motion.xrel);
+                    rt.raw_dy += double(ev->motion.yrel);
+                    rt.mouse_look_active.store(true, std::memory_order_release);
+                }
+            } else {
+                float px = ev->motion.x, py = ev->motion.y;
+                ClientToPhysicalCoords(hwnd_ptr, ev->motion.x, ev->motion.y, px, py);
                 std::lock_guard<std::mutex> lock(rt.input_lock);
-                rt.raw_dx += double(ev->motion.xrel);
-                rt.raw_dy += double(ev->motion.yrel);
-                rt.mouse_look_active.store(true, std::memory_order_release);
+                UpdateMenuCursorPhysLocked(rt, px, py);
             }
             return false;
         }
@@ -1507,11 +1752,33 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
                 default: break;
             }
             if (idx < 0) return false;
-            if (idx == 0 && !rt.cursor_captured.load(std::memory_order_acquire) && MkbShouldCaptureCursor()) {
-                MkbSyncCursorOnWindowThread(hwnd_ptr);
+            bool in_3d = MkbIsInActive3DGameplay();
+            if (in_3d) {
+                if (idx == 0 && !rt.cursor_captured.load(std::memory_order_acquire) && MkbShouldCaptureCursor()) {
+                    MkbSyncCursorOnWindowThread(hwnd_ptr);
+                }
+                std::lock_guard<std::mutex> lock(rt.input_lock);
+                rt.mouse_buttons[size_t(idx)] = true;
+            } else {
+                float px = ev->button.x, py = ev->button.y;
+                ClientToPhysicalCoords(hwnd_ptr, ev->button.x, ev->button.y, px, py);
+                {
+                    std::lock_guard<std::mutex> lock(rt.input_lock);
+                    UpdateMenuCursorPhysLocked(rt, px, py);
+                    rt.mouse_buttons[size_t(idx)] = true;
+                    rt.suppressed_mouse_mask |= uint8_t(1u << idx);
+                    if (idx == 0) {
+                        rt.menu_lmb_pressed = true;
+                        rt.menu_lmb_down = true;
+                    } else if (idx == 1) {
+                        rt.menu_rmb_pressed = true;
+                    }
+                }
+                if (idx == 0) {
+                    SDL_CaptureMouse(true);
+                    rt.menu_captured_hwnd = true;
+                }
             }
-            std::lock_guard<std::mutex> lock(rt.input_lock);
-            rt.mouse_buttons[size_t(idx)] = true;
             if (result) *result = 0;
             return true;
         }
@@ -1526,16 +1793,42 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
                 default: break;
             }
             if (idx < 0) return false;
-            std::lock_guard<std::mutex> lock(rt.input_lock);
-            rt.mouse_buttons[size_t(idx)] = false;
+            {
+                std::lock_guard<std::mutex> lock(rt.input_lock);
+                rt.mouse_buttons[size_t(idx)] = false;
+                rt.suppressed_mouse_mask &= ~uint8_t(1u << idx);
+                if (idx == 0 && rt.menu_lmb_down) {
+                    rt.menu_lmb_down = false;
+                    rt.menu_lmb_released = true;
+                }
+            }
+            if (idx == 0) ReleaseMenuDragCapture(rt, hwnd_ptr);
             return false;
         }
         case SDL_EVENT_MOUSE_WHEEL: {
-            int notches = int(std::lround(ev->wheel.y));
-            if (notches == 0 && ev->wheel.y != 0.0f) notches = (ev->wheel.y > 0.0f) ? 1 : -1;
-            std::lock_guard<std::mutex> lock(rt.input_lock);
-            if (notches > 0) rt.wheel_up_queue = std::min(rt.wheel_up_queue + notches, kMaxWheelQueue);
-            else if (notches < 0) rt.wheel_down_queue = std::min(rt.wheel_down_queue - notches, kMaxWheelQueue);
+            bool in_3d = MkbIsInActive3DGameplay();
+            if (!in_3d) {
+                float px = ev->wheel.mouse_x, py = ev->wheel.mouse_y;
+                ClientToPhysicalCoords(hwnd_ptr, ev->wheel.mouse_x, ev->wheel.mouse_y, px, py);
+                std::lock_guard<std::mutex> lock(rt.input_lock);
+                UpdateMenuCursorPhysLocked(rt, px, py);
+                rt.menu_wheel_frem += ev->wheel.y;
+                int notches = int(std::trunc(rt.menu_wheel_frem));
+                rt.menu_wheel_frem -= float(notches);
+                if (notches == 0 && std::fabs(ev->wheel.y) >= 0.5f) {
+                    notches = (ev->wheel.y > 0.0f) ? 1 : -1;
+                    rt.menu_wheel_frem = 0.0f;
+                }
+                if (notches != 0) {
+                    rt.menu_wheel_steps = std::clamp(rt.menu_wheel_steps + notches, -16, 16);
+                }
+            } else {
+                int notches = int(std::lround(ev->wheel.y));
+                if (notches == 0 && ev->wheel.y != 0.0f) notches = (ev->wheel.y > 0.0f) ? 1 : -1;
+                std::lock_guard<std::mutex> lock(rt.input_lock);
+                if (notches > 0) rt.wheel_up_queue = std::min(rt.wheel_up_queue + notches, kMaxWheelQueue);
+                else if (notches < 0) rt.wheel_down_queue = std::min(rt.wheel_down_queue - notches, kMaxWheelQueue);
+            }
             if (result) *result = 0;
             return true;
         }
@@ -1566,13 +1859,35 @@ void MkbMergeGameplayPad(input::Pad& pad) {
         rt.raw_dy = 0.0;
         rt.smooth_dx = 0.0f;
         rt.smooth_dy = 0.0f;
+        rt.wheel_up_queue = 0;
+        rt.wheel_up_hold = 0;
+        rt.wheel_up_gap = 0;
+        rt.wheel_down_queue = 0;
+        rt.wheel_down_hold = 0;
+        rt.wheel_down_gap = 0;
     }
 
     std::lock_guard<std::mutex> lock(rt.input_lock);
 
-    // Advance mouse-wheel notch pulse queues
-    AdvanceWheelQueue(rt.wheel_up_queue, rt.wheel_up_hold, rt.wheel_up_gap);
-    AdvanceWheelQueue(rt.wheel_down_queue, rt.wheel_down_hold, rt.wheel_down_gap);
+    // Click-through transition guard: when transitioning menu/cutscene -> active 3D gameplay,
+    // latch ALL currently held mouse buttons until physically released and discard stale mouse delta.
+    if (gc.in_active_3d_gameplay && !rt.prev_in_3d_gameplay) {
+        for (size_t i = 0; i < rt.mouse_buttons.size(); ++i) {
+            if (rt.mouse_buttons[i]) rt.suppressed_mouse_mask |= uint8_t(1u << i);
+        }
+        rt.raw_dx = 0.0;
+        rt.raw_dy = 0.0;
+        rt.smooth_dx = 0.0f;
+        rt.smooth_dy = 0.0f;
+        ClearMenuPendingLocked(rt);
+    }
+    rt.prev_in_3d_gameplay = gc.in_active_3d_gameplay;
+
+    // Advance mouse-wheel notch pulse queues (only active in 3D gameplay; zeroed in menus above)
+    if (gc.in_active_3d_gameplay) {
+        AdvanceWheelQueue(rt.wheel_up_queue, rt.wheel_up_hold, rt.wheel_up_gap);
+        AdvanceWheelQueue(rt.wheel_down_queue, rt.wheel_down_hold, rt.wheel_down_gap);
+    }
 
     // 1. Movement (WASD / custom bindings) -> Diagonal-normalized Left Stick
     float fx = 0.0f;
@@ -1591,9 +1906,11 @@ void MkbMergeGameplayPad(input::Pad& pad) {
         pad.ly = int16_t(std::clamp(std::lround(fy * 32767.0f), -32767l, 32767l));
     }
 
-    // 2. Gameplay buttons
-    if (IsActionActiveLocked(rt, MkbAction::Fire)) pad.analog[7] = 255;          // RT
-    if (IsActionActiveLocked(rt, MkbAction::ThrowGrenade)) pad.analog[6] = 255;  // LT
+    // 2. Gameplay buttons (Fire/ThrowGrenade suppressed outside 3D gameplay & guarded by suppressed_mouse_mask)
+    if (gc.in_active_3d_gameplay) {
+        if (IsActionActiveLocked(rt, MkbAction::Fire)) pad.analog[7] = 255;          // RT
+        if (IsActionActiveLocked(rt, MkbAction::ThrowGrenade)) pad.analog[6] = 255;  // LT
+    }
     if (IsActionActiveLocked(rt, MkbAction::Jump)) pad.analog[0] = 255;          // A
     if (IsActionActiveLocked(rt, MkbAction::Reload)) pad.analog[1] = 255;        // B
     if (IsActionActiveLocked(rt, MkbAction::Interact)) pad.analog[2] = 255;      // X
@@ -1641,6 +1958,18 @@ void MkbMergeGameplayPad(input::Pad& pad) {
         if (rt.keys[VK_DOWN]) pad.buttons |= (1u << 1);
         if (rt.keys[VK_LEFT]) pad.buttons |= (1u << 2);
         if (rt.keys[VK_RIGHT]) pad.buttons |= (1u << 3);
+        if ((gc.fmv || gc.cutscene) && gc.ui_stack == 0) {
+            if (rt.menu_lmb_pressed) {
+                rt.menu_lmb_pressed = false;
+                rt.cutscene_lmb_skip_polls = 2;
+            }
+        }
+        if (rt.cutscene_lmb_skip_polls > 0) {
+            --rt.cutscene_lmb_skip_polls;
+            pad.analog[0] = 255;  // A = Skip FMV / Cutscene
+        }
+    } else {
+        rt.cutscene_lmb_skip_polls = 0;
     }
 }
 
@@ -1682,7 +2011,8 @@ bool MkbConsumeMouseLook(float dt, float guest_sens_x, float guest_sens_y, float
     }
     if (!rt.mouse_look_active.load(std::memory_order_acquire)) return false;
 
-    float safe_dt = std::clamp(dt, 1.0f / 240.0f, 1.0f / 15.0f);
+    // Widen safe_dt to [1e-4, 0.1] so 1/(safe_dt * sx) cancels guest dt 1-to-1 from 10 FPS to 1000+ FPS.
+    float safe_dt = std::clamp(dt, 1.0e-4f, 0.1f);
     float sx = std::max(guest_sens_x, 0.1f);
     float sy = std::max(guest_sens_y, 0.1f);
     float user_sens = std::clamp(rt.cfg.mouse_sensitivity, 0.10f, 5.00f);
@@ -1694,6 +2024,139 @@ bool MkbConsumeMouseLook(float dt, float guest_sens_x, float guest_sens_y, float
     float signed_dy = rt.cfg.mouse_invert_y ? float(dy) : float(-dy);
     out_look_y = signed_dy * (kPitchScaleAt1x * user_sens) / (safe_dt * sy);
     return true;
+}
+
+GuestUiPoint MkbTransformPhysicalToGuestUi(float phys_x, float phys_y, uint32_t bb_w, uint32_t bb_h, uint32_t vp_w,
+                                           uint32_t vp_h, uint32_t render_w, uint32_t render_h,
+                                           uint32_t active_upscaler_mode, bool widescreen, float guest_w,
+                                           float guest_h) {
+    GuestUiPoint out{};
+    if (guest_w <= 1.0f) guest_w = 640.0f;
+    if (guest_h <= 1.0f) guest_h = 480.0f;
+    out.gx = guest_w * 0.5f;
+    out.gy = guest_h * 0.5f;
+    out.gx_clamped = out.gx;
+    out.gy_clamped = out.gy;
+    if (bb_w == 0 || bb_h == 0) return out;
+
+    if (vp_w == 0 || vp_h == 0) {
+        float aspect = widescreen ? (16.0f / 9.0f) : (4.0f / 3.0f);
+        float vw = std::min(float(bb_w), float(bb_h) * aspect);
+        float vh = vw / aspect;
+        vp_w = std::max(1u, uint32_t(std::lround(vw)));
+        vp_h = std::max(1u, uint32_t(std::lround(vh)));
+    }
+
+    uint32_t eff_vpw = vp_w;
+    uint32_t eff_vph = vp_h;
+    uint32_t eff_vpx = (bb_w > eff_vpw) ? (bb_w - eff_vpw) / 2u : 0u;
+    uint32_t eff_vpy = (bb_h > eff_vph) ? (bb_h - eff_vph) / 2u : 0u;
+
+    if (static_cast<app::UpscalerMode>(active_upscaler_mode) == app::UpscalerMode::Integer && render_w > 0 &&
+        render_h > 0 && render_w <= bb_w && render_h <= bb_h) {
+        uint32_t k = std::max(1u, std::min(bb_w / render_w, bb_h / render_h));
+        eff_vpw = render_w * k;
+        eff_vph = render_h * k;
+        eff_vpx = (bb_w > eff_vpw) ? (bb_w - eff_vpw) / 2u : 0u;
+        eff_vpy = (bb_h > eff_vph) ? (bb_h - eff_vph) / 2u : 0u;
+    }
+
+    if (eff_vpw == 0 || eff_vph == 0) return out;
+
+    out.in_viewport = (phys_x >= float(eff_vpx) && phys_x < float(eff_vpx + eff_vpw) &&
+                       phys_y >= float(eff_vpy) && phys_y < float(eff_vpy + eff_vph));
+    out.gx = ((phys_x - float(eff_vpx)) / float(eff_vpw)) * guest_w;
+    out.gy = ((phys_y - float(eff_vpy)) / float(eff_vph)) * guest_h;
+    out.gx_clamped = std::clamp(out.gx, 0.0f, guest_w);
+    out.gy_clamped = std::clamp(out.gy, 0.0f, guest_h);
+    return out;
+}
+
+MenuMouseFrame MkbConsumeMenuMouse(float guest_w, float guest_h) {
+    MkbRuntimeState& rt = Rt();
+    MenuMouseFrame f{};
+    if (app::IsReplayOrAutotestActive() || rt.cfg.input_mode == InputMode::ControllerOnly || UiIsOverlayOpen() ||
+        !rt.focused.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(rt.input_lock);
+        rt.menu_lmb_pressed = false;
+        rt.menu_rmb_pressed = false;
+        rt.menu_lmb_released = false;
+        rt.menu_wheel_steps = 0;
+        return f;
+    }
+
+    float px = 0.0f, py = 0.0f;
+    {
+        std::lock_guard<std::mutex> lock(rt.input_lock);
+        f.active = true;
+        f.has_pos = rt.menu_has_pos;
+        px = rt.menu_phys_x;
+        py = rt.menu_phys_y;
+        f.moved = rt.menu_has_pos && (rt.menu_move_seq != rt.menu_consumed_move_seq);
+        rt.menu_consumed_move_seq = rt.menu_move_seq;
+        f.lmb_pressed = rt.menu_lmb_pressed;
+        rt.menu_lmb_pressed = false;
+        f.lmb_down = rt.menu_lmb_down;
+        f.lmb_released = rt.menu_lmb_released;
+        rt.menu_lmb_released = false;
+        f.rmb_pressed = rt.menu_rmb_pressed;
+        rt.menu_rmb_pressed = false;
+        f.wheel_steps = rt.menu_wheel_steps;
+        rt.menu_wheel_steps = 0;
+    }
+
+    if (f.has_pos) {
+        gpu::UpscalerStatus us = gpu::GetUpscalerStatus();
+        uint32_t bb_w = us.bb_w;
+        uint32_t bb_h = us.bb_h;
+        if (bb_w == 0 || bb_h == 0) {
+            app::Mode out_m = app::Output();
+            bb_w = out_m.width;
+            bb_h = out_m.height;
+        }
+        f.pt = MkbTransformPhysicalToGuestUi(px, py, bb_w, bb_h, us.vp_w, us.vp_h, us.render_w, us.render_h,
+                                             us.active_mode, app::Widescreen(), guest_w, guest_h);
+    }
+    return f;
+}
+
+void MkbSetLastMenuDebugState(uint32_t top_vt, int32_t focused_idx, float guest_gx, float guest_gy, bool in_vp) {
+    MkbRuntimeState& rt = Rt();
+    rt.dbg_top_vt.store(top_vt, std::memory_order_relaxed);
+    rt.dbg_focused_idx.store(focused_idx, std::memory_order_relaxed);
+    rt.dbg_guest_gx.store(guest_gx, std::memory_order_relaxed);
+    rt.dbg_guest_gy.store(guest_gy, std::memory_order_relaxed);
+    rt.dbg_in_vp.store(in_vp, std::memory_order_relaxed);
+}
+
+bool MkbRunMenuCoordSelfTest() {
+    auto approx_eq = [](float a, float b) { return std::fabs(a - b) < 0.05f; };
+    bool ok = true;
+    // 1. 2560x1440 16:9 standard -> center (1280,720) maps to (320,240)
+    auto p1 = MkbTransformPhysicalToGuestUi(1280.0f, 720.0f, 2560, 1440, 2560, 1440, 2560, 1440, 0, true);
+    ok = ok && p1.in_viewport && approx_eq(p1.gx, 320.0f) && approx_eq(p1.gy, 240.0f);
+    // 2. 2560x1440 4:3 pillarboxed (1920x1440 @ +320px)
+    auto p2a = MkbTransformPhysicalToGuestUi(100.0f, 720.0f, 2560, 1440, 1920, 1440, 640, 480, 0, false);
+    auto p2b = MkbTransformPhysicalToGuestUi(320.0f, 0.0f, 2560, 1440, 1920, 1440, 640, 480, 0, false);
+    ok = ok && !p2a.in_viewport && approx_eq(p2a.gx_clamped, 0.0f) && p2b.in_viewport && approx_eq(p2b.gx, 0.0f) &&
+         approx_eq(p2b.gy, 0.0f);
+    // 3. 1280x800 Steam Deck 16:10 -> 1280x720 @ +40px letterbox
+    auto p3a = MkbTransformPhysicalToGuestUi(640.0f, 20.0f, 1280, 800, 1280, 720, 1280, 720, 0, true);
+    auto p3b = MkbTransformPhysicalToGuestUi(640.0f, 400.0f, 1280, 800, 1280, 720, 1280, 720, 0, true);
+    ok = ok && !p3a.in_viewport && p3b.in_viewport && approx_eq(p3b.gx, 320.0f) && approx_eq(p3b.gy, 240.0f);
+    // 4. 3440x1440 Ultrawide 21:9 -> 2560x1440 @ +440px pillarbox
+    auto p4a = MkbTransformPhysicalToGuestUi(200.0f, 720.0f, 3440, 1440, 2560, 1440, 2560, 1440, 0, true);
+    auto p4b = MkbTransformPhysicalToGuestUi(1720.0f, 720.0f, 3440, 1440, 2560, 1440, 2560, 1440, 0, true);
+    ok = ok && !p4a.in_viewport && p4b.in_viewport && approx_eq(p4b.gx, 320.0f) && approx_eq(p4b.gy, 240.0f);
+    // 5. 1024x768 4:3 exact
+    auto p5 = MkbTransformPhysicalToGuestUi(512.0f, 384.0f, 1024, 768, 1024, 768, 640, 480, 0, false);
+    ok = ok && p5.in_viewport && approx_eq(p5.gx, 320.0f) && approx_eq(p5.gy, 240.0f);
+    // 6. Integer upscaler (2560x1440 with 640x480 render -> k=3 -> 1920x1440 @ +320px)
+    uint32_t int_mode = static_cast<uint32_t>(app::UpscalerMode::Integer);
+    auto p6a = MkbTransformPhysicalToGuestUi(100.0f, 720.0f, 2560, 1440, 2560, 1440, 640, 480, int_mode, true);
+    auto p6b = MkbTransformPhysicalToGuestUi(1280.0f, 720.0f, 2560, 1440, 2560, 1440, 640, 480, int_mode, true);
+    ok = ok && !p6a.in_viewport && p6b.in_viewport && approx_eq(p6b.gx, 320.0f) && approx_eq(p6b.gy, 240.0f);
+    return ok;
 }
 
 bool MkbIsSyntheticTestActive() {
@@ -1753,18 +2216,51 @@ void MkbAdvanceSyntheticEvents() {
             if (ev.val1 > 0) rt.wheel_up_queue = std::min(rt.wheel_up_queue + ev.val1, kMaxWheelQueue);
             else if (ev.val1 < 0) rt.wheel_down_queue = std::min(rt.wheel_down_queue - ev.val1, kMaxWheelQueue);
             rt.pending_event_tag += ":" + std::to_string(ev.val1);
+        } else if (ev.cmd == "menu_cursor") {
+            std::lock_guard<std::mutex> lock(rt.input_lock);
+            UpdateMenuCursorPhysLocked(rt, float(ev.val1), float(ev.val2));
+            rt.pending_event_tag += ":" + std::to_string(ev.val1) + "," + std::to_string(ev.val2);
+        } else if (ev.cmd == "menu_lmb_down") {
+            std::lock_guard<std::mutex> lock(rt.input_lock);
+            rt.mouse_buttons[0] = true;
+            rt.suppressed_mouse_mask |= uint8_t(1u << 0);
+            rt.menu_lmb_pressed = true;
+            rt.menu_lmb_down = true;
+        } else if (ev.cmd == "menu_lmb_up") {
+            std::lock_guard<std::mutex> lock(rt.input_lock);
+            rt.mouse_buttons[0] = false;
+            rt.suppressed_mouse_mask &= ~uint8_t(1u << 0);
+            if (rt.menu_lmb_down) {
+                rt.menu_lmb_down = false;
+                rt.menu_lmb_released = true;
+            }
+        } else if (ev.cmd == "menu_rmb_down") {
+            std::lock_guard<std::mutex> lock(rt.input_lock);
+            rt.mouse_buttons[1] = true;
+            rt.suppressed_mouse_mask |= uint8_t(1u << 1);
+            rt.menu_rmb_pressed = true;
+        } else if (ev.cmd == "menu_rmb_up") {
+            std::lock_guard<std::mutex> lock(rt.input_lock);
+            rt.mouse_buttons[1] = false;
+            rt.suppressed_mouse_mask &= ~uint8_t(1u << 1);
+        } else if (ev.cmd == "menu_rmb_click") {
+            std::lock_guard<std::mutex> lock(rt.input_lock);
+            rt.menu_rmb_pressed = true;
+        } else if (ev.cmd == "menu_wheel") {
+            std::lock_guard<std::mutex> lock(rt.input_lock);
+            rt.menu_wheel_steps = std::clamp(rt.menu_wheel_steps + ev.val1, -16, 16);
+            rt.pending_event_tag += ":" + std::to_string(ev.val1);
         } else if (ev.cmd == "overlay") {
             UiSetOverlayOpen(ev.val1 != 0);
             rt.pending_event_tag += ":" + std::to_string(ev.val1);
         } else if (ev.cmd == "focus") {
-#ifdef _WIN32
-            if (hwnd) {
-                PostMessageW(hwnd, WM_ACTIVATE, ev.val1 ? WA_ACTIVE : WA_INACTIVE, 0);
+            bool active = (ev.val1 != 0);
+            rt.focused.store(active, std::memory_order_release);
+            if (!active) {
+                std::lock_guard<std::mutex> lock(rt.input_lock);
+                ClearAllHeldInputsLocked(rt);
             }
-#else
-            rt.focused.store(ev.val1 != 0, std::memory_order_release);
             UiRequestRefreshCursor();
-#endif
             rt.pending_event_tag += ":" + std::to_string(ev.val1);
         } else if (ev.cmd == "exit") {
             if (!rt.test_exit_posted) {

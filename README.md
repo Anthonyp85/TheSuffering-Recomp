@@ -15,12 +15,12 @@
 
 ## System Requirements (End Users)
 
-### Windows (`v1.3.1` — Native Win64 D3D12)
+### Windows (`v1.4.0` — Native Win64 D3D12)
 - **OS:** Windows 11 x64 or Windows 10 1809+ x64
 - **GPU:** Direct3D 12-capable GPU (Feature Level `11_0` or newer — supports NVIDIA, AMD, Intel Arc/Iris, and Handheld/iGPU UMA systems)
 - **Storage:** ~400 MB free writable disk space beside `suffering.exe` (for locally compiled `suffering.dll`, per-adapter shader/PSO cache `cache\`, virtual Xbox HDD `hdd\`, and logs)
 
-### Native Linux `x86_64` & Steam Deck (`v1.3.1` — Native Vulkan 1.2 + SDL3 + ELF64)
+### Native Linux `x86_64` & Steam Deck (`v1.4.0` — Native Vulkan 1.2 + SDL3 + ELF64)
 - **OS:** Any `x86_64` Linux distribution with **`glibc 2.35+`** and `libstdc++.so.6` (`GLIBCXX_3.4.30+`): **SteamOS 3.x (Steam Deck LCD & OLED)**, Ubuntu 22.04+, Debian 12+, Fedora 36+, Arch Linux, Bazzite, CachyOS — **zero Proton or Wine required**, and **zero system LLVM/Clang dev packages required** on stock read-only SteamOS!
 - **GPU:** Vulkan 1.2-capable GPU (AMD RADV on Steam Deck / Radeon, NVIDIA proprietary Vulkan, Intel ANV, or Mesa `lavapipe` software fallback)
 - **Audio / Display / Input:** PipeWire, PulseAudio, or ALSA; Wayland, Gamescope (Steam Deck Gaming Mode), or X11; SDL3 `evdev` + `HIDAPI` (Steam Deck integrated controls, DualSense 5, Xbox, Switch) + SDL3 Relative Mouse
@@ -46,7 +46,7 @@
 
 ## Quick Start (End-User Release Packages)
 
-### Windows (`TheSuffering-Recomp-v1.3.1-win64-launcher.zip`)
+### Windows (`TheSuffering-Recomp-v1.4.0-win64-launcher.zip`)
 You do **not** need Visual Studio, CMake, Python, or manual file extraction to play from a packaged Win64 launcher release:
 
 1. **Unpack** the archive into any writable folder (for example, `C:\Games\TheSuffering\`).
@@ -59,14 +59,14 @@ You do **not** need Visual Studio, CMake, Python, or manual file extraction to p
    - Enable **"Skip launcher on future starts"** inside the launcher to boot straight into gameplay on future runs.
    - To reopen the Pre-Game Launcher anytime while skipping is enabled, **hold `Shift`** while starting `suffering.exe`, pass `--launcher`, or re-enable **"Show Pre-Game Launcher on Startup"** inside the in-game **`F1`** overlay (**Launcher & Diagnostics**).
 
-### Native Linux `x86_64` & Steam Deck (`TheSuffering-Recomp-v1.3.1-linux-x86_64.tar.gz`)
+### Native Linux `x86_64` & Steam Deck (`TheSuffering-Recomp-v1.4.0-linux-x86_64.tar.gz`)
 
 Runs **100% natively on Linux Vulkan 1.2 + SDL3** with zero Proton overhead and zero system LLVM dependencies on stock read-only SteamOS:
 
 1. **Extract** the tarball into a writable directory (for example, `~/Games/TheSuffering/`):
    ```bash
    mkdir -p ~/Games/TheSuffering
-   tar -xzf TheSuffering-Recomp-v1.3.1-linux-x86_64.tar.gz -C ~/Games/TheSuffering
+   tar -xzf TheSuffering-Recomp-v1.4.0-linux-x86_64.tar.gz -C ~/Games/TheSuffering
    cd ~/Games/TheSuffering
    ```
 2. **Optional — Register in Steam Deck Gaming Mode & Desktop Menu:**
@@ -94,7 +94,7 @@ Runs **100% natively on Linux Vulkan 1.2 + SDL3** with zero Proton overhead and 
 
 ---
 
-## Modern Upscaling Suite (`v1.3.1`)
+## Modern Upscaling Suite (`v1.4.0`)
 
 Both Windows (Direct3D 12) and Native Linux / Steam Deck (Vulkan 1.2) decouple the internal 3D rendering resolution (`render_w x render_h`) from the native display resolution (`bb_w x bb_h`), apply square-pixel aspect-locked upscaling before compositing crisp native-resolution Dear ImGui overlays, and bypass temporal upscaling cleanly on 2D menus, loading screens, and FMVs.
 
@@ -186,6 +186,7 @@ Additional runtime flags (non-persistent session overrides unless saved via UI):
 *The Suffering* supports full **zero-controller, native-PC Mouse & Keyboard play** from launch to end-credits alongside instant **Auto hot-switching** with DualSense 5 / Xbox controllers:
 
 - **True 1:1 Raw Mouse Aim:** Uses Windows Raw Input (`WM_INPUT`) injected directly past the Original Xbox 30% stick deadzone, divided algebraically by frame `dt` and guest sensitivity for framerate-independent 1:1 horizontal & vertical camera control (`~0.09°/count` at `1.00x` across 3rd-Person, 1st-Person, Creature, and Mounted Turret/Searchlight modes), with yaw slew acceleration bypassed for **zero stop-coasting drift** and optional **Raw 1:1 Aim** bypassing controller sticky target slowdown.
+- **Full Point-and-Click Menu & Interactive Map Mouse Support (`v1.4.0`):** Hover to highlight items and Left-Click (`LMB`) to select across Title, Main Menu, Pause, Options (including clicking/dragging sliders and toggles), Save/Load lists, Clem's Journal/Archives, and Confirmation modals; Right-Click (`RMB`) to go Back/Unpause; scroll the **Mouse Wheel** through menus and journal pages; and **Left-Click Drag + Mouse Wheel Zoom** on the interactive Map (`Tab` / `M`) — with automatic click-release latching so clicking *Resume Game* never fires a stray shot.
 - **Smart Cursor Capture & Release:** Automatically clips and hides the cursor during active 3D gameplay, and releases it immediately on Pause, Archives/Map, FMVs/Cutscenes, Title/Main Menu, `F1` Overlay, `Alt+Tab`/Focus Loss, or window resize/move.
 - **Scheme 1 Flashlight Upgrade:** Automatically upgrades the game's default Xbox control table (`Scheme 0`) to `Scheme 1` (`R3` -> Flashlight Toggle) so **`F`** toggles the flashlight natively on 1 keypress without disturbing controller layouts.
 - **All 18 Actions Rebindable (`Primary` + `Secondary`):** Stored under `[controls]` and `[controls.bindings]` in `settings.toml` and synced live between the Pre-Game Launcher (**Controls** tab) and the in-game **`F1` -> Controls** tab.
@@ -289,7 +290,7 @@ All runtime data is portable and stored beside `suffering.exe`:
   cmake --build out/build/linux-release --parallel
   # Package self-contained Linux & Steam Deck tarball:
   bash release_linux.sh --build-dir out/build/linux-release \
-    --out-tar .local/dist/TheSuffering-Recomp-v1.3.1-linux-x86_64.tar.gz
+    --out-tar .local/dist/TheSuffering-Recomp-v1.4.0-linux-x86_64.tar.gz
   ```
 - **Automated 6-Gate Release & Copyright Audit (Windows + Linux ELF64):**
   ```bash

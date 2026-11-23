@@ -129,7 +129,7 @@ public:
         static constexpr uint32_t kApiVersions[] = {0x0000015u, 0x0000014u, 0x0000013u};
         uint32_t init_res = ngx::kFailBase;
         for (uint32_t ver : kApiVersions) {
-            init_res = pfn_init_("4d570015-5788-4b02-9a3e-535546464552", ngx::kEngineCustom, "1.3.1", app_data.c_str(),
+            init_res = pfn_init_("4d570015-5788-4b02-9a3e-535546464552", ngx::kEngineCustom, "1.4.0", app_data.c_str(),
                                  dev_, ver, &info);
             if (ngx::Succeeded(init_res)) break;
         }

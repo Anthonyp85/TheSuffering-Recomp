@@ -282,7 +282,7 @@ void DrawSettingsWindow(double fps, float ui_scale) {
     bool open = true;
     constexpr ImGuiWindowFlags kFlags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
                                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings;
-    if (ImGui::Begin("The Suffering v1.3.1 - Settings (F1 or Back + L3 to Close)", &open, kFlags)) {
+    if (ImGui::Begin("The Suffering v1.4.0 - Settings (F1 or Back + L3 to Close)", &open, kFlags)) {
         if (ImGui::BeginTabBar("##SettingsTabs")) {
             // 1. Upscaling & Graphics Tab
             if (ImGui::BeginTabItem("Upscaling & Graphics", nullptr, tab_flags(0))) {
@@ -568,6 +568,7 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
             return false;
 
         case WM_SETCURSOR:
+            if (app::IsReplayOrAutotestActive()) return false;
             if (LOWORD(lp) == HTCLIENT) {
                 if (MkbIsCursorCaptured()) {
                     SetCursor(nullptr);
@@ -575,7 +576,6 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
                     return true;
                 }
                 bool show = g_overlay_open.load(std::memory_order_relaxed) ||
-                            app::Get().display_mode == app::DisplayMode::Windowed ||
                             MkbGetConfig().input_mode != InputMode::ControllerOnly;
                 SetCursor(show ? LoadCursorW(nullptr, IDC_ARROW) : nullptr);
                 if (result) *result = TRUE;

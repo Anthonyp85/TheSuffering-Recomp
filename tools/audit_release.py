@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Automated Copyright, Sanitization, History & Cross-Platform Release Archive Auditor (v1.3.1).
+"""Automated Copyright, Sanitization, History & Cross-Platform Release Archive Auditor (v1.4.0).
 
 Runs 6 mandatory gates and writes a JSON report to .local/m6_audit/audit_release_report.json:
   Gate 1: Full Git history scan (git rev-list --objects --all) for forbidden extensions/paths,
@@ -9,14 +9,14 @@ Runs 6 mandatory gates and writes a JSON report to .local/m6_audit/audit_release
   Gate 2: HEAD & working-tree hygiene/sanitization (clean tree unless --allow-dirty, zero
           machine/site leak strings, GPL-2.0-or-later SPDX headers incl. .sh/.yml/.desktop,
           SDK patch byte parity).
-  Gate 3: Source release archive (.local/dist/TheSuffering-Recomp-v1.3.1-source.zip) exact
+  Gate 3: Source release archive (.local/dist/TheSuffering-Recomp-v1.4.0-source.zip) exact
           1-to-1 match with git ls-tree -r HEAD, required files, zero forbidden files/strings.
-  Gate 4: Win64 launcher release archive (.local/dist/TheSuffering-Recomp-v1.3.1-win64-launcher.zip)
+  Gate 4: Win64 launcher release archive (.local/dist/TheSuffering-Recomp-v1.4.0-win64-launcher.zip)
           exact allowlist of redistributable PE/lib files (incl. SHA-256-pinned official vendor
           upscaler plugins), required license/notice docs, zero suffering.dll / .xbe / .iso /
           .7z / compiler/work / runtime state.
   Gate 4b: Native Linux x86_64 & Steam Deck release archive
-          (.local/dist/TheSuffering-Recomp-v1.3.1-linux-x86_64.tar.gz) ELF64 header check,
+          (.local/dist/TheSuffering-Recomp-v1.4.0-linux-x86_64.tar.gz) ELF64 header check,
           GLIBC_2.35 max symbol version verification, self-contained compiler/ RPATH & deps,
           required Steam Deck/desktop/license files, LF script endings, zero libsuffering.so /
           .dll / .exe / .xbe / .iso / compiler/work / runtime state.
@@ -43,9 +43,9 @@ REPO = Path(__file__).resolve().parent.parent
 SDK_DIR = REPO / "XboxXBERecomp"
 PATCH_FILE = REPO / "patches" / "xboxxberecomp.patch"
 DIST_DIR = REPO / ".local" / "dist"
-DEFAULT_SOURCE_ZIP = DIST_DIR / "TheSuffering-Recomp-v1.3.1-source.zip"
-DEFAULT_LAUNCHER_ZIP = DIST_DIR / "TheSuffering-Recomp-v1.3.1-win64-launcher.zip"
-DEFAULT_LINUX_TAR = DIST_DIR / "TheSuffering-Recomp-v1.3.1-linux-x86_64.tar.gz"
+DEFAULT_SOURCE_ZIP = DIST_DIR / "TheSuffering-Recomp-v1.4.0-source.zip"
+DEFAULT_LAUNCHER_ZIP = DIST_DIR / "TheSuffering-Recomp-v1.4.0-win64-launcher.zip"
+DEFAULT_LINUX_TAR = DIST_DIR / "TheSuffering-Recomp-v1.4.0-linux-x86_64.tar.gz"
 REPORT_PATH = REPO / ".local" / "m6_audit" / "audit_release_report.json"
 
 FORBIDDEN_EXTS = {
