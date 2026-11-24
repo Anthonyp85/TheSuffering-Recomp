@@ -15,6 +15,8 @@
 #include "common/mkb_input.h"
 #include "common/settings_ui.h"
 #include "common/ui_common.h"
+#include "common/update_checker.h"
+#include "common/version.h"
 
 #include <algorithm>
 #include <array>
@@ -58,6 +60,8 @@ enum class UiAction : uintptr_t {
     OpenCrashDir = 5,
     CreateShortcut = 6,
     OpenPluginsDir = 7,
+    OpenReleaseUrl = 8,
+    QuitForStagedUpdate = 9,
 };
 
 std::atomic<bool> g_overlay_open{false};
@@ -80,6 +84,18 @@ std::chrono::steady_clock::time_point g_rumble_test_until{};
 std::mutex g_status_lock;
 std::string g_status_banner;
 bool g_status_is_error = false;
+std::string g_pending_release_url;
+
+// In-game background update notification toast + manual check tracking
+std::string g_update_toast_tag;
+uint64_t g_update_toast_start_ms = 0;
+bool g_update_toast_dismissed_by_overlay = false;
+bool g_ingame_upd_manual_pending = false;
+UpdateState g_ingame_prev_upd_state = UpdateState::Idle;
+
+struct UpdateCheckerProcessExitGuard {
+    ~UpdateCheckerProcessExitGuard() { ShutdownUpdateChecker(); }
+} g_update_exit_guard;
 
 // Automated UI screenshot capture CLI/env support (--open-settings, --settings-tab N, --capture-ui-bmp, --capture-ui-exit)
 fs::path g_capture_ui_path;
@@ -293,6 +309,82 @@ void DrawShaderWarmupToast(const gpu::ShaderWarmupStatus& ws, float alpha, float
     ImGui::PopStyleVar();
 }
 
+bool ShouldShowUpdateAvailableToast(const UpdateStatusSnapshot& snap, const std::string& dismissed_tag,
+                                    bool overlay_open, float& out_alpha) {
+    if (g_suppress_warmup_toast || !g_capture_ui_path.empty() || app::IsReplayOrAutotestActive()) return false;
+    if (snap.state != UpdateState::UpdateAvailable || snap.manual_check || snap.latest_tag.empty()) return false;
+    if (!dismissed_tag.empty() && snap.latest_tag == dismissed_tag) return false;
+
+    uint64_t now_ms = uint64_t(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    if (g_update_toast_tag != snap.latest_tag) {
+        g_update_toast_tag = snap.latest_tag;
+        g_update_toast_start_ms = now_ms;
+        g_update_toast_dismissed_by_overlay = false;
+    }
+    if (overlay_open) {
+        g_update_toast_dismissed_by_overlay = true;
+        return false;
+    }
+    if (g_update_toast_dismissed_by_overlay || now_ms < g_update_toast_start_ms) return false;
+    uint64_t age_ms = now_ms - g_update_toast_start_ms;
+    constexpr uint64_t kShowDurationMs = 6000;
+    constexpr uint64_t kFadeStartMs = 5100;
+    if (age_ms >= kShowDurationMs) return false;
+    out_alpha = (age_ms <= kFadeStartMs)
+                    ? 1.0f
+                    : std::clamp(float(kShowDurationMs - age_ms) / float(kShowDurationMs - kFadeStartMs), 0.0f, 1.0f);
+    return out_alpha > 0.02f;
+}
+
+void DrawUpdateAvailableToast(const UpdateStatusSnapshot& snap, float alpha, float ui_scale) {
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 16.0f * ui_scale, 16.0f * ui_scale), ImGuiCond_Always,
+                            ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.88f * alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.15f, 0.115f, 0.068f, 0.94f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.94f, 0.70f, 0.22f, 0.92f));
+    constexpr ImGuiWindowFlags kToastFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
+    if (ImGui::Begin("##SufferingUpdateAvailableToast", nullptr, kToastFlags)) {
+        ImGui::TextColored(ImVec4(1.00f, 0.84f, 0.36f, 1.0f),
+                           "Update %s available - press F1 -> Launcher & Diagnostics", snap.latest_tag.c_str());
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar();
+}
+
+void PollInGameUpdateTransitions(const UpdateStatusSnapshot& snap) {
+    if (g_ingame_upd_manual_pending && snap.state != UpdateState::Checking && snap.state != UpdateState::Idle) {
+        g_ingame_upd_manual_pending = false;
+        if (snap.state == UpdateState::UpToDate) {
+            SetStatus(std::string("Up to date (") + SUFFERING_VERSION_TAG + ")", false);
+        } else if (snap.state == UpdateState::UpdateAvailable) {
+            std::string tag = !snap.latest_tag.empty() ? snap.latest_tag : ("v" + snap.latest_version);
+            SetStatus("Update available: " + tag, false);
+        } else if (snap.state == UpdateState::Error) {
+            SetStatus(snap.status_message.empty() ? "Update check failed (network error)."
+                                                  : SanitizeUiText(snap.status_message, true, 140),
+                      true);
+        }
+    } else if (g_ingame_prev_upd_state == UpdateState::Downloading && snap.state != UpdateState::Downloading) {
+        if (snap.state == UpdateState::ReadyToRestart) {
+            SetStatus("Update " + snap.latest_tag +
+                          " staged! Save your game progress first, then click 'Save & Exit to Update'.",
+                      false);
+        } else if (snap.state == UpdateState::Error) {
+            SetStatus(snap.status_message.empty() ? "Self-update download/staging failed."
+                                                  : SanitizeUiText(snap.status_message, true, 140),
+                      true);
+        }
+    }
+    g_ingame_prev_upd_state = snap.state;
+}
+
 void DrawSettingsWindow(double fps, float ui_scale) {
     app::Settings& s = app::Get();
     if (!g_lists_inited) {
@@ -337,10 +429,13 @@ void DrawSettingsWindow(double fps, float ui_scale) {
         return 0;
     };
 
+    UpdateStatusSnapshot upd_snap = GetUpdateSnapshot();
+    PollInGameUpdateTransitions(upd_snap);
+
     bool open = true;
     constexpr ImGuiWindowFlags kFlags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
                                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings;
-    if (ImGui::Begin("The Suffering v1.4.1 - Settings (F1 or Back + L3 to Close)", &open, kFlags)) {
+    if (ImGui::Begin("The Suffering " SUFFERING_VERSION_TAG " - Settings (F1 or Back + L3 to Close)", &open, kFlags)) {
         if (ImGui::BeginTabBar("##SettingsTabs")) {
             // 1. Upscaling & Graphics Tab
             if (ImGui::BeginTabItem("Upscaling & Graphics", nullptr, tab_flags(0))) {
@@ -386,6 +481,118 @@ void DrawSettingsWindow(double fps, float ui_scale) {
             if (ImGui::BeginTabItem("Launcher & Diagnostics", nullptr, tab_flags(4))) {
                 ImGui::Spacing();
                 SharedUiOptions& o = GetSharedUiOptions();
+
+                // --- Updates Section ---
+                ImGui::TextUnformatted("Updates (" SUFFERING_VERSION_TAG "):");
+                if (ShouldShowUpdateBanner(upd_snap, o.dismissed_update_tag)) {
+                    UpdateCardContext uctx{};
+                    uctx.in_launcher = false;
+                    uctx.ui_scale = ui_scale;
+                    uctx.on_update_now = [&] {
+                        if (StartDownloadAndStageUpdate()) {
+                            SetStatus("Downloading & staging " +
+                                          (upd_snap.asset_name.empty() ? upd_snap.latest_tag : upd_snap.asset_name) +
+                                          " in the background...",
+                                      false);
+                        } else {
+                            UpdateStatusSnapshot err_s = GetUpdateSnapshot();
+                            SetStatus(err_s.status_message.empty() ? "Could not start self-update download."
+                                                                   : SanitizeUiText(err_s.status_message, true, 140),
+                                      true);
+                        }
+                    };
+                    uctx.on_apply_and_restart = [&] {
+                        app::Save();
+                        if (ApplyStagedUpdateAndRelaunch()) {
+                            PostAction(UiAction::QuitForStagedUpdate);
+                        } else {
+                            UpdateStatusSnapshot err_s = GetUpdateSnapshot();
+                            SetStatus(err_s.status_message.empty() ? "Failed to launch staged update helper."
+                                                                   : SanitizeUiText(err_s.status_message, true, 140),
+                                      true);
+                        }
+                    };
+                    uctx.on_open_release_page = [](const std::string& url) {
+                        {
+                            std::lock_guard<std::mutex> lock(g_status_lock);
+                            g_pending_release_url = url.empty() ? std::string(SUFFERING_RELEASES_URL) : url;
+                        }
+                        PostAction(UiAction::OpenReleaseUrl);
+                    };
+                    uctx.on_dismiss = [&](const std::string& tag) {
+                        o.dismissed_update_tag = tag;
+                        SetStatus("Dismissed update alert for " + tag + " (click 'Check for Updates' to show again).",
+                                  false);
+                    };
+                    DrawUpdateAlertCard(upd_snap, uctx);
+                    ImGui::Spacing();
+                }
+
+                bool upd_busy =
+                    (upd_snap.state == UpdateState::Checking || upd_snap.state == UpdateState::Downloading);
+                if (upd_busy) ImGui::BeginDisabled(true);
+                if (ImGui::Button(upd_snap.state == UpdateState::Checking ? "Checking...##InGameUpdBtn"
+                                                                          : "Check for Updates##InGameUpdBtn")) {
+                    o.dismissed_update_tag.clear();
+                    g_ingame_upd_manual_pending = true;
+                    SetStatus("Checking GitHub Releases for updates...", false);
+                    StartUpdateCheck(true);
+                }
+                if (upd_busy) ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (ImGui::Button("Open Release Page##InGameRelBtn")) {
+                    {
+                        std::lock_guard<std::mutex> lock(g_status_lock);
+                        g_pending_release_url =
+                            upd_snap.html_url.empty() ? std::string(SUFFERING_RELEASES_URL) : upd_snap.html_url;
+                    }
+                    PostAction(UiAction::OpenReleaseUrl);
+                }
+                ImGui::SameLine();
+                if (ImGui::Checkbox("Automatically Check for Updates on Startup", &o.check_updates_on_startup)) {
+                    app::Save();
+                }
+
+                switch (upd_snap.state) {
+                    case UpdateState::Checking:
+                        ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.36f, 1.0f),
+                                           "Status: Querying GitHub Releases (%s)...", SUFFERING_GITHUB_REPO);
+                        break;
+                    case UpdateState::UpToDate:
+                        ImGui::TextColored(ImVec4(0.45f, 0.92f, 0.55f, 1.0f), "Status: Up to date (%s)",
+                                           SUFFERING_VERSION_TAG);
+                        break;
+                    case UpdateState::UpdateAvailable:
+                        ImGui::TextColored(
+                            ImVec4(1.00f, 0.84f, 0.36f, 1.0f),
+                            "Status: Update available (%s) - save your progress in-game before updating.",
+                            upd_snap.latest_tag.c_str());
+                        break;
+                    case UpdateState::Downloading:
+                        ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.36f, 1.0f), "Status: Downloading %s...",
+                                           upd_snap.asset_name.c_str());
+                        break;
+                    case UpdateState::ReadyToRestart:
+                        ImGui::TextColored(
+                            ImVec4(0.48f, 0.96f, 0.60f, 1.0f),
+                            "Status: Update %s staged! Save your game progress, then click 'Save & Exit to Update'.",
+                            upd_snap.latest_tag.c_str());
+                        break;
+                    case UpdateState::Error:
+                        ImGui::TextColored(
+                            ImVec4(0.95f, 0.38f, 0.38f, 1.0f), "Status: %s",
+                            upd_snap.status_message.empty()
+                                ? "Update check failed."
+                                : SanitizeUiText(upd_snap.status_message, true, 120).c_str());
+                        break;
+                    case UpdateState::Idle:
+                    default:
+                        ImGui::TextDisabled("Installed Version: %s  |  GitHub: %s", SUFFERING_VERSION_TAG,
+                                            SUFFERING_GITHUB_REPO);
+                        break;
+                }
+                ImGui::Separator();
+
                 if (ImGui::Checkbox("Show Live FPS, Frame-Time & Upscaler HUD", &o.show_fps_hud)) {
                     app::Save();
                 }
@@ -521,6 +728,7 @@ std::vector<app::Option> UiOptions() {
         {"stick_deadzone", nullptr, &o.stick_deadzone},
         {"touchpad_as_back", &o.touchpad_as_back, nullptr},
         {"show_fps_hud", &o.show_fps_hud, nullptr},
+        {"check_updates_on_startup", &o.check_updates_on_startup, nullptr},
     };
 }
 
@@ -591,6 +799,21 @@ void UiInit() {
         g_capture_ui_exit = true;
     }
 #endif
+
+#ifdef _WIN32
+    const wchar_t* mock_upd = _wgetenv(L"SUFFERING_UPDATE_MOCK_JSON");
+    const bool has_mock_upd = mock_upd && *mock_upd;
+#else
+    const char* mock_upd = std::getenv("SUFFERING_UPDATE_MOCK_JSON");
+    const bool has_mock_upd = mock_upd && *mock_upd;
+#endif
+    if ((!g_suppress_warmup_toast && g_capture_ui_path.empty() && !app::IsReplayOrAutotestActive()) || has_mock_upd) {
+        if ((o.check_updates_on_startup && ShouldAutoCheckForUpdates()) || has_mock_upd) {
+            if (GetUpdateSnapshot().state == UpdateState::Idle) {
+                StartUpdateCheck(false);
+            }
+        }
+    }
 }
 
 void UiOnWindow(void* hwnd) {
@@ -614,6 +837,11 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
 #ifdef _WIN32
     HWND hwnd = static_cast<HWND>(hwnd_ptr);
     switch (msg) {
+        case WM_CLOSE:
+        case WM_DESTROY:
+            ShutdownUpdateChecker();
+            return false;
+
         case WM_KEYDOWN:
             if (wp == VK_F1) {
                 bool next = !g_overlay_open.load(std::memory_order_relaxed);
@@ -695,6 +923,20 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
                     }
                     break;
                 }
+                case UiAction::OpenReleaseUrl: {
+                    std::string url;
+                    {
+                        std::lock_guard<std::mutex> lock(g_status_lock);
+                        url = g_pending_release_url;
+                    }
+                    if (url.empty()) url = SUFFERING_RELEASES_URL;
+                    OpenReleasePageInBrowser(url);
+                    SetStatus("Opened release page in browser: " + url);
+                    break;
+                }
+                case UiAction::QuitForStagedUpdate:
+                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    break;
             }
             if (result) *result = 0;
             return true;
@@ -706,6 +948,11 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
     const SDL_Event* ev = reinterpret_cast<const SDL_Event*>(lp);
     if (!ev) return false;
     switch (msg) {
+        case SDL_EVENT_QUIT:
+        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+            ShutdownUpdateChecker();
+            return false;
+
         case SDL_EVENT_KEY_DOWN:
             if (ev->key.repeat) return false;
             if (ev->key.key == SDLK_F1) {
@@ -761,6 +1008,27 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
                         }
                         break;
                     }
+                    case UiAction::OpenReleaseUrl: {
+                        std::string url;
+                        {
+                            std::lock_guard<std::mutex> lock(g_status_lock);
+                            url = g_pending_release_url;
+                        }
+                        if (url.empty()) url = SUFFERING_RELEASES_URL;
+                        OpenReleasePageInBrowser(url);
+                        if (IsGamescope()) {
+                            SetStatus("Release page: " + url + " (browse in Desktop Mode if hidden)");
+                        } else {
+                            SetStatus("Opened release page in browser: " + url);
+                        }
+                        break;
+                    }
+                    case UiAction::QuitForStagedUpdate: {
+                        SDL_Event qev{};
+                        qev.type = SDL_EVENT_QUIT;
+                        SDL_PushEvent(&qev);
+                        break;
+                    }
                 }
             }
             if (result) *result = 0;
@@ -794,11 +1062,20 @@ void OnUi(double fps) {
     gpu::ShaderWarmupStatus warmup_ws{};
     float warmup_alpha = 0.0f;
     bool show_warmup = ShouldShowShaderWarmupToast(warmup_ws, warmup_alpha);
-    if (o.show_fps_hud || open || show_warmup) {
+    UpdateStatusSnapshot toast_upd_snap{};
+    float update_toast_alpha = 0.0f;
+    bool show_update_toast = false;
+    if (!g_suppress_warmup_toast && g_capture_ui_path.empty() && !app::IsReplayOrAutotestActive()) {
+        toast_upd_snap = GetUpdateSnapshot();
+        show_update_toast =
+            ShouldShowUpdateAvailableToast(toast_upd_snap, o.dismissed_update_tag, open, update_toast_alpha);
+    }
+    if (o.show_fps_hud || open || show_warmup || show_update_toast) {
         float ui_scale = ComputeInGameUiScale();
         EnsureInGameStyle(ui_scale);
         if (o.show_fps_hud) DrawFpsHud(fps, ui_scale);
         if (show_warmup) DrawShaderWarmupToast(warmup_ws, warmup_alpha, ui_scale);
+        if (show_update_toast) DrawUpdateAvailableToast(toast_upd_snap, update_toast_alpha, ui_scale);
         if (open) DrawSettingsWindow(fps, ui_scale);
     }
 

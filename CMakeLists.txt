@@ -108,7 +108,7 @@ if(WIN32)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/res/suffering.rc"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/res/suffering.manifest"
     )
-    target_link_libraries(suffering PRIVATE shell32 ole32 uuid wintrust oldnames)
+    target_link_libraries(suffering PRIVATE shell32 ole32 uuid wintrust oldnames winhttp)
 else()
     target_compile_definitions(suffering PRIVATE _FILE_OFFSET_BITS=64)
 endif()

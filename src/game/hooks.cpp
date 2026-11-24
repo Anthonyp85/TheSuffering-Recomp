@@ -5,18 +5,22 @@
 //    zero-coasting yaw slew bypass, decoupled PC pitch polarity, Scheme 1 dedicated R3 flashlight)
 //  - Full native-PC point-and-click, hover, drag, wheel, and right-click-back menu mouse engine
 //    inside CUIMgr::Update (sub_0005F9A0) across all Riot Engine UI screens
-//  - Sub-microsecond CClock (0x002DC724) timing hooks eliminating 1ms KeTickCount quantization
-//    and Unpause dt snowballs
+//  - Sub-microsecond CClock (0x002DC724) timing hooks eliminating 1ms KeTickCount quantization,
+//    Unpause dt snowballs, pause/streaming-pause total_s drift, and SaveState wall-clock drift
 //  - 60 Hz Cloth::Update accumulator (sub_001A6480) for safe native >60 FPS gameplay
-//  - XMVDecoder_GetNextFrame VBlank yield (sub_00265C7B)
+//  - XMVDecoder_GetNextFrame VBlank yield (sub_00265C7B) and cooperative SRSC / CSTOMP yields
+//    (sub_001765E0, sub_00156CA0, sub_001BAB90)
+//  - Surgical 2 Cellblocks Dallas (#2152) script race & softlock guards (sub_000D9AE0, sub_001414C0)
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <thread>
 
 #include "app/app.h"
 #include "common/mkb_input.h"
@@ -26,6 +30,10 @@
 #include "xdk/d3d8.h"
 #include "xdk/hle.h"
 
+namespace kernel {
+void SleepHighResUs(int64_t us);
+}
+
 X86_EXTERN_FUNC(__imp__sub_0014E1F0);
 X86_EXTERN_FUNC(__imp__sub_001B09A0);
 X86_EXTERN_FUNC(__imp__sub_000576A0);
@@ -33,26 +41,46 @@ X86_EXTERN_FUNC(__imp__sub_000505D0);
 X86_EXTERN_FUNC(__imp__sub_000465F0);
 X86_EXTERN_FUNC(__imp__sub_00265C7B);
 X86_EXTERN_FUNC(__imp__sub_0005F9A0);
+X86_EXTERN_FUNC(__imp__sub_000D9AE0);
+X86_EXTERN_FUNC(__imp__sub_001414C0);
+X86_EXTERN_FUNC(__imp__sub_00156CA0);
+X86_EXTERN_FUNC(__imp__sub_001765E0);
 X86_EXTERN_FUNC(__imp__sub_001A3170);
 X86_EXTERN_FUNC(__imp__sub_001A31A0);
 X86_EXTERN_FUNC(__imp__sub_001A3210);
 X86_EXTERN_FUNC(__imp__sub_001A3220);
+X86_EXTERN_FUNC(__imp__sub_001A3320);
 X86_EXTERN_FUNC(__imp__sub_001A3390);
 X86_EXTERN_FUNC(__imp__sub_001A3470);
 X86_EXTERN_FUNC(__imp__sub_001A6480);
+X86_EXTERN_FUNC(__imp__sub_001BAB90);
 
 namespace {
 
 // Verified guest globals (The Suffering USA default.xbe, Title ID 0x4D570015)
+constexpr uint32_t kVaLevelMgrPtr = 0x002D0D88u;
+constexpr uint32_t kVaWorldPtr = 0x002D0DC0u;
 constexpr uint32_t kVaUiMgrPtr = 0x002DAD78u;
 constexpr uint32_t kVaRendererPtr = 0x002DC75Cu;
 constexpr uint32_t kVaUserSettings = 0x002DB218u;
 constexpr uint32_t kVaSensMax = 0x002DADA0u;
 constexpr uint32_t kVaSensMin = 0x002DADA4u;
 constexpr uint32_t kVaMainClock = 0x002DC724u;
+constexpr uint32_t kVaInstanceIdMap = 0x002DD1B4u;
+constexpr uint32_t kVaLevelMgr = 0x002DEF40u;
 constexpr uint32_t kVaGlobalDt = 0x002E01D0u;
 constexpr uint32_t kVaGlobalInvDt = 0x002E01D4u;
+constexpr uint32_t kVaPauseFlags = 0x002E0274u;
 constexpr uint32_t kVaFrameCount = 0x002E0280u;
+constexpr uint32_t kVaMaxDt = 0x002E0298u;
+
+// Verified logic actor vtables & 2 Cellblocks instance IDs
+constexpr uint32_t kVtMessageRelay = 0x0029EFC8u;
+constexpr uint32_t kVtTimer = 0x002A2F68u;
+constexpr uint32_t kIidDallas = 2152u;
+constexpr uint32_t kIidCellblocksStompDoneRelay = 4051u;
+constexpr uint32_t kIidCellblocksDallasGateRelay = 11966u;
+constexpr uint32_t kIidCellblocksDallasDeadTimer = 12614u;
 
 // Verified strong-symbol guest UI methods
 constexpr uint32_t kFnSetFocusedChild = 0x0005D790u;
@@ -962,30 +990,47 @@ struct HighResClockState {
         return std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(back_s));
     }
 
-    void OnCtor() {
+    void SyncGuestClockAnchors(uint8_t* base, uint32_t clock_va) const {
+        const float t = float(total_s);
+        X86_MEMF32(clock_va + 0x20u) = t;
+        X86_MEMF32(clock_va + 0x24u) = t;
+        if (kernel::g_tick_count_va >= 0x10000u && mem::IsCommitted(kernel::g_tick_count_va)) {
+            X86_MEM32(clock_va + 0x28u) = X86_MEM32(kernel::g_tick_count_va);
+        }
+    }
+
+    void OnCtor(uint8_t* base, uint32_t clock_va) {
         last_tick = std::chrono::steady_clock::now();
         total_s = 0.0;
         valid = true;
         just_unpaused = false;
+        SyncGuestClockAnchors(base, clock_va);
     }
 
-    void OnReset(uint8_t* base, bool full_reset) {
+    void OnReset(uint8_t* base, uint32_t clock_va, bool full_reset) {
         auto now = std::chrono::steady_clock::now();
         if (full_reset) total_s = 0.0;
         last_tick = now - ClampedPrevDtDuration(base);
         valid = true;
         just_unpaused = false;
+        SyncGuestClockAnchors(base, clock_va);
     }
 
-    void OnPause() {
-        // CClock::Pause (0x001A3210) only snapshots [esi+0x0C] and does not modify [esi]; leave last_tick untouched.
+    void OnPause(uint8_t* base, uint32_t clock_va) {
+        // CClock::Pause (0x001A3210) snapshots [esi+0x0C]; keep [+0x20/+0x24] anchored to frozen total_s.
+        if (valid) {
+            const float t = float(total_s);
+            X86_MEMF32(clock_va + 0x20u) = t;
+            X86_MEMF32(clock_va + 0x24u) = t;
+        }
     }
 
-    void OnUnpause() {
+    void OnUnpause(uint8_t* base, uint32_t clock_va) {
         // Do NOT backdate by 16.67ms: Unpause runs mid-frame before Swap/Pace(), so backdating doubles dt to 33.3ms.
         last_tick = std::chrono::steady_clock::now();
         valid = true;
         just_unpaused = true;
+        SyncGuestClockAnchors(base, clock_va);
     }
 
     void OnLoadState(uint8_t* base, uint32_t clock_va) {
@@ -995,10 +1040,77 @@ struct HighResClockState {
         last_tick = now - ClampedPrevDtDuration(base);
         valid = true;
         just_unpaused = false;
+        SyncGuestClockAnchors(base, clock_va);
     }
 };
 
 HighResClockState g_main_clk{};
+
+// Cooperatively yields to the SRSC streaming worker while an acquired SRSC resource is in state 2 (LOADING).
+void WaitSrscResourceReady(uint8_t* base, uint32_t res_va) {
+    if (!ValidGuest(res_va + 0x0Eu, 1u)) return;
+    volatile const uint8_t* state_ptr = reinterpret_cast<volatile const uint8_t*>(base + res_va + 0x0Eu);
+    uint32_t spins = 0;
+    while ((*state_ptr & 0x03u) == 0x02u) {
+        if (spins < 16u) {
+            std::this_thread::yield();
+        } else {
+            kernel::SleepHighResUs(50);
+        }
+        ++spins;
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+}
+
+// Identifies the 18 verified Riot Engine call-sites that invoke SRSCResourceMgr::Acquire (sub_001765E0)
+// with bAsync=1 (to avoid sub_00176310's 200ms Sleep(0xC8) poll) and then immediately spin in user-mode
+// on `([res + 0x0E] & 3) == 2` waiting for the SRSC worker thread to finish loading.
+bool IsSyncSrscAcquireCallSite(const X86Context& ctx, uint8_t* base) {
+    const uint32_t ret_eip = X86_MEM32(ctx.esp);
+    switch (ret_eip) {
+        // Direct callers in CAudioMgr & CAnimMgr that spin immediately on ([eax/ecx/esi + 0x0E] & 3) == 2
+        case 0x0015A539u:  // sub_0015A4F0
+        case 0x0015A5C9u:  // sub_0015A580
+        case 0x0015A64Eu:  // sub_0015A610
+        case 0x0015AD0Bu:  // sub_0015ACB0
+        case 0x0016F9F5u:  // sub_0016F9C0
+        case 0x0016FA75u:  // sub_0016FA40
+        case 0x0016FB05u:  // sub_0016FAC0
+        case 0x0016FBC5u:  // sub_0016FB80
+            return true;
+
+        // 1-level typed-acquire wrappers (each allocates 0x10 bytes + pushes 1 arg + return addr -> outer ret at +0x18)
+        case 0x001625ECu:  // sub_001625C0
+        case 0x0016F8DCu:  // sub_0016F8B0
+        case 0x001786AAu:  // sub_00178670
+        case 0x0017AD2Cu:  // sub_0017AD00
+        case 0x0017B2CAu:  // sub_0017B290
+        {
+            const uint32_t outer_va = ctx.esp + 0x18u;
+            if (!ValidGuest(outer_va, 4u)) return false;
+            const uint32_t outer_ret = X86_MEM32(outer_va);
+            switch (outer_ret) {
+                case 0x000612CDu:  // sub_00061240 (6-texture loop spinning at 0x000612D7..0x000612FC)
+                case 0x00064CB6u:  // sub_00064BF0 (CCredits CSV load)
+                case 0x000CA12Du:  // sub_000CA0F0
+                case 0x00162455u:  // sub_00162120
+                case 0x00163850u:  // sub_00163710
+                case 0x00166DA8u:  // sub_00166D60
+                case 0x0016E750u:  // sub_0016E670 (transition anim sync path; async 0x0016E6C8 is NOT matched)
+                case 0x001BA6EFu:  // sub_001BA680
+                    return true;
+                case 0x00156CCFu:  // sub_00156CA0(int bAsync): spins at 0x00156D20 iff bAsync ([esp+0x2C]) == 0
+                    return ValidGuest(ctx.esp + 0x2Cu, 4u) && X86_MEM32(ctx.esp + 0x2Cu) == 0u;
+                case 0x00193871u:  // sub_00193840 (spins at 0x00193882 iff ebx == 0)
+                    return ctx.ebx == 0u;
+                default:
+                    return false;
+            }
+        }
+        default:
+            return false;
+    }
+}
 
 // 60 Hz Cloth::Update accumulator for native >60 FPS gameplay (sub_001A6480).
 struct ClothAccumulatorState {
@@ -1009,6 +1121,78 @@ struct ClothAccumulatorState {
 };
 
 ClothAccumulatorState g_cloth_accum{};
+
+// Uniquely identifies `English/Levels/2 Cellblocks/2 Cellblocks.lvl` via bounded case-insensitive
+// substring match on CLevelMgr::m_levelPath ([0x002D0D88] / 0x002DEF40, 0x104 bytes).
+bool IsCellblocks2Level(uint8_t* base) {
+    uint32_t lvl_va = ValidGuest(kVaLevelMgrPtr, 4u) ? X86_MEM32(kVaLevelMgrPtr) : 0u;
+    if (!ValidGuest(lvl_va, 0x104u)) {
+        lvl_va = kVaLevelMgr;
+        if (!ValidGuest(lvl_va, 0x104u)) return false;
+    }
+    const char* s = reinterpret_cast<const char*>(base + lvl_va);
+    size_t len = 0;
+    while (len < 0x104u && s[len] != '\0') ++len;
+
+    constexpr char kNeedle[] = "2 cellblocks";
+    constexpr size_t kNeedleLen = sizeof(kNeedle) - 1u;
+    if (len < kNeedleLen) return false;
+    for (size_t i = 0; i + kNeedleLen <= len; ++i) {
+        bool match = true;
+        for (size_t j = 0; j < kNeedleLen; ++j) {
+            char c = s[i + j];
+            if (c >= 'A' && c <= 'Z') c = char(c + ('a' - 'A'));
+            if (c != kNeedle[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+// Read-only CGameObject* lookup by instance ID across CInstanceIdMap (0x002DD1B4, sub_00163E00)
+// and CWorld's 6-byte packed object handle table ([world + 0x0C], capacity [world + 0x14], sub_00149850).
+uint32_t FindObjectByIid(uint8_t* base, uint32_t target_iid) {
+    if (!ValidGuest(kVaInstanceIdMap, 0x14u) || !ValidGuest(kVaWorldPtr, 4u)) return 0u;
+    const int32_t count = int32_t(X86_MEM32(kVaInstanceIdMap + 0x10u));
+    const uint32_t handles_va = X86_MEM32(kVaInstanceIdMap + 0x08u);
+    if (count <= 0 || count > 65536 || !ValidGuest(handles_va, uint32_t(count) * 2u)) return 0u;
+
+    const uint32_t world_va = X86_MEM32(kVaWorldPtr);
+    if (!ValidGuest(world_va + 0x0Cu, 12u)) return 0u;
+    const uint32_t tbl_va = X86_MEM32(world_va + 0x0Cu);
+    const int32_t tbl_cap = int32_t(X86_MEM32(world_va + 0x14u));
+    if (tbl_cap <= 0 || tbl_cap > 65536 || !ValidGuest(tbl_va, uint32_t(tbl_cap) * 6u)) return 0u;
+
+    for (int32_t i = 0; i < count; ++i) {
+        const uint16_t h = X86_MEM16(handles_va + uint32_t(i) * 2u);
+        if (h == 0u || int32_t(h) >= tbl_cap) continue;
+        const uint32_t obj_va = X86_MEM32(tbl_va + uint32_t(h) * 6u);
+        if (!ValidGuest(obj_va, 0xECu)) continue;
+        if (X86_MEM32(obj_va + 0xD0u) == target_iid) {
+            return obj_va;
+        }
+    }
+    return 0u;
+}
+
+// Verifies Dallas (#2152) exists in the world, is not flagged destroyed ([+0x08] & 0x80000000, sub_001558D0),
+// has entity_kind == CNPC (7, sub_000EF400), and is !CDamageable::IsDead (sub_000AF560).
+// Returns false on Evil-morality runs where the player killed Dallas so Timer #12614 stays enabled.
+bool IsDallasAlive(uint8_t* base) {
+    const uint32_t obj_va = FindObjectByIid(base, kIidDallas);
+    if (obj_va == 0u) return false;
+    if ((X86_MEM32(obj_va + 0x08u) & 0x80000000u) != 0u) return false;
+    if (X86_MEM32(obj_va + 0xE0u) != 7u) return false;
+
+    const uint32_t npc_va = X86_MEM32(obj_va + 0x60u);
+    if (!ValidGuest(npc_va, 0x24u)) return false;
+    if (X86_MEM32(npc_va + 0x0Eu) != 0u || X86_MEM32(npc_va + 0x1Eu) != 0u) return true;
+    const float hp = X86_MEMF32(npc_va + 0x16u);
+    return std::isfinite(hp) && hp > 0.0f;
+}
 
 }  // namespace
 
@@ -1146,30 +1330,55 @@ X86_FUNC(sub_0005F9A0) {
 
 // 8. Sub-microsecond CClock (0x002DC724) lifecycle & tick hooks (NOT bypassed during replay/autotest):
 // Replaces 1ms integer GetTickCount dt sawtooth (16/17/18ms at 60 FPS; 5/6/7ms at 165 FPS) with
-// continuous steady_clock double->float dt and prevents CClock::Unpause backdate dt snowballs.
+// continuous steady_clock double->float dt, freezes g_ElapsedGameTime during world/streaming pause,
+// matches TimeMgr's 0.10s max_dt clamp, and serializes exact total_s in CClock::SaveState.
 X86_FUNC(sub_001A3170) {
     const uint32_t clock_va = ctx.ecx;
     __imp__sub_001A3170(ctx, base);
-    if (clock_va == kVaMainClock) g_main_clk.OnCtor();
+    if (clock_va == kVaMainClock) g_main_clk.OnCtor(base, clock_va);
 }
 
 X86_FUNC(sub_001A31A0) {
     const uint32_t clock_va = ctx.ecx;
     const uint32_t full_reset = X86_MEM32(ctx.esp + 0x04u);
     __imp__sub_001A31A0(ctx, base);
-    if (clock_va == kVaMainClock) g_main_clk.OnReset(base, full_reset != 0u);
+    if (clock_va == kVaMainClock) g_main_clk.OnReset(base, clock_va, full_reset != 0u);
 }
 
 X86_FUNC(sub_001A3210) {
     const uint32_t clock_va = ctx.ecx;
     __imp__sub_001A3210(ctx, base);
-    if (clock_va == kVaMainClock) g_main_clk.OnPause();
+    if (clock_va == kVaMainClock) g_main_clk.OnPause(base, clock_va);
 }
 
 X86_FUNC(sub_001A3220) {
     const uint32_t clock_va = ctx.ecx;
+    if (clock_va == kVaMainClock && g_main_clk.valid) {
+        const float t = float(g_main_clk.total_s);
+        X86_MEMF32(clock_va + 0x20u) = t;
+        X86_MEMF32(clock_va + 0x24u) = t;
+    }
     __imp__sub_001A3220(ctx, base);
-    if (clock_va == kVaMainClock) g_main_clk.OnUnpause();
+    if (clock_va == kVaMainClock) g_main_clk.OnUnpause(base, clock_va);
+}
+
+X86_FUNC(sub_001A3320) {
+    const uint32_t clock_va = ctx.ecx;
+    if (clock_va != kVaMainClock || !g_main_clk.valid) {
+        __imp__sub_001A3320(ctx, base);
+        return;
+    }
+
+    // Zero [+0x2C] (time_scale) temporarily during SaveState so `(GetTickCount() - [+0x28]) * [+0x2C] + [+0x24]`
+    // writes bit-exact `float(g_main_clk.total_s)` into both [+0x20] and the save stream without wall-clock drift.
+    const float saved_scale = X86_MEMF32(clock_va + 0x2Cu);
+    const float exact_total = float(g_main_clk.total_s);
+    X86_MEMF32(clock_va + 0x20u) = exact_total;
+    X86_MEMF32(clock_va + 0x24u) = exact_total;
+    X86_MEMF32(clock_va + 0x2Cu) = 0.0f;
+    __imp__sub_001A3320(ctx, base);
+    X86_MEMF32(clock_va + 0x2Cu) = saved_scale;
+    g_main_clk.SyncGuestClockAnchors(base, clock_va);
 }
 
 X86_FUNC(sub_001A3390) {
@@ -1197,14 +1406,26 @@ X86_FUNC(sub_001A3470) {
         g_main_clk.valid = true;
     }
 
-    raw_dt = std::clamp(raw_dt, 0.0001, 0.25);
-    float scale = X86_MEMF32(clock_va + 0x2Cu);
-    double dt_d = raw_dt * double(scale);
-    g_main_clk.total_s += dt_d;
+    const float guest_max_dt = X86_MEMF32(kVaMaxDt);
+    const double max_dt_d =
+        (std::isfinite(guest_max_dt) && guest_max_dt > 0.001f) ? std::min(double(guest_max_dt), 0.10) : 0.10;
+    raw_dt = std::clamp(raw_dt, 0.0001, max_dt_d);
+
+    const float scale = X86_MEMF32(clock_va + 0x2Cu);
+    const double safe_scale = (std::isfinite(scale) && scale >= 0.0f) ? double(scale) : 1.0;
+    const double dt_d = std::clamp(raw_dt * safe_scale, 0.0, max_dt_d);
+
+    // Freeze g_ElapsedGameTime (0x002E0290) whenever EngineFrameTick skips World::Update
+    // (both Pause Menu and Mid-Level Streaming Pause set bit 0 of 0x002E0274), while keeping
+    // *out_dt_va (0x002E01D0) live so CGUI menu screens continue updating smoothly.
+    const bool world_paused = (X86_MEM8(kVaPauseFlags) & 0x01u) != 0u;
+    if (!world_paused) {
+        g_main_clk.total_s += dt_d;
+    }
     if (out_dt_va >= 0x10000u && mem::IsCommitted(out_dt_va)) {
         X86_MEMF32(out_dt_va) = float(dt_d);
     }
-    X86_MEMF32(clock_va + 0x20u) = float(g_main_clk.total_s);
+    g_main_clk.SyncGuestClockAnchors(base, clock_va);
     X87_ST(0) = x87_prec(ctx, g_main_clk.total_s);
 }
 
@@ -1246,4 +1467,98 @@ X86_FUNC(sub_001A6480) {
     __imp__sub_001A6480(ctx, base);
     X86_MEMF32(kVaGlobalDt) = saved_dt;
     X86_MEMF32(kVaGlobalInvDt) = saved_inv_dt;
+}
+
+// 10. SRSCResourceMgr::Acquire (__thiscall, ret 0x04) & MeshResource::EnsureLoaded (sub_00156CA0, __thiscall, ret 0x04)
+// — cooperative yields for synchronous spin-wait callers.
+// Async prefetch callers (e.g. 0x0016E6C8, sub_0015A420, sub_00156CA0(1)) return immediately untouched;
+// callers that immediately spin on `([res + 0x0E] & 3) == 2` yield cooperatively to the SRSC streaming worker.
+X86_FUNC(sub_001765E0) {
+    const bool sync_spin_caller = ValidGuest(ctx.esp, 4u) && IsSyncSrscAcquireCallSite(ctx, base);
+    __imp__sub_001765E0(ctx, base);
+    if (sync_spin_caller) {
+        WaitSrscResourceReady(base, ctx.eax);
+    }
+}
+
+X86_FUNC(sub_00156CA0) {
+    // When bAsync == 0 ([esp+0x04] == 0) and [this+0x68] was already cached from an earlier bAsync == 1
+    // prefetch while still in SRSC state 2, sub_00156CA0 bypasses sub_0017B290/sub_001765E0 and jumps
+    // straight to its spin loop at 0x00156D20. Yield cooperatively before entering __imp__sub_00156CA0.
+    if (ValidGuest(ctx.esp + 0x04u, 4u) && X86_MEM32(ctx.esp + 0x04u) == 0u &&
+        ValidGuest(ctx.ecx + 0x64u, 8u) && X86_MEM32(ctx.ecx + 0x64u) != 0u) {
+        const uint32_t cached_res = X86_MEM32(ctx.ecx + 0x68u);
+        if (cached_res != 0u) {
+            WaitSrscResourceReady(base, cached_res);
+        }
+    }
+    __imp__sub_00156CA0(ctx, base);
+}
+
+// 11. CSTOMPInstance::Start (__thiscall, ret 0) — main-thread SRSC + PostLoad/callback completion guard.
+// When called from CSTOMPManager::CreateHandle on the main thread (0x00162C3E -> ret_eip 0x00162C43, zero locks held),
+// wait until the SRSC worker has finished both loading (state != 2) and PostLoad + callback dispatch (bit 0x10 set
+// at 0x001C2D36 whenever bit 0x04 is clear) so CSTOMPInstance::Start never races main-thread scene/camera/audio state
+// from sub_001BB1A0 on multi-core hosts.
+X86_FUNC(sub_001BAB90) {
+    if (ValidGuest(ctx.esp, 4u) && X86_MEM32(ctx.esp) == 0x00162C43u && ValidGuest(ctx.ecx + 0x0Cu, 4u)) {
+        const uint32_t res_va = X86_MEM32(ctx.ecx + 0x0Cu);
+        if (ValidGuest(res_va, 0x10u) && X86_MEM32(res_va + 0x04u) != 0u) {
+            volatile const uint16_t* flags_ptr = reinterpret_cast<volatile const uint16_t*>(base + res_va + 0x0Eu);
+            constexpr uint32_t kMaxStompWaitIters = 100000u;  // ~5.0s bounded safety cap
+            for (uint32_t spins = 0; spins < kMaxStompWaitIters; ++spins) {
+                const uint16_t flags = *flags_ptr;
+                const bool loading = (flags & 0x03u) == 0x02u;
+                const bool postload_pending = ((flags & 0x04u) == 0u) && ((flags & 0x10u) == 0u);
+                if (!loading && !postload_pending) break;
+                if (spins < 16u) {
+                    std::this_thread::yield();
+                } else {
+                    kernel::SleepHighResUs(50);
+                }
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+        }
+    }
+    __imp__sub_001BAB90(ctx, base);
+}
+
+// 12. Surgical 2 Cellblocks Dallas (#2152) script race & existing-checkpoint softlock guards:
+//  - Hook A (MessageRelay::Fire, sub_000D9AE0, __thiscall, ret 0x04): If Torque sprints ahead to STOMP #11777
+//    (#4051) or Dallas routes via Door #2932 before crossing #4945 while Dallas is alive, enable one-shot #11966
+//    so #4051 -> #11966 -> #12616 disables the "Dallas dead/absent" Timer #12614 and assigns FollowBehavior #4055.
+//  - Hook B (Timer::Start, sub_001414C0, __thiscall, ret 0x04): Heals pre-existing v1.4.0 checkpoints where #4051
+//    already fired while #11966 was disabled by disarming Timer #12614 ([+0x12] = 0) when Switch #4077 triggers it
+//    while Dallas is alive (without re-firing #11966, which would overwrite Exit-Gate escape waypoints #4081..#4085).
+X86_FUNC(sub_000D9AE0) {
+    const uint32_t relay_va = ctx.ecx;
+    if (ValidGuest(relay_va, 0x14u)) {
+        const uint32_t obj_va = X86_MEM32(relay_va + 0x04u);
+        if (ValidGuest(obj_va + 0xD0u, 4u) && X86_MEM32(obj_va + 0xD0u) == kIidCellblocksStompDoneRelay &&
+            X86_MEM32(relay_va) == kVtMessageRelay && X86_MEM32(relay_va + 0x0Cu) != 0u &&
+            X86_MEM32(relay_va + 0x10u) != 0u && IsCellblocks2Level(base) && IsDallasAlive(base)) {
+            const uint32_t obj11966 = FindObjectByIid(base, kIidCellblocksDallasGateRelay);
+            if (obj11966 != 0u) {
+                const uint32_t r11966 = X86_MEM32(obj11966 + 0x60u);
+                if (ValidGuest(r11966, 0x14u) && X86_MEM32(r11966) == kVtMessageRelay &&
+                    X86_MEM32(r11966 + 0x0Cu) == 0u && int32_t(X86_MEM32(r11966 + 0x10u)) > 0) {
+                    X86_MEM32(r11966 + 0x0Cu) = 1u;
+                }
+            }
+        }
+    }
+    __imp__sub_000D9AE0(ctx, base);
+}
+
+X86_FUNC(sub_001414C0) {
+    const uint32_t timer_va = ctx.ecx;
+    if (ValidGuest(timer_va, 0x16u)) {
+        const uint32_t obj_va = X86_MEM32(timer_va + 0x04u);
+        if (ValidGuest(obj_va + 0xD0u, 4u) && X86_MEM32(obj_va + 0xD0u) == kIidCellblocksDallasDeadTimer &&
+            X86_MEM32(timer_va) == kVtTimer && X86_MEM32(timer_va + 0x12u) != 0u &&
+            IsCellblocks2Level(base) && IsDallasAlive(base)) {
+            X86_MEM32(timer_va + 0x12u) = 0u;
+        }
+    }
+    __imp__sub_001414C0(ctx, base);
 }

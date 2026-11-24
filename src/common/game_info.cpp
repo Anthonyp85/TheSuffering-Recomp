@@ -4,6 +4,10 @@
 #include "common/launcher_ui.h"
 #include "common/mkb_input.h"
 #include "common/settings_ui.h"
+#include "common/version.h"
+
+static_assert(SUFFERING_VERSION_MAJOR == 1 && SUFFERING_VERSION_MINOR == 5 && SUFFERING_VERSION_PATCH == 0,
+              "Keep game_info.cpp and suffering.rc synchronized with version.h (v1.5.0)");
 
 #ifdef _WIN32
 // Hint dual-GPU laptops (NVIDIA Optimus / AMD PowerXpress) to prefer the discrete GPU by default.
@@ -13,7 +17,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 #endif
 
-// Host application metadata for The Suffering (USA, Original Xbox, Title ID 0x4D570015).
+// Host application metadata for The Suffering (USA, Original Xbox, Title ID 0x4D570015, Recomp v1.5.0).
 const app::GameInfo app::kGame = {
     .title = L"The Suffering",
     .short_title = L"The Suffering",

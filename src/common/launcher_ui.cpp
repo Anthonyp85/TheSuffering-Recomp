@@ -25,6 +25,8 @@
 #include "common/launcher_ui.h"
 #include "common/mkb_input.h"
 #include "common/ui_common.h"
+#include "common/update_checker.h"
+#include "common/version.h"
 
 #include <algorithm>
 #include <cctype>
@@ -248,6 +250,107 @@ uint64_t ComputeCacheDiskBytes() {
         }
     }
     return total;
+}
+
+bool HasMockUpdateEnv() {
+#ifdef _WIN32
+    const wchar_t* v = _wgetenv(L"SUFFERING_UPDATE_MOCK_JSON");
+    return v && *v;
+#else
+    const char* v = std::getenv("SUFFERING_UPDATE_MOCK_JSON");
+    return v && *v;
+#endif
+}
+
+void MaybeStartLauncherUpdateCheck() {
+    if ((GetSharedUiOptions().check_updates_on_startup && ShouldAutoCheckForUpdates()) || HasMockUpdateEnv()) {
+        if (GetUpdateSnapshot().state == UpdateState::Idle) {
+            StartUpdateCheck(false);
+        }
+    }
+}
+
+struct LauncherUpdateUiTracker {
+    bool manual_pending = false;
+    UpdateState prev_state = UpdateState::Idle;
+};
+
+void PollLauncherUpdateTransitions(LauncherUpdateUiTracker& tr, const UpdateStatusSnapshot& snap,
+                                   const std::function<void(const std::string&, bool)>& set_status) {
+    if (tr.manual_pending && snap.state != UpdateState::Checking && snap.state != UpdateState::Idle) {
+        tr.manual_pending = false;
+        if (snap.state == UpdateState::UpToDate) {
+            set_status(std::string("Up to date (") + SUFFERING_VERSION_TAG + ")", false);
+        } else if (snap.state == UpdateState::UpdateAvailable) {
+            std::string tag = !snap.latest_tag.empty() ? snap.latest_tag : ("v" + snap.latest_version);
+            set_status("Update available: " + tag, false);
+        } else if (snap.state == UpdateState::Error) {
+            set_status(snap.status_message.empty() ? "Update check failed (network error)."
+                                                   : SanitizeUiText(snap.status_message, true, 140),
+                       true);
+        }
+    } else if (tr.prev_state == UpdateState::Downloading && snap.state != UpdateState::Downloading) {
+        if (snap.state == UpdateState::ReadyToRestart) {
+            set_status("Update " + snap.latest_tag + " verified & staged! Click 'Restart & Apply Update' to install.",
+                       false);
+        } else if (snap.state == UpdateState::Error) {
+            set_status(snap.status_message.empty() ? "Self-update download/staging failed."
+                                                   : SanitizeUiText(snap.status_message, true, 140),
+                       true);
+        }
+    }
+    tr.prev_state = snap.state;
+}
+
+bool DrawLauncherUpdateAlertIfNeeded(const UpdateStatusSnapshot& snap, float ui_scale,
+                                     const std::function<void(const std::string&, bool)>& set_status,
+                                     bool& launch_game, bool& quit) {
+    if (!ShouldShowUpdateBanner(snap, GetSharedUiOptions().dismissed_update_tag)) {
+        return false;
+    }
+    UpdateCardContext uctx{};
+    uctx.in_launcher = true;
+    uctx.ui_scale = ui_scale;
+    uctx.on_update_now = [&] {
+        if (StartDownloadAndStageUpdate()) {
+            set_status("Downloading & staging " +
+                           (snap.asset_name.empty() ? snap.latest_tag : snap.asset_name) + "...",
+                       false);
+        } else {
+            UpdateStatusSnapshot err_s = GetUpdateSnapshot();
+            set_status(err_s.status_message.empty() ? "Could not start self-update download."
+                                                    : SanitizeUiText(err_s.status_message, true, 140),
+                       true);
+        }
+    };
+    uctx.on_apply_and_restart = [&] {
+        app::Save();
+        if (ApplyStagedUpdateAndRelaunch()) {
+            launch_game = false;
+            quit = true;
+        } else {
+            UpdateStatusSnapshot err_s = GetUpdateSnapshot();
+            set_status(err_s.status_message.empty() ? "Failed to launch staged update helper."
+                                                    : SanitizeUiText(err_s.status_message, true, 140),
+                       true);
+        }
+    };
+    uctx.on_open_release_page = [&](const std::string& url) {
+        std::string target = url.empty() ? std::string(SUFFERING_RELEASES_URL) : url;
+        OpenReleasePageInBrowser(target);
+        if (IsGamescope()) {
+            set_status("Release page: " + target + " (browse in Desktop Mode if hidden)", false);
+        } else {
+            set_status("Opened release page in browser: " + target, false);
+        }
+    };
+    uctx.on_dismiss = [&](const std::string& tag) {
+        GetSharedUiOptions().dismissed_update_tag = tag;
+        set_status("Dismissed update alert for " + tag + " (click 'Check for Updates' to show again).", false);
+    };
+    DrawUpdateAlertCard(snap, uctx);
+    ImGui::Spacing();
+    return true;
 }
 
 #ifdef _WIN32
@@ -642,8 +745,9 @@ bool RunLauncher(void* hinstance) {
     RegisterClassExW(&wc);
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    HWND hwnd = CreateWindowExW(0, class_name.c_str(), L"The Suffering - PC Recompilation Launcher (v1.4.1)", style,
-                                work.left + 40, work.top + 40, 920, 620, nullptr, nullptr, inst, nullptr);
+    std::wstring win_title = L"The Suffering - PC Recompilation Launcher (" + Utf8ToWideStr(SUFFERING_VERSION_TAG) + L")";
+    HWND hwnd = CreateWindowExW(0, class_name.c_str(), win_title.c_str(), style, work.left + 40, work.top + 40, 920,
+                                620, nullptr, nullptr, inst, nullptr);
     if (!hwnd) {
         UnregisterClassW(class_name.c_str(), inst);
         return true;  // Fail open to game if launcher window cannot be created
@@ -720,6 +824,10 @@ bool RunLauncher(void* hinstance) {
         status_is_err = err;
     };
 
+    MaybeStartLauncherUpdateCheck();
+    LauncherUpdateUiTracker upd_tracker{};
+    upd_tracker.prev_state = GetUpdateSnapshot().state;
+
     bool rumble_active = false;
     std::chrono::steady_clock::time_point rumble_until{};
     bool was_pad_active = false;
@@ -783,6 +891,8 @@ bool RunLauncher(void* hinstance) {
         app::Settings& s = app::Get();
         RefreshMonitorLists(monitors, resolutions, res_device, s.monitor);
         active_gpu = FindSelectedGpu(gpus, s.gpu_adapter);
+        UpdateStatusSnapshot upd_snap = GetUpdateSnapshot();
+        PollLauncherUpdateTransitions(upd_tracker, upd_snap, set_status);
 
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -798,8 +908,14 @@ bool RunLauncher(void* hinstance) {
             if (lctx.fonts.heading) ImGui::PushFont(lctx.fonts.heading);
             ImGui::TextColored(ImVec4(0.96f, 0.34f, 0.34f, 1.0f), "THE SUFFERING");
             ImGui::SameLine();
-            ImGui::TextUnformatted("- PC Recompilation Launcher v1.4.1");
+            ImGui::TextUnformatted("- PC Recompilation Launcher " SUFFERING_VERSION_TAG);
             if (lctx.fonts.heading) ImGui::PopFont();
+            DrawLauncherHeaderUpdateButton(upd_snap, lctx.ui_scale, [&] {
+                GetSharedUiOptions().dismissed_update_tag.clear();
+                upd_tracker.manual_pending = true;
+                set_status("Checking GitHub Releases for updates...", false);
+                StartUpdateCheck(true);
+            });
 
             std::string gpu_line = active_gpu ? active_gpu->name : "Default D3D12 GPU";
             double vram_gb = active_gpu ? (double(active_gpu->dedicated_vram) / (1024.0 * 1024.0 * 1024.0)) : 0.0;
@@ -838,6 +954,9 @@ bool RunLauncher(void* hinstance) {
             // --- Tabbed Content Body (reserve space for sticky footer) ---
             float footer_h = (status_banner.empty() ? 52.0f : 78.0f) * lctx.ui_scale;
             if (ImGui::BeginChild("##LauncherBody", ImVec2(0.0f, -footer_h), false)) {
+                bool show_upd_banner = DrawLauncherUpdateAlertIfNeeded(upd_snap, lctx.ui_scale, set_status,
+                                                                       lctx.launch_game, lctx.quit);
+
                 UiPanelContext pctx{};
                 pctx.in_launcher = true;
                 pctx.gpus = &gpus;
@@ -871,7 +990,8 @@ bool RunLauncher(void* hinstance) {
                         selected_tab = 0;
                         ImGui::Spacing();
                         ImGui::TextUnformatted("Original Xbox Disc Image Status (Opened Strictly Read-Only):");
-                        if (ImGui::BeginChild("##DiscCard", ImVec2(0.0f, 118.0f * lctx.ui_scale), true)) {
+                        float disc_card_h = (show_upd_banner ? 94.0f : 114.0f) * lctx.ui_scale;
+                        if (ImGui::BeginChild("##DiscCard", ImVec2(0.0f, disc_card_h), true)) {
                             if (disc.valid) {
                                 ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.45f, 1.0f), "READY: %s",
                                                    disc.summary.c_str());
@@ -981,6 +1101,14 @@ bool RunLauncher(void* hinstance) {
                         SharedUiOptions& o = GetSharedUiOptions();
                         if (ImGui::Checkbox("Show Live FPS, Frame-Time & Upscaler HUD In-Game", &o.show_fps_hud)) {
                             app::Save();
+                        }
+                        if (ImGui::Checkbox("Automatically Check for Updates on Startup", &o.check_updates_on_startup)) {
+                            app::Save();
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Open GitHub Releases")) {
+                            OpenReleasePageInBrowser(SUFFERING_RELEASES_URL);
+                            set_status(std::string("Opened GitHub Releases: ") + SUFFERING_RELEASES_URL, false);
                         }
                         ImGui::Separator();
                         ImGui::Text("Shader / PSO Cache on Disk: %.2f MB (cache\\)",
@@ -1148,7 +1276,11 @@ bool RunLauncher(void* hinstance) {
     }
 
     if (rumble_active) input::Rumble(0, 0, 0);
-    if (lctx.launch_game) app::Save();
+    if (lctx.launch_game) {
+        app::Save();
+    } else {
+        ShutdownUpdateChecker();
+    }
 
     // Complete teardown & GPU flush before returning to wWinMain
     lctx.WaitForGpu();
@@ -1194,7 +1326,8 @@ bool RunLauncher(void* /*hinstance*/) {
         wflags |= SDL_WINDOW_RESIZABLE;
     }
 
-    SDL_Window* win = SDL_CreateWindow("The Suffering - PC Recompilation Launcher (v1.4.1)", init_w, init_h, wflags);
+    SDL_Window* win =
+        SDL_CreateWindow("The Suffering - PC Recompilation Launcher (" SUFFERING_VERSION_TAG ")", init_w, init_h, wflags);
     if (!win) {
         LOGW("launcher: SDL_CreateWindow failed (%s); continuing directly to game", SDL_GetError());
         return true;
@@ -1265,6 +1398,10 @@ bool RunLauncher(void* /*hinstance*/) {
         status_is_err = err;
     };
 
+    MaybeStartLauncherUpdateCheck();
+    LauncherUpdateUiTracker upd_tracker{};
+    upd_tracker.prev_state = GetUpdateSnapshot().state;
+
     XisoFileBrowser file_browser;
     if (cli.open_file_browser) file_browser.Open();
 
@@ -1328,6 +1465,8 @@ bool RunLauncher(void* /*hinstance*/) {
         app::Settings& s = app::Get();
         RefreshMonitorLists(monitors, resolutions, res_device, s.monitor);
         active_gpu = FindSelectedGpu(gpus, s.gpu_adapter);
+        UpdateStatusSnapshot upd_snap = GetUpdateSnapshot();
+        PollLauncherUpdateTransitions(upd_tracker, upd_snap, set_status);
 
         ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
@@ -1344,8 +1483,14 @@ bool RunLauncher(void* /*hinstance*/) {
             if (fonts.heading) ImGui::PushFont(fonts.heading);
             ImGui::TextColored(ImVec4(0.96f, 0.34f, 0.34f, 1.0f), "THE SUFFERING");
             ImGui::SameLine();
-            ImGui::TextUnformatted("- PC Recompilation Launcher v1.4.1");
+            ImGui::TextUnformatted("- PC Recompilation Launcher " SUFFERING_VERSION_TAG);
             if (fonts.heading) ImGui::PopFont();
+            DrawLauncherHeaderUpdateButton(upd_snap, ui_scale, [&] {
+                GetSharedUiOptions().dismissed_update_tag.clear();
+                upd_tracker.manual_pending = true;
+                set_status("Checking GitHub Releases for updates...", false);
+                StartUpdateCheck(true);
+            });
 
             std::string gpu_line = active_gpu ? active_gpu->name : "Default Vulkan 1.2 GPU";
             double vram_gb = active_gpu ? (double(active_gpu->dedicated_vram) / (1024.0 * 1024.0 * 1024.0)) : 0.0;
@@ -1384,6 +1529,9 @@ bool RunLauncher(void* /*hinstance*/) {
 
             float footer_h = (status_banner.empty() ? 52.0f : 78.0f) * ui_scale;
             if (ImGui::BeginChild("##LauncherBody", ImVec2(0.0f, -footer_h), false)) {
+                bool show_upd_banner = DrawLauncherUpdateAlertIfNeeded(upd_snap, ui_scale, set_status, launch_game,
+                                                                       quit);
+
                 UiPanelContext pctx{};
                 pctx.in_launcher = true;
                 pctx.gpus = &gpus;
@@ -1412,7 +1560,8 @@ bool RunLauncher(void* /*hinstance*/) {
                         selected_tab = 0;
                         ImGui::Spacing();
                         ImGui::TextUnformatted("Original Xbox Disc Image Status (Opened Strictly Read-Only):");
-                        if (ImGui::BeginChild("##DiscCard", ImVec2(0.0f, 118.0f * ui_scale), true)) {
+                        float disc_card_h = (show_upd_banner ? 94.0f : 114.0f) * ui_scale;
+                        if (ImGui::BeginChild("##DiscCard", ImVec2(0.0f, disc_card_h), true)) {
                             if (disc.valid) {
                                 ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.45f, 1.0f), "READY: %s",
                                                    disc.summary.c_str());
@@ -1509,6 +1658,20 @@ bool RunLauncher(void* /*hinstance*/) {
                         SharedUiOptions& o = GetSharedUiOptions();
                         if (ImGui::Checkbox("Show Live FPS, Frame-Time & Upscaler HUD In-Game", &o.show_fps_hud)) {
                             app::Save();
+                        }
+                        if (ImGui::Checkbox("Automatically Check for Updates on Startup", &o.check_updates_on_startup)) {
+                            app::Save();
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Open GitHub Releases")) {
+                            OpenReleasePageInBrowser(SUFFERING_RELEASES_URL);
+                            if (IsGamescope()) {
+                                set_status(std::string("GitHub Releases: ") + SUFFERING_RELEASES_URL +
+                                               " (browse in Desktop Mode if hidden)",
+                                           false);
+                            } else {
+                                set_status(std::string("Opened GitHub Releases: ") + SUFFERING_RELEASES_URL, false);
+                            }
                         }
                         ImGui::Separator();
                         ImGui::Text("Shader / PSO Cache on Disk: %.2f MB (cache/)",
@@ -1659,7 +1822,11 @@ bool RunLauncher(void* /*hinstance*/) {
     }
 
     if (rumble_active) input::Rumble(0, 0, 0);
-    if (launch_game) app::Save();
+    if (launch_game) {
+        app::Save();
+    } else {
+        ShutdownUpdateChecker();
+    }
 
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();

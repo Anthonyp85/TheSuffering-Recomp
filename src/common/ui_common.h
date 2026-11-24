@@ -10,6 +10,7 @@
 #include <imgui.h>
 
 #include "app/app.h"
+#include "common/update_checker.h"
 #include "upscale/upscaler_manager.h"
 
 namespace input {
@@ -25,6 +26,8 @@ struct SharedUiOptions {
     uint32_t stick_deadzone = 0;
     bool touchpad_as_back = true;
     bool show_fps_hud = false;
+    bool check_updates_on_startup = true;
+    std::string dismissed_update_tag;
 };
 
 SharedUiOptions& GetSharedUiOptions();
@@ -79,5 +82,21 @@ bool IsSteamDeck();
 bool IsGamescope();
 void OpenDirectoryInExplorer(void* hwnd, const std::filesystem::path& dir, const char* label,
                              const std::function<void(const std::string&, bool)>& set_status);
+
+// Update Checker & Self-Updater UI components shared by Pre-Game Launcher and In-Game F1 Overlay.
+struct UpdateCardContext {
+    bool in_launcher = true;
+    float ui_scale = 1.0f;
+    std::function<void()> on_update_now;
+    std::function<void()> on_apply_and_restart;
+    std::function<void(const std::string&)> on_open_release_page;
+    std::function<void(const std::string&)> on_dismiss;
+};
+
+std::string SanitizeUiText(const std::string& s, bool single_line = true, size_t max_chars = 160);
+bool ShouldShowUpdateBanner(const UpdateStatusSnapshot& snap, const std::string& dismissed_tag);
+void DrawLauncherHeaderUpdateButton(const UpdateStatusSnapshot& snap, float ui_scale,
+                                    const std::function<void()>& on_manual_check);
+void DrawUpdateAlertCard(const UpdateStatusSnapshot& snap, const UpdateCardContext& uctx);
 
 }  // namespace suffering

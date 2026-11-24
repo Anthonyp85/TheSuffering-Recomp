@@ -2913,10 +2913,10 @@ index e36f7ac..09da610 100644
  }
 diff --git a/runtime/app/main_linux.cpp b/runtime/app/main_linux.cpp
 new file mode 100644
-index 0000000..0890f16
+index 0000000..7261d2e
 --- /dev/null
 +++ b/runtime/app/main_linux.cpp
-@@ -0,0 +1,916 @@
+@@ -0,0 +1,922 @@
 +// Native Linux SDL3 host: window, event loop, POSIX crash handler, pacing, and early CLI utilities.
 +// Mirrors runtime/app/main.cpp while keeping app.h and main.cpp 100% untouched.
 +#ifndef _WIN32
@@ -2928,6 +2928,7 @@ index 0000000..0890f16
 +#include <fcntl.h>
 +#include <immintrin.h>
 +#include <pthread.h>
++#include <sched.h>
 +#include <signal.h>
 +#include <sys/stat.h>
 +#include <time.h>
@@ -3563,6 +3564,11 @@ index 0000000..0890f16
 +                    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr) == EINTR) {
 +                    }
 +                }
++            }
++        }
++        if (kGame.single_core_guest) {
++            while (clock::now() + std::chrono::microseconds(50) < target) {
++                sched_yield();
 +            }
 +        }
 +        while (clock::now() < target) _mm_pause();
@@ -7395,7 +7401,7 @@ index 275980a..7ccee6e 100644
 +
  }  // namespace gpu
 diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
-index 9ddd87b..cb7b9b0 100644
+index 9ddd87b..ee8bfda 100644
 --- a/runtime/gpu/d3d12.cpp
 +++ b/runtime/gpu/d3d12.cpp
 @@ -14,16 +14,24 @@
@@ -8418,9 +8424,9 @@ index 9ddd87b..cb7b9b0 100644
 +};
 +
 +constexpr uint32_t kPsoMetaMagic = 0x50534F4Du;
-+constexpr uint32_t kPsoMetaVersion = 1u;
++constexpr uint32_t kPsoMetaVersion = 2u;
 +constexpr uint32_t kRecipeCacheMagic = 0x43524258u;  // 'XBRC'
-+constexpr uint32_t kRecipeCacheVersion = 1u;
++constexpr uint32_t kRecipeCacheVersion = 2u;
 +constexpr uint64_t kTexSlabSize = 32ull << 20;
 +constexpr uint64_t kTexSlabMaxAlloc = 8ull << 20;
 +
@@ -10001,7 +10007,53 @@ index 9ddd87b..cb7b9b0 100644
          }
      }
      Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-@@ -2097,14 +4111,33 @@ std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh
+@@ -1939,6 +3953,18 @@ void D3D12Backend::ReleasePackTextures() {
+     pack_textures_.clear();
+ }
+ 
++// Paletted, YUV and block-compressed formats cannot be GPU render targets, and a swizzled texture's Morton layout
++// only matches a target of the exact same dimensions (linear aliases such as MSAA resolve proxies may scale).
++bool CanSampleAsTarget(const TextureDesc& d, const FormatInfo& fi, const Target& t) {
++    constexpr uint32_t kFmtP8 = 0x0B;
++    constexpr uint32_t kFmtYuy2 = 0x24;
++    constexpr uint32_t kFmtUyvy = 0x25;
++    if (d.cube || d.depth != 1 || fi.compressed) return false;
++    if (d.format == kFmtP8 || d.format == kFmtYuy2 || d.format == kFmtUyvy) return false;
++    if (!d.linear && (d.width != t.gw || d.height != t.gh)) return false;
++    return true;
++}
++
+ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTextures& stages) {
+     TexInfo& info = stages.info[stage];
+     D3D12_SHADER_RESOURCE_VIEW_DESC& sv = stages.sv[stage];
+@@ -1957,13 +3983,23 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
+     info.kind = TextureKind(d);
+     info.rect = d.linear;
+ 
+-    // rendered by the GPU: sample the target itself; DXT data loaded over a target's memory is not it
++    // rendered by the GPU: sample the target itself; guest texture data loaded over a freed target's memory is not it
+     uint64_t alt = 0;
+     bool box = true;
+     if (ext_) ext_->Sample(d.data, fi.depth, stage, alt, stages.k[stage], box);
+     auto tit = targets_.find(SizedTargetKey(d.data, fi.depth, d.width, d.height) | alt);
+-    if (tit != targets_.end() && !d.cube && d.depth == 1 && !fi.compressed) {
+-        return BindTargetTexture(s, stage, d, tit->second, box, stages);
++    if (tit != targets_.end()) {
++        Target& t = tit->second;
++        bool compat = CanSampleAsTarget(d, fi, t);
++        bool overwritten = !t.depth && (TargetStale(d.data) || d.levels > 1 || !compat) && LatchCpuWrite(t);
++        if (!compat || overwritten) {
++            if ((overwritten || TargetStale(d.data)) && &t != draw_rt_ && &t != draw_ds_ && &t != bound_rt_ &&
++                &t != bound_ds_) {
++                ReleaseTarget(tit);
++            }
++            return BindGuestTexture(s, stage, d, fi, stages);
++        }
++        return BindTargetTexture(s, stage, d, t, box, stages);
+     }
+     return BindGuestTexture(s, stage, d, fi, stages);
+ }
+@@ -2097,14 +4133,33 @@ std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh
  // sets sh.vh and sh.vs_code, compiling the shader on a cache miss
  void D3D12Backend::EnsureVertexShader(const State& s, const Assembled& a, DrawShaders& sh) {
      auto vit = shader_src_.find(sh.vkey);
@@ -10035,7 +10087,7 @@ index 9ddd87b..cb7b9b0 100644
  }
  
  bool D3D12Backend::BindStageTexturesAndTargets(const State& s, DrawTextures& stages) {
-@@ -2126,14 +4159,33 @@ constexpr uint64_t kPixelKeySalt = 0x9E3779B97F4A7C15ull;
+@@ -2126,14 +4181,33 @@ constexpr uint64_t kPixelKeySalt = 0x9E3779B97F4A7C15ull;
  // sets sh.ph and sh.ps_code, compiling the shader on a cache miss
  void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
      // pixel shaders share the map with vertex shaders, the salt keeps their keys apart
@@ -10071,7 +10123,7 @@ index 9ddd87b..cb7b9b0 100644
  }
  
  void KeyBlend(const State& s, PsoKey& k) {
-@@ -2156,7 +4208,8 @@ bool OffsetsPolygons(const State& s, Topology topology) {
+@@ -2156,7 +4230,8 @@ bool OffsetsPolygons(const State& s, Topology topology) {
  
  // polygon offset slopes are per console pixel, an upscaled target's pixels are smaller
  float HostSlopeScale(const State& s, const Target* ds) {
@@ -10081,7 +10133,22 @@ index 9ddd87b..cb7b9b0 100644
  }
  
  void D3D12Backend::KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k) {
-@@ -2270,7 +4323,10 @@ void D3D12Backend::FillTextureConstants(const State& s, const DrawShaders& sh, c
+@@ -2212,10 +4287,11 @@ constexpr float kAlphaTestAlways = float(D3D12_COMPARISON_FUNC_ALWAYS - 1);
+ constexpr uint32_t kFogTableNone = 0;
+ constexpr float kFogTableLinear = 3.0f;
+ 
+-// table mode none under a vertex program: oFog is the blend factor, passed on as linear fog from 1 to 0
+-void FillFogConstants(const State& s, bool vertex_program, DrawConstants& c) {
++// table mode none: oFog is the vertex blend factor (program output or fixed-function specular alpha), passed on as
++// linear fog from 1 to 0
++void FillFogConstants(const State& s, bool /*vertex_program*/, DrawConstants& c) {
+     if (!s.rs[kRsFogEnable]) return;
+-    if (vertex_program && s.rs[kRsFogTableMode] == kFogTableNone) {
++    if (s.rs[kRsFogTableMode] == kFogTableNone) {
+         c.fog[0] = 1.0f;
+         c.fog[1] = 0.0f;
+         c.fog[2] = 0.0f;
+@@ -2270,7 +4346,10 @@ void D3D12Backend::FillTextureConstants(const State& s, const DrawShaders& sh, c
      for (int i = 0; i < 4; i++) {
          TextureDesc d;
          if (s.textures[size_t(i)] && Describe(s.textures[size_t(i)], d)) FillTexelConstants(i, d, stages, c);
@@ -10093,7 +10160,7 @@ index 9ddd87b..cb7b9b0 100644
          const auto& t = s.tss[size_t(i)];
          c.bump[i][0] = Bits(t[kTssBumpEnvMat00]);
          c.bump[i][1] = Bits(t[kTssBumpEnvMat01]);
-@@ -2452,8 +4508,8 @@ uint8_t* D3D12Backend::UploadVertexConstants(const State& s) {
+@@ -2452,8 +4531,8 @@ uint8_t* D3D12Backend::UploadVertexConstants(const State& s) {
      return vc.cpu;
  }
  
@@ -10104,7 +10171,7 @@ index 9ddd87b..cb7b9b0 100644
      // the extension edits the uploaded copy, so its draws always get their own
      bool same = !ext_ && last_vsc_gpu_ && !std::memcmp(last_vsc_.data(), s.vsc.data(), sizeof(s.vsc));
      uint8_t* vsc = same ? nullptr : UploadVertexConstants(s);
-@@ -2465,6 +4521,25 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
+@@ -2465,6 +4544,25 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
      if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vsc), c.ext, bound_rt_, k.blend ? k.src : 1);
      FillDepthConstants(s, sh, k, c);
      FillTextureConstants(s, sh, stages, c);
@@ -10130,7 +10197,16 @@ index 9ddd87b..cb7b9b0 100644
      if (sh.fixed_transform) {
          FillTransformConstants(s, size, c);
          FillLightConstants(s, sh.fk, c);
-@@ -2630,20 +4705,21 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
+@@ -2486,7 +4584,7 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
+         ID3D12Resource* res = stages.res[i];
+         TextureDesc d;
+         if (!s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], d)) continue;
+-        bool tg = targets_.count(SizedTargetKey(d.data, Format(d.format).depth, d.width, d.height));
++        bool tg = stages.rt[i];
+         fprintf(cap_, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height, tg ? " target" : "",
+                 res ? "" : " unbound");
+         if (res && !tg && stages.info[i].kind == kTex2D && cap_seen_.insert(d.data).second) {
+@@ -2630,20 +4728,21 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
  }
  
  // viewport covers the target, the guest viewport is in the shader; scissor clips to it
@@ -10162,7 +10238,7 @@ index 9ddd87b..cb7b9b0 100644
      }
      D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
                      std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
-@@ -2827,8 +4903,6 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+@@ -2827,8 +4926,6 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
      if (ext_) ext_->BeginDraw(s);
      Assembled& a = asm_;
      if (!AssembleDraw(s, prim, start, count, indices, a)) return;
@@ -10171,7 +10247,7 @@ index 9ddd87b..cb7b9b0 100644
      if (!BindTargets(s)) return;
      if (ext_ && ext_->Bound(*this, s, bound_rt_, bound_ds_, a.pretransformed) && !BindTargets(s)) return;
  
-@@ -2861,7 +4935,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+@@ -2861,7 +4958,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
      GuestExtent size;
      SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
      DrawConstants c{};
@@ -10180,7 +10256,7 @@ index 9ddd87b..cb7b9b0 100644
      if (ext_) binds_ = {};
  
      if (cap_) {
-@@ -2872,7 +4946,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+@@ -2872,7 +4969,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
  
      // texture views and samplers, viewport and scissor, blend factor and stencil reference
      SetTextureViewsAndSamplers(s, a, stages);
@@ -10189,7 +10265,7 @@ index 9ddd87b..cb7b9b0 100644
      SetBlendFactorStencilRef(s);
  
      // geometry, counted while the title runs a visibility test
-@@ -2883,9 +4957,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+@@ -2883,9 +4980,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
  
  // a guest rect scaled to the target and clamped to it
  D3D12_RECT ScaledRect(const Target& t, int x0, int y0, int x1, int y1) {
@@ -10203,7 +10279,7 @@ index 9ddd87b..cb7b9b0 100644
  }
  
  // rs: the rects buffer, reused across targets
-@@ -2929,7 +5004,8 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
+@@ -2929,7 +5027,8 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
  // ClearChannels' pipeline for the target format and channel mask, kept in blit_psos_; null when it can't be made
  ID3D12PipelineState* D3D12Backend::EnsureClearPipeline(DXGI_FORMAT rtv, uint8_t mask) {
      uint64_t seed = uint64_t(rtv) << 8 | mask;
@@ -10213,7 +10289,7 @@ index 9ddd87b..cb7b9b0 100644
      if (pso) return pso.Get();
      uint64_t h;
      ID3DBlob* vs = Compile(kClearHlsl, "vs", "vs_5_0", h);
-@@ -2937,7 +5013,9 @@ ID3D12PipelineState* D3D12Backend::EnsureClearPipeline(DXGI_FORMAT rtv, uint8_t
+@@ -2937,7 +5036,9 @@ ID3D12PipelineState* D3D12Backend::EnsureClearPipeline(DXGI_FORMAT rtv, uint8_t
      if (!vs || !ps) return nullptr;
      D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
      d.BlendState.RenderTarget[0].RenderTargetWriteMask = mask;
@@ -10224,7 +10300,7 @@ index 9ddd87b..cb7b9b0 100644
      return pso.Get();
  }
  
-@@ -3061,8 +5139,10 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
+@@ -3061,8 +5162,10 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
      D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), dst_t.view, rtv_inc_);
      cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
      float gw = src_t.gw * l.kx, gh = src_t.gh * l.ky;  // the source in the guest pixels the rects use
@@ -10237,7 +10313,7 @@ index 9ddd87b..cb7b9b0 100644
      bool listed = l.count && l.src_rects;
      uint32_t n = listed ? l.count : 1;
      for (uint32_t i = 0; i < n; i++) {
-@@ -3071,8 +5151,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
+@@ -3071,8 +5174,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
          DrawnRect r{.x0 = 0, .y0 = 0, .x1 = whole_w, .y1 = whole_h};
          if (listed) r = ReadDrawnRect(l.src_rects, l.dst_points, i);
          if (r.x1 <= r.x0 || r.y1 <= r.y0) continue;
@@ -10247,7 +10323,7 @@ index 9ddd87b..cb7b9b0 100644
          LONG right = std::min(LONG(vp.TopLeftX + vp.Width), LONG(dst_t.w));
          LONG bottom = std::min(LONG(vp.TopLeftY + vp.Height), LONG(dst_t.h));
          D3D12_RECT scissor{LONG(vp.TopLeftX), LONG(vp.TopLeftY), right, bottom};
-@@ -3081,7 +5160,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
+@@ -3081,7 +5183,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
          cl_->RSSetScissorRects(1, &scissor);
          binds_ = {};
          float uv[4] = {r.x0 / gw, r.y0 / gh, (r.x1 - r.x0) / gw, (r.y1 - r.y0) / gh};
@@ -10256,7 +10332,7 @@ index 9ddd87b..cb7b9b0 100644
          float mul = 1 / dst_t.range;
          BlitOptions o{.alpha = true, .taps = taps, .mul = mul, .rtv = dst_t.fmt};
          Blit(src_res, src_t.fmt, uv, o);
-@@ -3097,7 +5176,8 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
+@@ -3097,7 +5199,8 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
      Transition(dst_t.res.Get(), dst_t.state, D3D12_RESOURCE_STATE_COPY_DEST);
      D3D12_TEXTURE_COPY_LOCATION dl{dst_t.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
      D3D12_TEXTURE_COPY_LOCATION sl{src_res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
@@ -10266,7 +10342,7 @@ index 9ddd87b..cb7b9b0 100644
      bool listed = l.count && l.src_rects;
      uint32_t n = listed ? l.count : 1;
      for (uint32_t i = 0; i < n; i++) {
-@@ -3106,16 +5186,16 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
+@@ -3106,16 +5209,16 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
          uint32_t dy = 0;
          if (listed) {
              GuestRect r = ReadGuestRect(l.src_rects, i);
@@ -10289,7 +10365,7 @@ index 9ddd87b..cb7b9b0 100644
              }
          }
          if (b.right <= b.left || b.bottom <= b.top || dx >= dst_t.w || dy >= dst_t.h) continue;
-@@ -3164,20 +5244,30 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count,
+@@ -3164,20 +5267,30 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count,
  
  void D3D12Backend::ResizeSwap() {
      HWND hwnd = static_cast<HWND>(app::Window());
@@ -10324,7 +10400,7 @@ index 9ddd87b..cb7b9b0 100644
  }
  
  void D3D12Backend::FinishCapture(const Surface& front) {
-@@ -3267,6 +5357,7 @@ void D3D12Backend::RenderUi() {
+@@ -3267,6 +5380,7 @@ void D3D12Backend::RenderUi() {
  }
  
  void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
@@ -10332,7 +10408,7 @@ index 9ddd87b..cb7b9b0 100644
      D3D12_RESOURCE_STATES bs = D3D12_RESOURCE_STATE_PRESENT;
      Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
      D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), kRtvCount + bi, rtv_inc_);
-@@ -3274,20 +5365,153 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
+@@ -3274,20 +5388,153 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
      cl_->ClearRenderTargetView(rh, black, 0, nullptr);
      cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
      bound_rt_ = bound_ds_ = nullptr;
@@ -10494,7 +10570,7 @@ index 9ddd87b..cb7b9b0 100644
              it = textures_.erase(it);
          } else {
              ++it;
-@@ -3302,8 +5526,16 @@ void D3D12Backend::ResetFrame() {
+@@ -3302,8 +5549,16 @@ void D3D12Backend::ResetFrame() {
          WaitFence(f.fence);
          g_perf.wait += PerfMs(perf_wait);
      }
@@ -10511,7 +10587,7 @@ index 9ddd87b..cb7b9b0 100644
      f.used = 0;
      f.srv = 0;
      cl_->Reset(f.alloc.Get(), nullptr);
-@@ -3352,6 +5584,7 @@ void LogPerf() {
+@@ -3352,6 +5607,7 @@ void LogPerf() {
               p.targets / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n,
               (unsigned long long)p.shaders, (unsigned long long)p.psos);
          g_perf = Perf{};
@@ -10519,7 +10595,7 @@ index 9ddd87b..cb7b9b0 100644
          perf_start = PerfClock::now();
          perf_frames = 0;
      }
-@@ -3371,22 +5604,125 @@ void D3D12Backend::Present(const Surface& front) {
+@@ -3371,22 +5627,125 @@ void D3D12Backend::Present(const Surface& front) {
      if (ramp_dirty_) UploadGammaRamp();
      Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
  
@@ -10647,7 +10723,7 @@ index 9ddd87b..cb7b9b0 100644
      if (diag::Perf()) LogPerf();
      ApplySettings();
  }
-@@ -3398,16 +5734,45 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
+@@ -3398,16 +5757,45 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
  }
  
  void D3D12Backend::ApplySettings() {
@@ -10698,7 +10774,7 @@ index 9ddd87b..cb7b9b0 100644
      }
  }
  
-@@ -3442,9 +5807,21 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
+@@ -3442,9 +5830,21 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
                    it->second.w, it->second.h);
      }
      Target& t = it->second;
@@ -10721,7 +10797,7 @@ index 9ddd87b..cb7b9b0 100644
      std::vector<uint8_t> px;
      if (!ReadBack(src.res, t.gw, t.gh, px)) return;
      // color targets are 32 bit linear in guest memory, the pitch rounds to 64 bytes
-@@ -3610,23 +5987,27 @@ bool D3D12Backend::ReadBack(ID3D12Resource* res, uint32_t w, uint32_t h, std::ve
+@@ -3610,23 +6010,27 @@ bool D3D12Backend::ReadBack(ID3D12Resource* res, uint32_t w, uint32_t h, std::ve
      UINT64 row_size;
      UINT64 bytes;
      dev_->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &rows, &row_size, &bytes);
@@ -10758,7 +10834,7 @@ index 9ddd87b..cb7b9b0 100644
      return true;
  }
  
-@@ -3704,4 +6085,53 @@ void D3D12Backend::SetGamma(const uint8_t* ramp) {
+@@ -3704,4 +6108,53 @@ void D3D12Backend::SetGamma(const uint8_t* ramp) {
  
  std::unique_ptr<Backend> CreateBackend() { return std::make_unique<D3D12Backend>(); }
  
@@ -11074,7 +11150,7 @@ index fed4612..85fd349 100644
      // the render thread
      State state_;
 diff --git a/runtime/gpu/shaders.cpp b/runtime/gpu/shaders.cpp
-index 2bd0667..16f0087 100644
+index 2bd0667..f8a310e 100644
 --- a/runtime/gpu/shaders.cpp
 +++ b/runtime/gpu/shaders.cpp
 @@ -6,6 +6,7 @@
@@ -11107,7 +11183,55 @@ index 2bd0667..16f0087 100644
  }
  
  // texture shader stage i, per its mode
-@@ -1058,10 +1060,13 @@ bool InsertAfter(std::string& s, const char* at, const char* text) {
+@@ -798,6 +800,8 @@ std::string VertexProgramHlsl(const std::vector<uint32_t>& prog, uint16_t regs,
+     return s;
+ }
+ 
++constexpr uint32_t kFixedFogSpec = 1u << 4;  // FOGENABLE with D3DFOG_NONE: vertex fog factor in specular alpha
++
+ FixedKey MakeFixedKey(const State& s) {
+     FixedKey f;
+     if (s.rs[kRsLighting]) {
+@@ -808,6 +812,7 @@ FixedKey MakeFixedKey(const State& s) {
+         for (int i = 0; i < 8; i++)
+             if ((s.light_enable >> i) & 1) f.types |= (s.lights[size_t(i)][0] & 3) << (i * 2);
+     }
++    if (s.rs[kRsFogEnable] && s.rs[kRsFogTableMode] == 0) f.light |= kFixedFogSpec;
+     for (int t = 0; t < 4; t++) {
+         uint32_t tci = s.tss[size_t(t)][kTssTexCoordIndex], ttf = s.tss[size_t(t)][kTssTextureTransformFlags];
+         uint32_t set = tci & 3, size = 2;
+@@ -906,7 +911,16 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
+         else s += F("        oT%d = float4(tc.xy, %s, 1);\n", t, count >= 3 ? "tc.z" : "0");
+         s += "    }\n";
+     }
+-    s += "    oFog = " + v(5, "float4(0,0,0,0)") + ";\n";
++    bool explicit_fog = ((regs >> 5) & 1) || (f.light & kFixedFogSpec);
++    if ((regs >> 5) & 1) {
++        s += "    oFog = i.v5;\n";
++    } else if (f.light & kFixedFogSpec) {
++        s += "    oFog = " + v(4, "float4(0,0,0,1)") + ".wwww;\n";
++    } else if (pretransformed) {
++        s += "    oFog = float4(w, w, w, w);\n";
++    } else {
++        s += "    oFog = float4(0,0,0,0);\n";
++    }
+     if (pretransformed) return s + kVsEpilogue;
+     s += R"(
+     VOut o;
+@@ -923,10 +937,9 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
+     o.tc1 = oT1;
+     o.tc2 = oT2;
+     o.tc3 = oT3;
+-    o.fogamt = fogfactor(abs(cp.z));
+-    return o;
+-}
+ )";
++    s += explicit_fog ? "    o.fogamt = fogfactor(oFog.x);\n" : "    o.fogamt = fogfactor(abs(cp.z));\n";
++    s += "    return o;\n}\n";
+     return s;
+ }
+ 
+@@ -1058,10 +1071,13 @@ bool InsertAfter(std::string& s, const char* at, const char* text) {
  std::string ReversedDepthHlsl(std::string s) {
      size_t entry = s.find("VOut main(");
      if (entry != std::string::npos) s.insert(entry, kReversedClipHlsl);
@@ -11122,7 +11246,7 @@ index 2bd0667..16f0087 100644
                  "    precise float wz = dot(ip, wvp._m03_m13_m23_m33 - wvp._m02_m12_m22_m32);\n"
                  "    o.pos.z = ReversedClip(wz, cp.w);\n");
      return s;
-@@ -1085,4 +1090,246 @@ void main(point VOut v[1], inout TriangleStream<VOut> strip) {
+@@ -1085,4 +1101,246 @@ void main(point VOut v[1], inout TriangleStream<VOut> strip) {
  )";
  }
  
@@ -11370,7 +11494,7 @@ index 2bd0667..16f0087 100644
 +
  }  // namespace gpu
 diff --git a/runtime/gpu/shaders.h b/runtime/gpu/shaders.h
-index 08d9bff..56aa462 100644
+index 08d9bff..a685872 100644
 --- a/runtime/gpu/shaders.h
 +++ b/runtime/gpu/shaders.h
 @@ -1,4 +1,5 @@
@@ -11379,6 +11503,17 @@ index 08d9bff..56aa462 100644
  #include <cstdint>
  #include <string>
  #include <vector>
+@@ -48,8 +49,8 @@ std::string VertexProgramHlsl(const std::vector<uint32_t>& program, uint16_t reg
+ bool ReadsViewportOffset(const std::vector<uint32_t>& program);
+ // fixed function vertex state a shader is built for
+ struct FixedKey {
+-    uint32_t light = 0;    // bit 0 lighting, 1 specular, 2 local viewer, 3 normalize, then D3DMCS 2 bits each from bit 8:
+-                           // diffuse, specular, ambient, emissive (material when the vertex lacks that colour)
++    uint32_t light = 0;    // bit 0 lighting, 1 specular, 2 local viewer, 3 normalize, 4 specular-alpha vertex fog,
++                           // then D3DMCS 2 bits each from bit 8: diffuse, specular, ambient, emissive
+     uint32_t types = 0;    // D3DLIGHTTYPE per light, 2 bits each, 0 off
+     uint32_t tex[4] = {};  // per stage: coordinate set, texgen at bit 4, D3DTTFF count at bit 8, projected bit 11, set size at bit 12
+ };
 @@ -63,6 +64,20 @@ std::string ReversedDepthHlsl(std::string s);
  // the geometry shader that draws a point as its console pixel
  std::string PointHlsl();
@@ -12226,10 +12361,10 @@ index 6bd6d0b..ac627f2 100644
  bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, Assembled& out);
 diff --git a/runtime/gpu/vulkan.cpp b/runtime/gpu/vulkan.cpp
 new file mode 100644
-index 0000000..232d3f7
+index 0000000..33cefd1
 --- /dev/null
 +++ b/runtime/gpu/vulkan.cpp
-@@ -0,0 +1,7316 @@
+@@ -0,0 +1,7336 @@
 +// Native Vulkan 1.2 backend for Linux x86_64 & Steam Deck (RADV / NVIDIA / Intel ANV / Mesa llvmpipe).
 +// Implements 100% parity with d3d12.cpp: reversed-Z D32_SFLOAT_S8_UINT, SizedTargetKey Swap(2)/Swap(4),
 +// glslang HLSL->SPIR-V compiler with persistent vk_shaders.bin & vk_psos_*.bin caches, negative-height
@@ -13427,9 +13562,9 @@ index 0000000..232d3f7
 +};
 +
 +constexpr uint32_t kVkPsoMetaMagic = 0x50534F4Du;
-+constexpr uint32_t kVkPsoMetaVersion = 1u;
++constexpr uint32_t kVkPsoMetaVersion = 2u;
 +constexpr uint32_t kRecipeCacheMagic = 0x43524258u;  // 'XBRC'
-+constexpr uint32_t kRecipeCacheVersion = 1u;
++constexpr uint32_t kRecipeCacheVersion = 2u;
 +constexpr VkDeviceSize kVkTexSlabSize = 32ull << 20;
 +constexpr VkDeviceSize kVkTexSlabMaxAlloc = 8ull << 20;
 +
@@ -13621,9 +13756,9 @@ index 0000000..232d3f7
 +    k.fill = s.rs[kRsFillMode];
 +}
 +
-+void FillFogConstants(const State& s, bool vertex_program, DrawConstants& c) {
++void FillFogConstants(const State& s, bool /*vertex_program*/, DrawConstants& c) {
 +    if (!s.rs[kRsFogEnable]) return;
-+    if (vertex_program && s.rs[kRsFogTableMode] == kFogTableNone) {
++    if (s.rs[kRsFogTableMode] == kFogTableNone) {
 +        c.fog[0] = 1.0f;
 +        c.fog[1] = 0.0f;
 +        c.fog[2] = 0.0f;
@@ -18227,6 +18362,16 @@ index 0000000..232d3f7
 +    return drawn.view;
 +}
 +
++bool CanSampleAsTarget(const TextureDesc& d, const FormatInfo& fi, const Target& t) {
++    constexpr uint32_t kFmtP8 = 0x0B;
++    constexpr uint32_t kFmtYuy2 = 0x24;
++    constexpr uint32_t kFmtUyvy = 0x25;
++    if (d.cube || d.depth != 1 || fi.compressed) return false;
++    if (d.format == kFmtP8 || d.format == kFmtYuy2 || d.format == kFmtUyvy) return false;
++    if (!d.linear && (d.width != t.gw || d.height != t.gh)) return false;
++    return true;
++}
++
 +VkImageView VulkanBackend::BindTexture(const State& s, int stage, DrawTextures& stages) {
 +    stages.info[stage] = {};
 +    stages.views[stage] = VK_NULL_HANDLE;
@@ -18244,8 +18389,18 @@ index 0000000..232d3f7
 +    stages.info[stage].rect = d.linear;
 +
 +    auto tit = targets_.find(SizedTargetKey(d.data, fi.depth, d.width, d.height));
-+    if (tit != targets_.end() && !d.cube && d.depth == 1 && !fi.compressed) {
-+        return BindTargetTexture(s, stage, d, tit->second, stages);
++    if (tit != targets_.end()) {
++        Target& t = tit->second;
++        bool compat = CanSampleAsTarget(d, fi, t);
++        bool overwritten = !t.depth && (TargetStale(d.data) || d.levels > 1 || !compat) && LatchCpuWrite(t);
++        if (!compat || overwritten) {
++            if ((overwritten || TargetStale(d.data)) && &t != draw_rt_ && &t != draw_ds_ && &t != bound_rt_ &&
++                &t != bound_ds_ && &t != rp_rt_ && &t != rp_ds_) {
++                ReleaseTarget(tit);
++            }
++            return BindGuestTexture(s, stage, d, fi, stages);
++        }
++        return BindTargetTexture(s, stage, d, t, stages);
 +    }
 +    return BindGuestTexture(s, stage, d, fi, stages);
 +}
@@ -20631,10 +20786,10 @@ index 4974985..0513cea 100644
  }
  
 diff --git a/runtime/kernel/threads.cpp b/runtime/kernel/threads.cpp
-index 137c57f..f4e5a56 100644
+index 137c57f..daa06c4 100644
 --- a/runtime/kernel/threads.cpp
 +++ b/runtime/kernel/threads.cpp
-@@ -1,22 +1,355 @@
+@@ -1,22 +1,371 @@
  #include <algorithm>
 +#include <atomic>
 +#include <bit>
@@ -20859,9 +21014,11 @@ index 137c57f..f4e5a56 100644
  thread_local ThreadRef t_current;
  std::mutex g_threads_lock;
  std::vector<ThreadRef> g_threads;
++std::unordered_map<Thread*, int> g_rel_prio;  // protected by g_threads_lock
  std::atomic<uint32_t> g_next_id{0x10};
 +std::atomic<uint32_t> g_main_guest_tid{0};
 +std::atomic<uint32_t> g_main_host_tid{0};
++std::atomic<int> g_main_rel_prio{0};
 +std::atomic<uint64_t> g_last_frame_progress_ns{0};
 +std::atomic<bool> g_main_boosted{false};
 +
@@ -20875,66 +21032,78 @@ index 137c57f..f4e5a56 100644
 +void ApplyWinPriority(uint32_t host_tid, uint32_t guest_id, int prio) {
 +    if (!host_tid) return;
 +    int win_prio = THREAD_PRIORITY_NORMAL;
-+    bool disable_boost = app::kGame.single_core_guest;
 +    if (app::kGame.single_core_guest) {
-+        uint32_t main_id = g_main_guest_tid.load(std::memory_order_acquire);
-+        if (guest_id == main_id) {
-+            bool boosted = g_main_boosted.load(std::memory_order_acquire);
-+            if (boosted) {
-+                win_prio = THREAD_PRIORITY_HIGHEST;
-+                disable_boost = false;
-+            } else {
-+                win_prio = THREAD_PRIORITY_NORMAL;
-+                disable_boost = true;
-+            }
++        // Strict monotonic Xbox priority hierarchy on the pinned single guest core:
++        //   prio >= +2 (+2 HIGHEST, +16 TIME_CRITICAL) -> TIME_CRITICAL (15)
++        //   prio == +1 (e.g. Surreal SRSC streaming worker) -> HIGHEST (10)
++        //   prio ==  0 main guest thread (active frame progress) -> ABOVE_NORMAL (9)
++        //   prio ==  0 unboosted main / background guest worker -> NORMAL (8)
++        //   prio == -1 -> BELOW_NORMAL (7), <= -2 -> LOWEST (6), <= -15 -> IDLE (1)
++        // Keep NT dynamic priority boost disabled on all single-core guest threads so wait
++        // completions on the main thread never temporarily boost it above +1 streaming workers.
++        if (prio >= 2) {
++            win_prio = THREAD_PRIORITY_TIME_CRITICAL;
++        } else if (prio == 1) {
++            win_prio = THREAD_PRIORITY_HIGHEST;
++        } else if (prio == 0) {
++            bool is_main = (guest_id != 0 && guest_id == g_main_guest_tid.load(std::memory_order_acquire));
++            bool boosted = is_main && g_main_boosted.load(std::memory_order_acquire);
++            win_prio = boosted ? THREAD_PRIORITY_ABOVE_NORMAL : THREAD_PRIORITY_NORMAL;
++        } else if (prio == -1) {
++            win_prio = THREAD_PRIORITY_BELOW_NORMAL;
++        } else if (prio <= -15) {
++            win_prio = THREAD_PRIORITY_IDLE;
 +        } else {
-+            if (prio >= 2) win_prio = THREAD_PRIORITY_HIGHEST;
-+            else if (prio == 1) win_prio = THREAD_PRIORITY_ABOVE_NORMAL;
-+            else if (prio <= -2) win_prio = THREAD_PRIORITY_LOWEST;
-+            else if (prio < 0) win_prio = THREAD_PRIORITY_BELOW_NORMAL;
-+            else win_prio = THREAD_PRIORITY_NORMAL;
++            win_prio = THREAD_PRIORITY_LOWEST;
 +        }
 +    } else {
-+        if (prio >= 1) win_prio = THREAD_PRIORITY_HIGHEST;
++        if (prio >= 2) win_prio = THREAD_PRIORITY_TIME_CRITICAL;
++        else if (prio == 1) win_prio = THREAD_PRIORITY_HIGHEST;
++        else if (prio == -1) win_prio = THREAD_PRIORITY_BELOW_NORMAL;
++        else if (prio <= -15) win_prio = THREAD_PRIORITY_IDLE;
 +        else if (prio <= -2) win_prio = THREAD_PRIORITY_LOWEST;
-+        else if (prio < 0) win_prio = THREAD_PRIORITY_BELOW_NORMAL;
 +    }
 +    if (HANDLE h = OpenThread(THREAD_SET_INFORMATION, FALSE, host_tid)) {
 +        SetThreadPriority(h, win_prio);
-+        if (app::kGame.single_core_guest) SetThreadPriorityBoost(h, disable_boost ? TRUE : FALSE);
++        if (app::kGame.single_core_guest) SetThreadPriorityBoost(h, TRUE);
 +        ::CloseHandle(h);
 +    }
 +}
 +#else
 +std::atomic<int> g_linux_nice_shift{0};
-+std::unordered_map<Thread*, int> g_linux_rel_prio;  // protected by g_threads_lock
 +
 +int LinuxNiceForPrio(int prio, int shift, bool is_main, bool main_boosted) {
 +    if (app::kGame.single_core_guest) {
 +        if (shift > 0) {
-+            if (is_main) return 0;
-+            if (prio >= 2) return 0;
-+            if (prio == 1) return shift;
-+            if (prio == 0) return std::min(shift * 2, 19);
-+            if (prio == -1) return std::min(shift * 3, 19);
-+            return std::min(shift * 4, 19);
++            // Unprivileged Linux (no CAP_SYS_NICE): keep prio >= +1 workers and the main thread
++            // at nice 0 (never penalize +1 streaming workers behind main, and keep main at nice 0
++            // so child pthreads spawned by main do not inherit a raised nice ceiling).
++            if (prio >= 1 || is_main) return 0;
++            if (prio == 0) return std::min(shift, 19);
++            if (prio == -1) return std::min(shift * 2, 19);
++            if (prio <= -15) return 19;
++            return std::min(shift * 3, 19);
 +        }
-+        if (is_main) return main_boosted ? -6 : 0;
-+        if (prio >= 2) return -6;
-+        if (prio == 1) return -3;
-+        if (prio <= -2) return 10;
-+        if (prio < 0) return 5;
-+        return 0;
++        // Privileged Linux: strict Xbox ordering (-8 < -5 < -2 < 0 < 5 < 10 < 19)
++        if (prio >= 2) return -8;
++        if (prio == 1) return -5;
++        if (prio == 0) return (is_main && main_boosted) ? -2 : 0;
++        if (prio == -1) return 5;
++        if (prio <= -15) return 19;
++        return 10;
 +    }
 +    if (shift > 0) {
 +        if (prio >= 1) return 0;
 +        if (prio == 0) return shift;
 +        if (prio == -1) return shift + 5;
++        if (prio <= -15) return 19;
 +        return std::min(shift + 10, 19);
 +    }
-+    if (prio >= 1) return -5;
++    if (prio >= 2) return -8;
++    if (prio == 1) return -5;
++    if (prio == -1) return 5;
++    if (prio <= -15) return 19;
 +    if (prio <= -2) return 10;
-+    if (prio < 0) return 5;
 +    return 0;
 +}
 +
@@ -20953,8 +21122,8 @@ index 137c57f..f4e5a56 100644
 +            if (!r) continue;
 +            uint32_t otid = r->host_tid.load(std::memory_order_acquire);
 +            if (!otid) continue;
-+            auto it = g_linux_rel_prio.find(r.get());
-+            int oprio = (it != g_linux_rel_prio.end()) ? it->second : r->priority;
++            auto it = g_rel_prio.find(r.get());
++            int oprio = (it != g_rel_prio.end()) ? it->second : r->priority;
 +            items.push_back({otid, oprio, r->id == main_id});
 +        }
 +    }
@@ -20970,14 +21139,16 @@ index 137c57f..f4e5a56 100644
 +    if (prev == boosted) return;
 +    uint32_t htid = g_main_host_tid.load(std::memory_order_acquire);
 +    uint32_t gtid = g_main_guest_tid.load(std::memory_order_acquire);
++    int mprio = g_main_rel_prio.load(std::memory_order_acquire);
 +    if (!htid || !gtid) return;
 +#ifdef _WIN32
-+    ApplyWinPriority(htid, gtid, 0);
++    ApplyWinPriority(htid, gtid, mprio);
 +#else
 +    int shift = g_linux_nice_shift.load(std::memory_order_acquire);
 +    if (shift > 0) return;  // unprivileged Linux keeps main guest thread at nice 0
-+    int nice_val = LinuxNiceForPrio(0, shift, true, boosted);
-+    if (setpriority(PRIO_PROCESS, id_t(htid), nice_val) != 0 && boosted && (errno == EACCES || errno == EPERM)) {
++    int nice_val = LinuxNiceForPrio(mprio, shift, true, boosted);
++    if (setpriority(PRIO_PROCESS, id_t(htid), nice_val) != 0 && boosted && nice_val < 0 &&
++        (errno == EACCES || errno == EPERM)) {
 +        constexpr int kFallbackShift = 4;
 +        if (g_linux_nice_shift.exchange(kFallbackShift, std::memory_order_acq_rel) == 0) {
 +            LOGI("threads: unprivileged setpriority(%d) denied (errno=%d); shifting background guest threads to nice +%d/+%d/+%d",
@@ -20990,26 +21161,34 @@ index 137c57f..f4e5a56 100644
  
  // guest structures per thread
  constexpr uint32_t kKpcrSize = 0x400;
-@@ -62,12 +395,18 @@ void InitContext(Thread& t, X86Context& ctx) {
+@@ -62,12 +411,26 @@ void InitContext(Thread& t, X86Context& ctx) {
  void Register(const ThreadRef& t) {
      std::lock_guard<std::mutex> lock(g_threads_lock);
      g_threads.push_back(t);
-+#ifndef _WIN32
-+    g_linux_rel_prio.emplace(t.get(), t->priority);
-+#endif
++    g_rel_prio[t.get()] = t->priority;
++    if (g_main_guest_tid.load(std::memory_order_relaxed) == 0) {
++        g_main_guest_tid.store(t->id, std::memory_order_release);
++        g_main_rel_prio.store(t->priority, std::memory_order_release);
++    }
  }
  
  void Unregister(Thread* t) {
      std::lock_guard<std::mutex> lock(g_threads_lock);
      g_threads.erase(std::remove_if(g_threads.begin(), g_threads.end(), [t](const ThreadRef& r) { return r.get() == t; }),
                      g_threads.end());
-+#ifndef _WIN32
-+    g_linux_rel_prio.erase(t);
-+#endif
++    g_rel_prio.erase(t);
++    // Clear g_main_* atomically under g_threads_lock if an early bootstrap thread (e.g. XAPI
++    // XapiInitProcess thread 0x10) exits after spawning the real main game thread (0x14).
++    if (t->id != 0 && g_main_guest_tid.load(std::memory_order_relaxed) == t->id) {
++        g_main_guest_tid.store(0, std::memory_order_release);
++        g_main_host_tid.store(0, std::memory_order_release);
++        g_main_rel_prio.store(0, std::memory_order_release);
++        g_main_boosted.store(false, std::memory_order_release);
++    }
  }
  
  void MarkExited(Thread& t, uint32_t code) {
-@@ -78,6 +417,7 @@ void MarkExited(Thread& t, uint32_t code) {
+@@ -78,6 +441,7 @@ void MarkExited(Thread& t, uint32_t code) {
  }
  
  void NameHostThread(const char* name) {
@@ -21017,7 +21196,7 @@ index 137c57f..f4e5a56 100644
      wchar_t w[64];
      size_t i = 0;
      for (; name[i] && i < 63; i++) w[i] = wchar_t(name[i]);
-@@ -85,11 +425,17 @@ void NameHostThread(const char* name) {
+@@ -85,11 +449,17 @@ void NameHostThread(const char* name) {
      using Fn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
      static Fn set = reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")));
      if (set) set(GetCurrentThread(), w);
@@ -21035,7 +21214,7 @@ index 137c57f..f4e5a56 100644
      auto entry = [](void* p) -> DWORD {
          std::unique_ptr<std::function<void()>> g(static_cast<std::function<void()>*>(p));
          (*g)();
-@@ -97,6 +443,24 @@ void Spawn(std::function<void()> fn) {
+@@ -97,6 +467,24 @@ void Spawn(std::function<void()> fn) {
      };
      HANDLE h = ::CreateThread(nullptr, 64u << 20, entry, f, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
      if (h) ::CloseHandle(h);
@@ -21060,17 +21239,18 @@ index 137c57f..f4e5a56 100644
  }
  
  }  // namespace
-@@ -128,10 +492,112 @@ ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_r
+@@ -128,10 +516,149 @@ ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_r
      return t;
  }
  
 +void ApplyThreadPriority(Thread& t, int prio) {
-+#ifndef _WIN32
 +    {
 +        std::lock_guard<std::mutex> lock(g_threads_lock);
-+        g_linux_rel_prio[&t] = prio;
++        g_rel_prio[&t] = prio;
++        if (t.id != 0 && g_main_guest_tid.load(std::memory_order_relaxed) == t.id) {
++            g_main_rel_prio.store(prio, std::memory_order_release);
++        }
 +    }
-+#endif
 +    uint32_t tid = t.host_tid.load(std::memory_order_acquire);
 +    if (!tid) return;
 +#ifdef _WIN32
@@ -21097,15 +21277,56 @@ index 137c57f..f4e5a56 100644
 +
 +void NotifyGuestFrameProgress() {
 +    if (!app::kGame.single_core_guest) return;
-+    if (Thread* cur = Current()) {
-+        uint32_t expected = 0;
-+        g_main_guest_tid.compare_exchange_strong(expected, cur->id, std::memory_order_acq_rel);
-+        if (cur->id == g_main_guest_tid.load(std::memory_order_acquire)) {
-+            uint32_t htid = cur->host_tid.load(std::memory_order_acquire);
-+            if (htid) g_main_host_tid.store(htid, std::memory_order_release);
++    g_last_frame_progress_ns.store(SteadyNowNs(), std::memory_order_release);
++    Thread* cur = Current();
++    if (!cur) return;
++
++    // Fast path: g_main_guest_tid is already bound to cur->id (zero locks / zero RMWs per frame).
++    // Slow path: authoritatively bind g_main_* under g_threads_lock (serialized with Register/Unregister).
++    uint32_t cur_htid = cur->host_tid.load(std::memory_order_acquire);
++    if (g_main_guest_tid.load(std::memory_order_acquire) != cur->id) {
++        ThreadRef prev_ref;
++        int prev_prio = 0;
++        int cur_prio = cur->priority;
++        bool switched = false;
++        {
++            std::lock_guard<std::mutex> lock(g_threads_lock);
++            uint32_t prev_gtid = g_main_guest_tid.load(std::memory_order_relaxed);
++            if (prev_gtid != cur->id) {
++                switched = true;
++                auto it_cur = g_rel_prio.find(cur);
++                if (it_cur != g_rel_prio.end()) cur_prio = it_cur->second;
++                if (prev_gtid != 0) {
++                    for (const ThreadRef& r : g_threads) {
++                        if (r && r->id == prev_gtid) {
++                            prev_ref = r;
++                            auto it_prev = g_rel_prio.find(r.get());
++                            prev_prio = (it_prev != g_rel_prio.end()) ? it_prev->second : r->priority;
++                            break;
++                        }
++                    }
++                }
++                g_main_guest_tid.store(cur->id, std::memory_order_release);
++                g_main_host_tid.store(cur_htid, std::memory_order_release);
++                g_main_rel_prio.store(cur_prio, std::memory_order_release);
++                g_main_boosted.store(true, std::memory_order_release);
++            }
++        }
++        if (switched) {
++            if (prev_ref) {
++                ApplyThreadPriority(*prev_ref, prev_prio);
++            }
++            ApplyThreadPriority(*cur, cur_prio);
++            return;
 +        }
 +    }
-+    g_last_frame_progress_ns.store(SteadyNowNs(), std::memory_order_release);
++
++    if (cur_htid && g_main_host_tid.load(std::memory_order_acquire) != cur_htid) {
++        std::lock_guard<std::mutex> lock(g_threads_lock);
++        if (g_main_guest_tid.load(std::memory_order_relaxed) == cur->id) {
++            g_main_host_tid.store(cur_htid, std::memory_order_release);
++        }
++    }
 +    if (!g_main_boosted.load(std::memory_order_acquire)) {
 +        SetMainGuestThreadBoosted(true);
 +    }
@@ -21121,32 +21342,24 @@ index 137c57f..f4e5a56 100644
 +}
 +
  void StartThread(ThreadRef t) {
-+    uint32_t expected_main = 0;
-+    g_main_guest_tid.compare_exchange_strong(expected_main, t->id, std::memory_order_acq_rel);
      Register(t);
      Spawn([t] {
          t_current = t;
 +#ifdef _WIN32
 +        uint32_t htid = GetCurrentThreadId();
 +        t->host_tid.store(htid, std::memory_order_release);
-+        if (t->id == g_main_guest_tid.load(std::memory_order_acquire)) {
-+            g_main_host_tid.store(htid, std::memory_order_release);
-+        }
 +        if (app::kGame.single_core_guest) {
 +            DWORD_PTR mask = SelectGuestCoreMask();
 +            if (!SetThreadAffinityMask(GetCurrentThread(), mask)) {
 +                LOGW("threads: SetThreadAffinityMask(0x%llX) failed (err=%lu)", (unsigned long long)mask, GetLastError());
 +            }
-+            // Disable Windows dynamic priority boost for non-boosted single-core guest threads;
-+            // ApplyThreadPriority re-enables boost on the main guest thread during active frame pacing.
++            // Disable Windows dynamic priority boost on all single-core guest threads so strict
++            // Xbox relative priority ordering is never inverted by NT wait boosts.
 +            SetThreadPriorityBoost(GetCurrentThread(), TRUE);
 +        }
 +#else
 +        uint32_t htid = uint32_t(syscall(SYS_gettid));
 +        t->host_tid.store(htid, std::memory_order_release);
-+        if (t->id == g_main_guest_tid.load(std::memory_order_acquire)) {
-+            g_main_host_tid.store(htid, std::memory_order_release);
-+        }
 +        if (app::kGame.single_core_guest) {
 +            uint32_t cpu = SelectGuestCoreCpu();
 +            cpu_set_t set;
@@ -21157,23 +21370,26 @@ index 137c57f..f4e5a56 100644
 +            }
 +        }
 +#endif
-+#ifdef _WIN32
-+        if (app::kGame.single_core_guest || t->priority != 0) ApplyThreadPriority(*t, t->priority);
-+#else
 +        {
 +            int rel_prio = t->priority;
 +            {
 +                std::lock_guard<std::mutex> lock(g_threads_lock);
-+                auto it = g_linux_rel_prio.find(t.get());
-+                if (it != g_linux_rel_prio.end()) rel_prio = it->second;
++                if (g_main_guest_tid.load(std::memory_order_relaxed) == t->id) {
++                    g_main_host_tid.store(htid, std::memory_order_release);
++                }
++                auto it = g_rel_prio.find(t.get());
++                if (it != g_rel_prio.end()) rel_prio = it->second;
 +            }
++#ifdef _WIN32
++            if (app::kGame.single_core_guest || rel_prio != 0) ApplyThreadPriority(*t, rel_prio);
++#else
 +            ApplyThreadPriority(*t, rel_prio);
-+        }
 +#endif
++        }
          char name[32];
          std::snprintf(name, sizeof(name), "guest %X", t->id);
          NameHostThread(name);
-@@ -185,7 +651,11 @@ void ExitThread(uint32_t code) {
+@@ -185,7 +712,11 @@ void ExitThread(uint32_t code) {
          Unregister(t);
      }
      t_current.reset();
@@ -21185,7 +21401,7 @@ index 137c57f..f4e5a56 100644
  }
  
  void Resume(Thread& t) {
-@@ -232,4 +702,24 @@ bool RunApcs(Thread& t) {
+@@ -232,4 +763,24 @@ bool RunApcs(Thread& t) {
      return ran;
  }
  

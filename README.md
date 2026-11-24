@@ -13,14 +13,29 @@
 
 ---
 
+## What's New in `v1.5.0`
+
+- **Launcher & In-Game Update Checker, Startup Alerts & One-Click Self-Updater:**
+  - Added a **Check for Updates** button and automatic background startup check (configurable via **Automatically check for updates on startup** in `settings.toml`, using native `WinHTTP` on Windows and zero-library `curl`/`wget`/`python3` subprocess fetches on Linux so `ELF64` `DT_NEEDED` / `glibc 2.35` portability remains untouched) to both the **Pre-Game Graphical Launcher** and the **In-Game `F1` -> Launcher & Diagnostics** tab (plus a non-intrusive corner toast when `"Skip launcher on future starts"` is active).
+  - When a newer GitHub release is detected, a high-visibility **Update Alert** banner offers one-click **Update Now** (`SHA-256` & size-verified download, archive staging, atomic binary/plugin/compiler swap preserving `settings.toml`, `hdd/` Xbox saves, `assets/`, `cache/`, and `.iso` paths, automatic recompile-stamp refresh if `compiler/` changed, and clean relaunch), **Open Release Page**, and per-version **Dismiss**.
+- **Recreation Yard Searchlight Rendering Fix (D3D12 & Vulkan):**
+  - Fixed the bright concentric-ring bullseye and grey rectangular quad artifact on guard-tower pedestal searchlights in `3a YardCellBlock`: `BindTexture` / `CanSampleAsTarget` now reject paletted `D3DFMT_P8` (`0x0B`), YUV, compressed, cube/3D, and dimension-mismatched textures that reuse freed contiguous render-target addresses so they always decode with their bound stage palette (`ReadStagePalette`) rather than unpaletted `(idx, idx, idx, 255)` greyscale.
+  - Matched XDK 5788 / NV2A fixed-function fog hardware behavior (`SPECULAR.A` passthrough when `FOGTABLEMODE == D3DFOG_NONE`, and `1 / rhw.w` eye-distance fog on pre-transformed `XYZRHW` sprites when table fog is active) and bumped shader/PSO metadata cache versions (`v2`).
+- **`2 Cellblocks` ("Byron" / Dallas) Progression, `CClock` & Single-Core `SRSC` Streaming Fixes:**
+  - Restored strict Original Xbox relative thread priority ordering (`SRSC` streaming worker `+1 -> HIGHEST` above boosted `Main` `0 -> ABOVE_NORMAL`) and fixed bootstrap-thread (`0x10 -> 0x14`) re-latching on Windows & Linux `single_core_guest`, eliminating 60+ FPS streaming starvation alongside cooperative yields across all synchronous `SRSC` spin-waiters and main-thread completion gating on `CSTOMPInstance::Start` (`sub_001BAB90`).
+  - Fixed `CClock` (`0x002DC724`) hooks so checkpoint/room partial resets (`sub_001A31A0(0)`) preserve `g_ElapsedGameTime` (`0x002E0290`) instead of freezing NPC pathfinding and animation blends mid-level, kept all `CClock` fields synchronized across `SaveState`/`LoadState`/`GetTimeScale`, paused elapsed game time cleanly during UI & streaming pauses (`0x002E0274 & 1`), and matched `TimeMgr`'s `0.10s` `max_dt` clamp.
+  - Added surgical `2 Cellblocks` script guards (`MessageRelay #4051 -> #11966` and `Timer #12614`, gated on `IsDallasAlive` to preserve Evil-morality runs and heal pre-existing `v1.4.0` checkpoints) so sprinting ahead before the mounted machine-gun encounter can no longer stall Dallas or permanently lock the Control Room exit gates (`#7001` / `#7002`).
+
+---
+
 ## System Requirements (End Users)
 
-### Windows (`v1.4.1` — Native Win64 D3D12)
+### Windows (`v1.5.0` — Native Win64 D3D12)
 - **OS:** Windows 11 x64 or Windows 10 1809+ x64
 - **GPU:** Direct3D 12-capable GPU (Feature Level `11_0` or newer — supports NVIDIA, AMD, Intel Arc/Iris, and Handheld/iGPU UMA systems)
 - **Storage:** ~400 MB free writable disk space beside `suffering.exe` (for locally compiled `suffering.dll`, per-adapter shader/PSO cache `cache\`, virtual Xbox HDD `hdd\`, and logs)
 
-### Native Linux `x86_64` & Steam Deck (`v1.4.1` — Native Vulkan 1.2 + SDL3 + ELF64)
+### Native Linux `x86_64` & Steam Deck (`v1.5.0` — Native Vulkan 1.2 + SDL3 + ELF64)
 - **OS:** Any `x86_64` Linux distribution with **`glibc 2.35+`** and `libstdc++.so.6` (`GLIBCXX_3.4.30+`): **SteamOS 3.x (Steam Deck LCD & OLED)**, Ubuntu 22.04+, Debian 12+, Fedora 36+, Arch Linux, Bazzite, CachyOS — **zero Proton or Wine required**, and **zero system LLVM/Clang dev packages required** on stock read-only SteamOS!
 - **GPU:** Vulkan 1.2-capable GPU (AMD RADV on Steam Deck / Radeon, NVIDIA proprietary Vulkan, Intel ANV, or Mesa `lavapipe` software fallback)
 - **Audio / Display / Input:** PipeWire, PulseAudio, or ALSA; Wayland, Gamescope (Steam Deck Gaming Mode), or X11; SDL3 `evdev` + `HIDAPI` (Steam Deck integrated controls, DualSense 5, Xbox, Switch) + SDL3 Relative Mouse
@@ -46,27 +61,28 @@
 
 ## Quick Start (End-User Release Packages)
 
-### Windows (`TheSuffering-Recomp-v1.4.1-win64-launcher.zip`)
+### Windows (`TheSuffering-Recomp-v1.5.0-win64-launcher.zip`)
 You do **not** need Visual Studio, CMake, Python, or manual file extraction to play from a packaged Win64 launcher release:
 
 1. **Unpack** the archive into any writable folder (for example, `C:\Games\TheSuffering\`).
 2. **Launch `suffering.exe`** to open the **Pre-Game Graphical Launcher** (PerMonitorV2 DPI-aware Segoe UI interface with full keyboard & controller support):
    - **Select your legally owned Disc Image:** Click **Browse Disc Image...** (or let the first-launch picker guide you) to select your **The Suffering (USA)** `.xiso.iso` or `.iso`. `suffering.exe` validates it read-only (XDVDFS volume, `/Default.xbe`, Title ID `0x4D570015`, supported USA Retail SHA-1) and persists its path in `settings.toml`.
    - **Configure Hardware Preset, Upscaling, Display & GPU, Controls & Audio:** Pick one of 4 one-click Hardware Presets (**Handheld / iGPU**, **1080p Mainstream**, **1440p High**, **4K Ultra**), choose your upscaler, display adapter, and **Mouse & Keyboard / Controller** bindings, and click **PLAY**.
+   - **Check for Updates & One-Click Self-Update:** The launcher checks GitHub Releases automatically in the background on startup (and anytime via **Check for Updates** in the header bar). When a new version is available, an **Update Alert** banner lets you click **Update Now** to download, verify (`SHA-256`), stage, and relaunch into the new build automatically without touching `settings.toml`, `hdd\` saves, or your disc image — or click **Open Release Page** to view full release notes.
    - **First-Launch Local Compilation:** On first launch only, `suffering.exe` uses the bundled `compiler\` tools (`xbe_recomp.exe`, `clang.exe`, `lld-link.exe`) with RAM-bounded parallelism to compile `suffering.dll` locally from your disc's `Default.xbe` with a live progress bar (typically ~15–45 seconds).
 3. **Subsequent Launches & Skip-Launcher Option:**
    - `suffering.dll` is reused automatically (`compiler\work\suffering\built.txt`).
    - Enable **"Skip launcher on future starts"** inside the launcher to boot straight into gameplay on future runs.
    - To reopen the Pre-Game Launcher anytime while skipping is enabled, **hold `Shift`** while starting `suffering.exe`, pass `--launcher`, or re-enable **"Show Pre-Game Launcher on Startup"** inside the in-game **`F1`** overlay (**Launcher & Diagnostics**).
 
-### Native Linux `x86_64` & Steam Deck (`TheSuffering-Recomp-v1.4.1-linux-x86_64.tar.gz`)
+### Native Linux `x86_64` & Steam Deck (`TheSuffering-Recomp-v1.5.0-linux-x86_64.tar.gz`)
 
 Runs **100% natively on Linux Vulkan 1.2 + SDL3** with zero Proton overhead and zero system LLVM dependencies on stock read-only SteamOS:
 
 1. **Extract** the tarball into a writable directory (for example, `~/Games/TheSuffering/`):
    ```bash
    mkdir -p ~/Games/TheSuffering
-   tar -xzf TheSuffering-Recomp-v1.4.1-linux-x86_64.tar.gz -C ~/Games/TheSuffering
+   tar -xzf TheSuffering-Recomp-v1.5.0-linux-x86_64.tar.gz -C ~/Games/TheSuffering
    cd ~/Games/TheSuffering
    ```
 2. **Optional — Register in Steam Deck Gaming Mode & Desktop Menu:**
@@ -79,6 +95,7 @@ Runs **100% natively on Linux Vulkan 1.2 + SDL3** with zero Proton overhead and 
    - Opens the **Pre-Game Graphical Launcher** (auto-fills `1280x800` in Gamescope on Steam Deck, auto-detects the **`Steam Deck (1280x800)`** preset with **AMD FSR 1.0 Quality `67%`** `854x480 -> 1280x720` cleanly centered in `1280x800`, 4x AF, and exact 60 FPS pacing on both 60 Hz LCD and 90 Hz OLED).
    - **Built-In Gamepad + Touch + Mouse XISO File Browser:** Click **Browse Disc Image...** to open the in-app Dear ImGui file browser with a **Quick-Jump sidebar** (`Game Folder`, `Home`, `Downloads`, `Desktop`, auto-detected Steam Deck microSD `/run/media/mmcblk0p1` & `/run/media/<user>/*`, `/`), touch-friendly rows, live read-only `ValidateDiscImage` badge, and full gamepad navigation (`D-Pad`/`Stick`, `A` open/select, `B` up, `LB`/`RB` sidebar <-> list) — zero GTK/KDE portal hangs in Gaming Mode! Desktop Linux users also get an optional **"System Dialog..."** button.
    - **First-Launch Local Compilation:** Compiles `libsuffering.so` once locally from your XISO using the bundled self-contained `compiler/{xbe_recomp,clang,ld.lld,lib/*}` with zero `/usr/include` or system packages needed.
+   - **Built-In Update Checker & Self-Updater:** Includes the same **Check for Updates** header button, automatic startup update alerts, **Update Now** (`linux-x86_64.tar.gz` staging & relaunch preserving `settings.toml` and `hdd/`), and **Open Release Page** support on Desktop Linux & Steam Deck.
    - **Cross-Platform `settings.toml`:** All mouse & keyboard keybindings (`[controls.bindings]`), upscaler settings, and Xbox saves (`hdd/E/UDATA/4d570015/`) are 100% portable between Windows and Linux.
 
 ### Selecting or Relocating Your Disc Image
@@ -94,7 +111,7 @@ Runs **100% natively on Linux Vulkan 1.2 + SDL3** with zero Proton overhead and 
 
 ---
 
-## Modern Upscaling Suite (`v1.4.1`)
+## Modern Upscaling Suite (`v1.5.0`)
 
 Both Windows (Direct3D 12) and Native Linux / Steam Deck (Vulkan 1.2) decouple the internal 3D rendering resolution (`render_w x render_h`) from the native display resolution (`bb_w x bb_h`), apply square-pixel aspect-locked upscaling before compositing crisp native-resolution Dear ImGui overlays, and bypass temporal upscaling cleanly on 2D menus, loading screens, and FMVs.
 
@@ -153,7 +170,7 @@ Press **`F1`** on the keyboard (or **`BACK + Left Stick Click (L3)`** on a contr
   - **Mouse & Keyboard Sub-Tab:** Sensitivity slider (`0.10–5.00x`, with live `cm/360 @ 800 DPI` readout), **Invert Mouse Y** (decoupled from the Xbox controller pitch setting), **Raw 1:1 Mouse Aim** (bypasses controller sticky aim-slowdown on targets), optional **Mouse Smoothing**, **Reset to PC Defaults**, and an interactive 4-column **Click-to-Rebind** table (`Primary` + `Secondary` slots across all 18 actions supporting keyboard keys, mouse buttons `LMB/RMB/MMB/Mouse4/Mouse5`, and `Wheel Up`/`Wheel Down`; `Esc` cancels, `Del` clears).
   - **Controller Sub-Tab:** Live Port 1 SDL3 / DualSense 5 device status (`VID:PID`), Rumble enable + strength (`0–100%`) + Test Pulse, Extra Host Stick Deadzone (`0–30%`), DualSense Touchpad Click -> Xbox `BACK` toggle, and Wine / Steam Deck XInput Compatibility toggle.
 - **Audio:** Master Volume (`0–100%`), Mute All, Mute When Unfocused, and Speaker Output Mode (`Auto`, `Stereo`, `5.1 Surround`, `Mono`).
-- **Launcher & Diagnostics:** Live FPS / Frame-Time / Upscaler HUD toggle, **Show Pre-Game Launcher on Startup** toggle, per-adapter Shader/PSO Cache stats & 1-click **Reset Shader & PSO Cache**, **Relocate Disc Image...**, **Open Save Data / Logs / CrashDumps / Plugins** folders, and **Create Desktop Shortcut**.
+- **Launcher & Diagnostics:** **Updates** section (**Check for Updates**, **Automatically check for updates on startup** toggle, background corner toast notification when skipping the launcher, and **Save & Exit to Update** / **Open Release Page** controls), live FPS / Frame-Time / Upscaler HUD toggle, **Show Pre-Game Launcher on Startup** toggle, per-adapter Shader/PSO Cache stats & 1-click **Reset Shader & PSO Cache**, **Relocate Disc Image...**, **Open Save Data / Logs / CrashDumps / Plugins** folders, and **Create Desktop Shortcut**.
 
 ### Desktop Shortcut & Utility CLI Flags
 
@@ -290,7 +307,7 @@ All runtime data is portable and stored beside `suffering.exe`:
   cmake --build out/build/linux-release --parallel
   # Package self-contained Linux & Steam Deck tarball:
   bash release_linux.sh --build-dir out/build/linux-release \
-    --out-tar .local/dist/TheSuffering-Recomp-v1.4.1-linux-x86_64.tar.gz
+    --out-tar .local/dist/TheSuffering-Recomp-v1.5.0-linux-x86_64.tar.gz
   ```
 - **Automated 6-Gate Release & Copyright Audit (Windows + Linux ELF64):**
   ```bash
