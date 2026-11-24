@@ -642,7 +642,7 @@ bool RunLauncher(void* hinstance) {
     RegisterClassExW(&wc);
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    HWND hwnd = CreateWindowExW(0, class_name.c_str(), L"The Suffering - PC Recompilation Launcher (v1.4.0)", style,
+    HWND hwnd = CreateWindowExW(0, class_name.c_str(), L"The Suffering - PC Recompilation Launcher (v1.4.1)", style,
                                 work.left + 40, work.top + 40, 920, 620, nullptr, nullptr, inst, nullptr);
     if (!hwnd) {
         UnregisterClassW(class_name.c_str(), inst);
@@ -798,7 +798,7 @@ bool RunLauncher(void* hinstance) {
             if (lctx.fonts.heading) ImGui::PushFont(lctx.fonts.heading);
             ImGui::TextColored(ImVec4(0.96f, 0.34f, 0.34f, 1.0f), "THE SUFFERING");
             ImGui::SameLine();
-            ImGui::TextUnformatted("- PC Recompilation Launcher v1.4.0");
+            ImGui::TextUnformatted("- PC Recompilation Launcher v1.4.1");
             if (lctx.fonts.heading) ImGui::PopFont();
 
             std::string gpu_line = active_gpu ? active_gpu->name : "Default D3D12 GPU";
@@ -985,6 +985,8 @@ bool RunLauncher(void* hinstance) {
                         ImGui::Separator();
                         ImGui::Text("Shader / PSO Cache on Disk: %.2f MB (cache\\)",
                                     double(cache_bytes) / (1024.0 * 1024.0));
+                        ImGui::TextDisabled(
+                            "Startup Pre-Compilation: Enabled (parallel shader & PSO warmup runs automatically on launch)");
                         if (ImGui::Button("Clear Shader & PSO Cache")) {
                             fs::path cdir = app::ExeDir() / "cache";
                             std::error_code rec;
@@ -1192,7 +1194,7 @@ bool RunLauncher(void* /*hinstance*/) {
         wflags |= SDL_WINDOW_RESIZABLE;
     }
 
-    SDL_Window* win = SDL_CreateWindow("The Suffering - PC Recompilation Launcher (v1.4.0)", init_w, init_h, wflags);
+    SDL_Window* win = SDL_CreateWindow("The Suffering - PC Recompilation Launcher (v1.4.1)", init_w, init_h, wflags);
     if (!win) {
         LOGW("launcher: SDL_CreateWindow failed (%s); continuing directly to game", SDL_GetError());
         return true;
@@ -1342,7 +1344,7 @@ bool RunLauncher(void* /*hinstance*/) {
             if (fonts.heading) ImGui::PushFont(fonts.heading);
             ImGui::TextColored(ImVec4(0.96f, 0.34f, 0.34f, 1.0f), "THE SUFFERING");
             ImGui::SameLine();
-            ImGui::TextUnformatted("- PC Recompilation Launcher v1.4.0");
+            ImGui::TextUnformatted("- PC Recompilation Launcher v1.4.1");
             if (fonts.heading) ImGui::PopFont();
 
             std::string gpu_line = active_gpu ? active_gpu->name : "Default Vulkan 1.2 GPU";
@@ -1511,6 +1513,8 @@ bool RunLauncher(void* /*hinstance*/) {
                         ImGui::Separator();
                         ImGui::Text("Shader / PSO Cache on Disk: %.2f MB (cache/)",
                                     double(cache_bytes) / (1024.0 * 1024.0));
+                        ImGui::TextDisabled(
+                            "Startup Pre-Compilation: Enabled (parallel shader & PSO warmup runs automatically on launch)");
                         if (ImGui::Button("Clear Shader & PSO Cache")) {
                             fs::path cdir = app::ExeDir() / "cache";
                             std::error_code rec;

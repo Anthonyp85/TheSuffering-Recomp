@@ -7200,7 +7200,7 @@ index 2f19baa..0412523 100644
  X86_HOST_API void x86_kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal);
  [[noreturn]] X86_HOST_API void x86_trap(X86Context& ctx, uint32_t va, const char* what);
 diff --git a/runtime/gpu/backend.h b/runtime/gpu/backend.h
-index 275980a..2864fca 100644
+index 275980a..7ccee6e 100644
 --- a/runtime/gpu/backend.h
 +++ b/runtime/gpu/backend.h
 @@ -1,7 +1,10 @@
@@ -7229,15 +7229,16 @@ index 275980a..2864fca 100644
      // rects: count D3DRECTs (4 x int32), null for the whole viewport
      virtual void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                         uint32_t stencil) = 0;
-@@ -38,6 +44,7 @@ public:
+@@ -38,6 +44,8 @@ public:
      virtual bool DeliverLate(uint32_t) { return false; }
      virtual void RecordLate(uint32_t) {}
      virtual void Flush() = 0;
 +    virtual void FlushCaches() {}
++    virtual void PrewarmGuestShaders(const std::vector<VertexShader>& /*vs*/, const std::vector<PixelShader>& /*ps*/) {}
      virtual void SetGamma(const uint8_t* ramp /*3 x 256*/) = 0;
      // visibility tests: draws count passing pixels while simple[kMCountEnable / 4] is set, ClearReport zeroes the
      // count, GetReport writes it to a 16 byte report once the GPU is past those draws; without them it stays pending
-@@ -69,4 +76,141 @@ inline std::atomic<uint64_t> g_perf_sync_late{0}, g_perf_sync_block{0};  // read
+@@ -69,4 +77,155 @@ inline std::atomic<uint64_t> g_perf_sync_late{0}, g_perf_sync_block{0};  // read
  // F3: save the next frame, every draw and target, under diag::CaptureDir
  inline std::atomic<bool> g_capture{false};
  
@@ -7248,6 +7249,20 @@ index 275980a..2864fca 100644
 +    uint64_t disk_bytes = 0;
 +};
 +CacheStats GetCacheStats();
++
++struct ShaderWarmupStatus {
++    bool active = false;
++    bool completed = false;
++    uint32_t done = 0;
++    uint32_t total = 0;
++    uint32_t compiled_new = 0;
++    uint32_t cached_shaders = 0;
++    uint32_t cached_psos = 0;
++    double elapsed_ms = 0.0;
++    uint64_t completed_ms = 0;
++};
++ShaderWarmupStatus GetShaderWarmupStatus();
++
 +void RequestCacheReset();
 +void RequestBackbufferCapture(const std::filesystem::path& bmp_path);
 +
@@ -7380,7 +7395,7 @@ index 275980a..2864fca 100644
 +
  }  // namespace gpu
 diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
-index 9ddd87b..a55cb76 100644
+index 9ddd87b..cb7b9b0 100644
 --- a/runtime/gpu/d3d12.cpp
 +++ b/runtime/gpu/d3d12.cpp
 @@ -14,16 +14,24 @@
@@ -7458,11 +7473,12 @@ index 9ddd87b..a55cb76 100644
      bool Init(uint32_t width, uint32_t height) override;
      void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                 uint32_t stencil) override;
-@@ -467,10 +480,15 @@ public:
+@@ -467,10 +480,16 @@ public:
      bool DeliverLate(uint32_t data) override;
      void RecordLate(uint32_t data) override;
      void Flush() override;
 +    void FlushCaches() override;
++    void PrewarmGuestShaders(const std::vector<VertexShader>& vs, const std::vector<PixelShader>& ps) override;
      void SetGamma(const uint8_t* ramp) override;
      void ClearReport() override { counted_.clear(); }
      // done once the list being recorded, the next fence value, has run
@@ -7474,7 +7490,7 @@ index 9ddd87b..a55cb76 100644
  
      ID3D12Device* Device() override { return dev_.Get(); }
      ID3D12GraphicsCommandList* List() override { return cl_.Get(); }
-@@ -486,6 +504,34 @@ public:
+@@ -486,6 +505,49 @@ public:
      uint64_t Presents() const override { return presents_; }
  
  private:
@@ -7495,6 +7511,19 @@ index 9ddd87b..a55cb76 100644
 +        uint64_t src_key = 0;
 +        uint64_t blob_hash = 0;
 +    };
++    struct FixedVsRecipe {
++        uint64_t vkey = 0;
++        uint64_t decode = 0;
++        FixedKey fk{};
++        uint16_t regs = 0;
++        uint8_t pretransformed = 0;
++        uint8_t quad = 0;
++        uint32_t pad = 0;
++    };
++    struct PixelRecipe {
++        uint64_t key = 0;
++        PixelKey pk{};
++    };
 +    struct CacheSaveJob {
 +        std::filesystem::path dir;
 +        bool write_shaders = false;
@@ -7505,11 +7534,13 @@ index 9ddd87b..a55cb76 100644
 +        bool write_meta = false;
 +        std::filesystem::path meta_path;
 +        std::vector<uint8_t> meta_bytes;
++        bool write_recipes = false;
++        std::vector<uint8_t> recipes_bytes;
 +    };
      struct Frame {
          ComPtr<ID3D12CommandAllocator> alloc;
          ComPtr<ID3D12Resource> upload;
-@@ -493,7 +539,9 @@ private:
+@@ -493,7 +555,9 @@ private:
          uint64_t used = 0;
          uint64_t fence = 0;
          std::vector<ComPtr<ID3D12Resource>> garbage;
@@ -7519,7 +7550,7 @@ index 9ddd87b..a55cb76 100644
      };
      struct Alloc {
          ID3D12Resource* res;
-@@ -566,12 +614,14 @@ private:
+@@ -566,12 +630,14 @@ private:
      ID3D12PipelineState* EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps);
      void FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
      void ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, bool sprite);
@@ -7538,7 +7569,7 @@ index 9ddd87b..a55cb76 100644
      void FillTextureConstants(const State& s, const DrawShaders& sh, const DrawTextures& stages, DrawConstants& c);
      void FillTexelConstants(int i, const TextureDesc& d, const DrawTextures& stages, DrawConstants& c);
      void CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
-@@ -584,7 +634,7 @@ private:
+@@ -584,7 +650,7 @@ private:
      void SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages);
      uint32_t EnsureViewSet(const DrawTextures& stages);
      uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp, bool fixed);
@@ -7547,7 +7578,7 @@ index 9ddd87b..a55cb76 100644
      void SetBlendFactorStencilRef(const State& s);
      void UpdateTargetUsed(uint32_t data);
      void DrawGeometry(const Assembled& a);
-@@ -603,13 +653,27 @@ private:
+@@ -603,13 +669,27 @@ private:
      // Init, in order, each callee right after its caller
      bool CreateDevice();
      bool CreateSwapChain(HWND hwnd);
@@ -7578,13 +7609,19 @@ index 9ddd87b..a55cb76 100644
      // Present, in call order, each callee right after its caller; DrawFrame runs the two after it
      void FinishCapture(const Surface& front);
      void StartCapture();
-@@ -693,16 +757,76 @@ private:
+@@ -693,16 +773,104 @@ private:
      ID3D12Resource* PrepareLateSource(Target& t, Late& l);
      void RecordLateCopy(Late& l, uint32_t slot, ID3D12Resource* src);
  
 +    void InitCaches();
++    void PrewarmBuiltinPipelines();
++    size_t CompileBatchParallel(const std::vector<ShaderPrewarmItem>& batch);
++    size_t BuildDeferredPsos();
++    void DrainAsyncPrewarm(bool wait);
++    void StopAsyncPrewarm();
++    void LoadAndPrewarmRecipes();
 +    void PrewarmCachedPsos();
-+    void SaveCaches(bool sync = false);
++    void SaveCaches(bool sync = false, bool include_pso_lib = true);
 +    void ResetCaches();
 +    void PublishCacheStats();
 +    bool CreateOrLoadPso(const wchar_t* name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d,
@@ -7608,13 +7645,19 @@ index 9ddd87b..a55cb76 100644
 +    std::unordered_set<uint64_t> disk_blob_pending_;
 +    std::unordered_set<uint64_t> known_src_keys_;
 +    std::unordered_set<uint64_t> known_pso_keys_;
++    std::unordered_set<uint64_t> known_fixed_vs_recipes_;
++    std::unordered_set<uint64_t> known_pixel_ps_recipes_;
 +    std::vector<SrcMetaEntry> src_meta_entries_;
 +    std::vector<PsoKey> pso_meta_entries_;
++    std::vector<PsoKey> deferred_pso_keys_;
++    std::vector<FixedVsRecipe> fixed_vs_recipes_;
++    std::vector<PixelRecipe> pixel_ps_recipes_;
 +    std::vector<uint8_t> pso_init_blob_;  // must outlive pso_lib_ per ID3D12Device1::CreatePipelineLibrary contract
 +    ComPtr<ID3D12PipelineLibrary> pso_lib_;
 +    bool shaders_dirty_ = false;
 +    bool pso_dirty_ = false;
 +    bool meta_dirty_ = false;
++    bool recipes_dirty_ = false;
 +    uint64_t cache_dirty_frame_ = 0;
 +    std::mutex save_mtx_;
 +    std::condition_variable save_cv_;
@@ -7624,6 +7667,22 @@ index 9ddd87b..a55cb76 100644
 +    bool save_has_pending_ = false;
 +    bool save_writing_ = false;
 +    CacheSaveJob save_pending_{};
++    struct AsyncReadyShader {
++        uint64_t src_key = 0;
++        uint64_t blob_hash = 0;
++        ComPtr<ID3DBlob> blob;
++    };
++    std::mutex async_pw_mtx_;
++    std::vector<AsyncReadyShader> async_pw_ready_;
++    std::vector<std::pair<uint64_t, uint64_t>> async_pw_links_;
++    std::thread async_pw_thread_;
++    std::atomic<bool> async_pw_running_{false};
++    std::atomic<bool> async_pw_done_flag_{false};
++    std::atomic<bool> async_pw_stop_{false};
++    PerfClock::time_point async_pw_t0_{};
++    size_t async_pw_vs_in_ = 0;
++    size_t async_pw_ps_in_ = 0;
++    size_t async_pw_compiled_ = 0;
 +    std::vector<TexSlab> tex_slabs_;
 +    std::vector<uint8_t> upload_px_;
 +    ComPtr<ID3D12Resource> upload_tex_;
@@ -7655,7 +7714,7 @@ index 9ddd87b..a55cb76 100644
      // texture view sets made since the descriptor ring last started over, by a hash of their resources and views, to
      // their first slot; resources freed in that time go to the frame's garbage, so no other one takes their address
      std::unordered_map<uint64_t, uint32_t> view_sets_;
-@@ -767,7 +891,38 @@ private:
+@@ -767,7 +935,38 @@ private:
      uint32_t guest_h_ = 480;
      uint32_t bb_w_ = 0;
      uint32_t bb_h_ = 0;
@@ -7694,7 +7753,7 @@ index 9ddd87b..a55cb76 100644
      // surfaces locked without a wait: copies in flight, the newest finished one goes to guest memory
      struct Late {
          ComPtr<ID3D12Resource> rb[kFrames];
-@@ -809,23 +964,86 @@ private:
+@@ -809,23 +1008,88 @@ private:
      uint64_t fps_n_ = 0;
  };
  
@@ -7718,6 +7777,8 @@ index 9ddd87b..a55cb76 100644
 +}
 +
 +D3D12Backend::~D3D12Backend() {
++    StopAsyncPrewarm();
++    if (cache_enabled_) SaveCaches(true, true);
 +    StopSaveThread();
 +    if (dev_ && queue_ && fence_ && event_) Flush();
 +    if (upscaler_inited_) {
@@ -7786,7 +7847,7 @@ index 9ddd87b..a55cb76 100644
      return true;
  }
  
-@@ -835,27 +1053,197 @@ bool D3D12Backend::CreateDevice() {
+@@ -835,27 +1099,197 @@ bool D3D12Backend::CreateDevice() {
          if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer();
      }
      if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_)))) return false;
@@ -7861,7 +7922,10 @@ index 9ddd87b..a55cb76 100644
 +        } else {
 +            LOGW("d3d12: requested GPU adapter '%s' not found; falling back to auto", want.c_str());
 +        }
-+    }
+     }
+-    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev_))) &&
+-        FAILED(D3D12CreateDevice((adapter = nullptr).Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev_)))) {
+-        LOGE("d3d12: no device");
 +
 +    if (!dev_) {
 +        for (const Candidate& c : cands) {
@@ -7871,10 +7935,7 @@ index 9ddd87b..a55cb76 100644
 +                break;
 +            }
 +        }
-     }
--    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev_))) &&
--        FAILED(D3D12CreateDevice((adapter = nullptr).Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev_)))) {
--        LOGE("d3d12: no device");
++    }
 +    if (!dev_ && FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev_)))) {
 +        if (GetEnvironmentVariableW(L"XBE_ALLOW_WARP", nullptr, 0)) {
 +            ComPtr<IDXGIAdapter1> warp;
@@ -7994,7 +8055,7 @@ index 9ddd87b..a55cb76 100644
      return true;
  }
  
-@@ -872,14 +1260,27 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
+@@ -872,14 +1306,27 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
      sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
      sd.BufferCount = kFrames;
      sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
@@ -8025,7 +8086,7 @@ index 9ddd87b..a55cb76 100644
      return true;
  }
  
-@@ -889,25 +1290,31 @@ uint32_t D3D12Backend::CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool
+@@ -889,25 +1336,31 @@ uint32_t D3D12Backend::CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool
      hd.Type = t;
      hd.NumDescriptors = n;
      hd.Flags = visible ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
@@ -8062,7 +8123,7 @@ index 9ddd87b..a55cb76 100644
  }
  
  bool D3D12Backend::CreateRootSignature() {
-@@ -934,34 +1341,217 @@ bool D3D12Backend::CreateRootSignature() {
+@@ -934,34 +1387,217 @@ bool D3D12Backend::CreateRootSignature() {
      ComPtr<ID3DBlob> rs;
      ComPtr<ID3DBlob> err;
      if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs, &err))) return false;
@@ -8299,7 +8360,7 @@ index 9ddd87b..a55cb76 100644
      texturedumper::Update();
      ext_ = g_extension.get();
      if (ext_) {
-@@ -971,6 +1561,10 @@ void D3D12Backend::LoadSettings() {
+@@ -971,6 +1607,10 @@ void D3D12Backend::LoadSettings() {
  }
  
  void D3D12Backend::Begin() {
@@ -8310,7 +8371,7 @@ index 9ddd87b..a55cb76 100644
      ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
      cl_->SetDescriptorHeaps(2, heaps);
      cl_->SetGraphicsRootSignature(root_.Get());
-@@ -991,6 +1585,7 @@ void D3D12Backend::Submit(bool wait) {
+@@ -991,6 +1631,7 @@ void D3D12Backend::Submit(bool wait) {
          WaitFence(fence_value_);
          f.alloc->Reset();
          f.garbage.clear();
@@ -8318,7 +8379,7 @@ index 9ddd87b..a55cb76 100644
          f.used = 0;
          f.srv = 0;
          view_sets_.clear();
-@@ -999,6 +1594,543 @@ void D3D12Backend::Submit(bool wait) {
+@@ -999,6 +1640,627 @@ void D3D12Backend::Submit(bool wait) {
      }
  }
  
@@ -8358,8 +8419,25 @@ index 9ddd87b..a55cb76 100644
 +
 +constexpr uint32_t kPsoMetaMagic = 0x50534F4Du;
 +constexpr uint32_t kPsoMetaVersion = 1u;
++constexpr uint32_t kRecipeCacheMagic = 0x43524258u;  // 'XBRC'
++constexpr uint32_t kRecipeCacheVersion = 1u;
 +constexpr uint64_t kTexSlabSize = 32ull << 20;
 +constexpr uint64_t kTexSlabMaxAlloc = 8ull << 20;
++
++struct RecipeCacheHeader {
++    uint32_t magic;
++    uint32_t version;
++    uint32_t sizeof_fixed_vs;
++    uint32_t sizeof_pixel_ps;
++    uint32_t fixed_vs_count;
++    uint32_t pixel_ps_count;
++};
++
++uint64_t NowMonoMs() {
++    return uint64_t(
++        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
++            .count());
++}
 +
 +void WriteAtomicFile(const std::filesystem::path& dst, const std::vector<uint8_t>& bytes) {
 +    if (bytes.empty()) return;
@@ -8384,6 +8462,14 @@ index 9ddd87b..a55cb76 100644
 +std::atomic<uint32_t> g_cache_psos_stat{0};
 +std::atomic<uint64_t> g_cache_bytes_stat{0};
 +std::atomic<bool> g_cache_reset_requested{false};
++
++std::atomic<bool> g_warmup_active{false};
++std::atomic<bool> g_warmup_completed{false};
++std::atomic<uint32_t> g_warmup_done{0};
++std::atomic<uint32_t> g_warmup_total{0};
++std::atomic<uint32_t> g_warmup_compiled_new{0};
++std::atomic<uint64_t> g_warmup_elapsed_us{0};
++std::atomic<uint64_t> g_warmup_completed_ms{0};
 +
 +std::mutex g_bb_cap_lock;
 +std::filesystem::path g_bb_cap_path;
@@ -8551,6 +8637,7 @@ index 9ddd87b..a55cb76 100644
 +        if (job.write_shaders) WriteAtomicFile(job.dir / "shaders.bin", job.shaders_bytes);
 +        if (job.write_pso) WriteAtomicFile(job.pso_path, job.pso_bytes);
 +        if (job.write_meta) WriteAtomicFile(job.meta_path, job.meta_bytes);
++        if (job.write_recipes) WriteAtomicFile(job.dir / "shader_recipes.bin", job.recipes_bytes);
 +        {
 +            std::lock_guard<std::mutex> lock(save_mtx_);
 +            save_writing_ = false;
@@ -8574,11 +8661,15 @@ index 9ddd87b..a55cb76 100644
 +        ec.clear();
 +        auto msz = std::filesystem::file_size(PsoMetaPath(), ec);
 +        if (!ec) bytes += msz;
++        ec.clear();
++        auto rsz = std::filesystem::file_size(cache_dir_ / "shader_recipes.bin", ec);
++        if (!ec) bytes += rsz;
 +    }
 +    g_cache_bytes_stat.store(bytes, std::memory_order_relaxed);
 +}
 +
 +void D3D12Backend::ResetCaches() {
++    StopAsyncPrewarm();
 +    Flush();
 +    DrainSaveThread();
 +    {
@@ -8587,17 +8678,25 @@ index 9ddd87b..a55cb76 100644
 +        disk_blob_pending_.clear();
 +        known_src_keys_.clear();
 +        known_pso_keys_.clear();
++        known_fixed_vs_recipes_.clear();
++        known_pixel_ps_recipes_.clear();
 +        src_meta_entries_.clear();
 +        pso_meta_entries_.clear();
++        deferred_pso_keys_.clear();
++        fixed_vs_recipes_.clear();
++        pixel_ps_recipes_.clear();
 +        shaders_dirty_ = false;
 +        pso_dirty_ = false;
 +        meta_dirty_ = false;
++        recipes_dirty_ = false;
 +        pso_lib_.Reset();
 +        pso_init_blob_.clear();
 +        if (!cache_dir_.empty()) {
 +            std::error_code ec;
 +            std::filesystem::remove(cache_dir_ / "shaders.bin", ec);
 +            std::filesystem::remove(cache_dir_ / "shaders.bin.tmp", ec);
++            std::filesystem::remove(cache_dir_ / "shader_recipes.bin", ec);
++            std::filesystem::remove(cache_dir_ / "shader_recipes.bin.tmp", ec);
 +            std::filesystem::remove(cache_dir_ / "psos.bin", ec);
 +            std::filesystem::remove(cache_dir_ / "psos.bin.tmp", ec);
 +            for (auto& e : std::filesystem::directory_iterator(cache_dir_, ec)) {
@@ -8618,6 +8717,15 @@ index 9ddd87b..a55cb76 100644
 +    perf::SetShaderCacheEnabled(cache_enabled_);
 +    if (!cache_enabled_) {
 +        LOGR("d3d12: shader/PSO disk cache disabled (--no-shader-cache)");
++        auto boot_t0 = PerfClock::now();
++        g_warmup_active.store(true, std::memory_order_release);
++        PrewarmBuiltinPipelines();
++        LoadAndPrewarmRecipes();
++        g_warmup_elapsed_us.fetch_add(uint64_t(PerfMs(boot_t0) * 1000.0), std::memory_order_relaxed);
++        g_warmup_active.store(false, std::memory_order_release);
++        g_warmup_completed.store(true, std::memory_order_release);
++        g_warmup_completed_ms.store(NowMonoMs(), std::memory_order_release);
++        PublishCacheStats();
 +        return;
 +    }
 +    cache_dir_ = app::ExeDir() / "cache";
@@ -8683,17 +8791,27 @@ index 9ddd87b..a55cb76 100644
 +    }
 +    LOGR("d3d12: cache initialized (shaders_loaded=%zu, pso_library_loaded=%s, pso_file=%s)", loaded_shaders,
 +         loaded_pso_lib ? "true" : "false", PsoCachePath().filename().string().c_str());
++    auto boot_t0 = PerfClock::now();
++    g_warmup_active.store(true, std::memory_order_release);
++    PrewarmBuiltinPipelines();
 +    PrewarmCachedPsos();
++    LoadAndPrewarmRecipes();
++    g_warmup_elapsed_us.fetch_add(uint64_t(PerfMs(boot_t0) * 1000.0), std::memory_order_relaxed);
++    g_warmup_active.store(false, std::memory_order_release);
++    g_warmup_completed.store(true, std::memory_order_release);
++    g_warmup_completed_ms.store(NowMonoMs(), std::memory_order_release);
++    if (shaders_dirty_ || pso_dirty_ || meta_dirty_ || recipes_dirty_) SaveCaches(false, true);
 +    PublishCacheStats();
 +}
 +
-+void D3D12Backend::SaveCaches(bool sync) {
++void D3D12Backend::SaveCaches(bool sync, bool include_pso_lib) {
 +    if (!cache_enabled_) return;
 +    CacheSaveJob job{};
 +    job.dir = cache_dir_;
 +    {
 +        std::lock_guard<std::mutex> lock(cache_lock_);
-+        if (!shaders_dirty_ && !pso_dirty_ && !meta_dirty_) {
++        bool want_pso = pso_dirty_ && (include_pso_lib || sync);
++        if (!shaders_dirty_ && !want_pso && !meta_dirty_ && !recipes_dirty_) {
 +            if (sync) {
 +                // fall through to drain any in-flight background write
 +            } else {
@@ -8721,7 +8839,7 @@ index 9ddd87b..a55cb76 100644
 +                job.write_shaders = true;
 +                shaders_dirty_ = false;
 +            }
-+            if (pso_dirty_) {
++            if (want_pso) {
 +                if (pso_lib_) {
 +                    SIZE_T sz = pso_lib_->GetSerializedSize();
 +                    if (sz > 0 && sz < (256u << 20)) {
@@ -8778,9 +8896,31 @@ index 9ddd87b..a55cb76 100644
 +                job.write_meta = true;
 +                meta_dirty_ = false;
 +            }
++            if (recipes_dirty_) {
++                RecipeCacheHeader rh{};
++                rh.magic = kRecipeCacheMagic;
++                rh.version = kRecipeCacheVersion;
++                rh.sizeof_fixed_vs = uint32_t(sizeof(FixedVsRecipe));
++                rh.sizeof_pixel_ps = uint32_t(sizeof(PixelRecipe));
++                rh.fixed_vs_count = uint32_t(fixed_vs_recipes_.size());
++                rh.pixel_ps_count = uint32_t(pixel_ps_recipes_.size());
++                size_t fv_bytes = fixed_vs_recipes_.size() * sizeof(FixedVsRecipe);
++                size_t pp_bytes = pixel_ps_recipes_.size() * sizeof(PixelRecipe);
++                job.recipes_bytes.resize(sizeof(rh) + fv_bytes + pp_bytes);
++                uint8_t* p = job.recipes_bytes.data();
++                std::memcpy(p, &rh, sizeof(rh));
++                p += sizeof(rh);
++                if (fv_bytes) {
++                    std::memcpy(p, fixed_vs_recipes_.data(), fv_bytes);
++                    p += fv_bytes;
++                }
++                if (pp_bytes) std::memcpy(p, pixel_ps_recipes_.data(), pp_bytes);
++                job.write_recipes = true;
++                recipes_dirty_ = false;
++            }
 +        }
 +    }
-+    if (job.write_shaders || job.write_pso || job.write_meta) {
++    if (job.write_shaders || job.write_pso || job.write_meta || job.write_recipes) {
 +        StartSaveThread();
 +        {
 +            std::lock_guard<std::mutex> lock(save_mtx_);
@@ -8799,6 +8939,10 @@ index 9ddd87b..a55cb76 100644
 +                save_pending_.meta_path = std::move(job.meta_path);
 +                save_pending_.meta_bytes = std::move(job.meta_bytes);
 +            }
++            if (job.write_recipes) {
++                save_pending_.write_recipes = true;
++                save_pending_.recipes_bytes = std::move(job.recipes_bytes);
++            }
 +            save_has_pending_ = true;
 +        }
 +        save_cv_.notify_one();
@@ -8807,7 +8951,8 @@ index 9ddd87b..a55cb76 100644
 +}
 +
 +void D3D12Backend::FlushCaches() {
-+    SaveCaches(true);
++    DrainAsyncPrewarm(true);
++    SaveCaches(true, true);
 +    PublishCacheStats();
 +}
 +
@@ -8862,7 +9007,7 @@ index 9ddd87b..a55cb76 100644
  // the GPU is idle after it: every report asked for so far is written, as a title waiting on one expects
  void D3D12Backend::Flush() {
      Submit(true);
-@@ -1029,7 +2161,7 @@ D3D12Backend::Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
+@@ -1029,7 +2291,7 @@ D3D12Backend::Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
      Frame& f = CurrentFrame();
      g_perf.upload += size;
      uint64_t o = (f.used + align - 1) & ~(align - 1);
@@ -8871,7 +9016,7 @@ index 9ddd87b..a55cb76 100644
          f.used = o + size;
          return {f.upload.Get(), o, f.map + o, f.upload->GetGPUVirtualAddress() + o};
      }
-@@ -1039,12 +2171,22 @@ D3D12Backend::Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
+@@ -1039,12 +2301,22 @@ D3D12Backend::Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
      D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
      constexpr uint64_t kOwnAlign = 0x10000;  // a committed buffer's size granularity
      D3D12_RESOURCE_DESC bd = BufferDesc((size + kOwnAlign - 1) & ~(kOwnAlign - 1));
@@ -8899,7 +9044,7 @@ index 9ddd87b..a55cb76 100644
  }
  
  uint32_t D3D12Backend::AllocSrvSlots(uint32_t n) {
-@@ -1081,12 +2223,17 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator
+@@ -1081,12 +2353,17 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator
      targets_.erase(it);
  }
  
@@ -8921,7 +9066,7 @@ index 9ddd87b..a55cb76 100644
      D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
      D3D12_RESOURCE_DESC td = Texture2DDesc(DXGI_FORMAT_UNKNOWN, t.w, t.h);
      D3D12_CLEAR_VALUE cv{};
-@@ -1212,6 +2359,10 @@ bool D3D12Backend::BindTargets(const State& s) {
+@@ -1212,6 +2489,10 @@ bool D3D12Backend::BindTargets(const State& s) {
          Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
          ds->drawn = true;
      }
@@ -8932,7 +9077,7 @@ index 9ddd87b..a55cb76 100644
      if (rt != bound_rt_ || ds != bound_ds_) {
          D3D12_CPU_DESCRIPTOR_HANDLE rh = rt ? Cpu(rtv_heap_.Get(), rt->view, rtv_inc_) : D3D12_CPU_DESCRIPTOR_HANDLE{};
          D3D12_CPU_DESCRIPTOR_HANDLE dh = ds ? Cpu(dsv_heap_.Get(), ds->view, dsv_inc_) : D3D12_CPU_DESCRIPTOR_HANDLE{};
-@@ -1246,7 +2397,7 @@ ID3D12PipelineState* D3D12Backend::EnsureDepthCopyPipeline() {
+@@ -1246,7 +2527,7 @@ ID3D12PipelineState* D3D12Backend::EnsureDepthCopyPipeline() {
      p.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
      p.DSVFormat = kDepthFormat;
      p.SampleDesc.Count = 1;
@@ -8941,7 +9086,7 @@ index 9ddd87b..a55cb76 100644
      return pso.Get();
  }
  
-@@ -1316,10 +2467,12 @@ ComPtr<ID3D12Resource> D3D12Backend::CreatePixelTexture(const std::vector<uint8_
+@@ -1316,10 +2597,12 @@ ComPtr<ID3D12Resource> D3D12Backend::CreatePixelTexture(const std::vector<uint8_
      ComPtr<ID3D12Resource> tex;
      D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
      D3D12_RESOURCE_DESC td = Texture2DDesc(DXGI_FORMAT_B8G8R8A8_UNORM, w, h);
@@ -8956,7 +9101,7 @@ index 9ddd87b..a55cb76 100644
      for (uint32_t y = 0; y < h; y++) std::memcpy(a.cpu + size_t(y) * row, &px[size_t(y) * pitch], w * 4);
      D3D12_TEXTURE_COPY_LOCATION dst{tex.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
      D3D12_TEXTURE_COPY_LOCATION src{a.res, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-@@ -1336,24 +2489,47 @@ void D3D12Backend::UploadTarget(Target& t, const Surface& s) {
+@@ -1336,24 +2619,47 @@ void D3D12Backend::UploadTarget(Target& t, const Surface& s) {
      g_perf.rtups++;
      TextureDesc d;
      if (!Describe(s.header, d) || Format(d.format).depth) return;
@@ -9010,7 +9155,7 @@ index 9ddd87b..a55cb76 100644
      t.epoch = DirtyEpoch(t.data);
      t.sig = MemSig(t.data, t.bytes);
  }
-@@ -1426,13 +2602,18 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
+@@ -1426,13 +2732,18 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
      uint64_t entry_seed = Hash(entry, std::strlen(entry), profile_seed);
      hash = Hash(src.data(), src.size(), entry_seed);
      auto it = blobs_.find(hash);
@@ -9030,7 +9175,7 @@ index 9ddd87b..a55cb76 100644
      if (FAILED(hr)) {
          LOGE("d3d12: %s compile failed: %s", profile, err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
          LOGE("%s", src.c_str());
-@@ -1440,6 +2621,13 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
+@@ -1440,6 +2751,13 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
          return nullptr;
      }
      blobs_[hash] = code;
@@ -9044,7 +9189,7 @@ index 9ddd87b..a55cb76 100644
      return code.Get();
  }
  
-@@ -1463,7 +2651,8 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC D3D12Backend::FullScreenPipelineDesc(ID3DBlob
+@@ -1463,7 +2781,8 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC D3D12Backend::FullScreenPipelineDesc(ID3DBlob
  }
  
  ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over) {
@@ -9054,7 +9199,7 @@ index 9ddd87b..a55cb76 100644
      if (pso) return pso.Get();
      uint64_t h;
      ID3DBlob* vs = Compile(kBlitHlsl, "vs", "vs_5_0", h);
-@@ -1479,7 +2668,9 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
+@@ -1479,7 +2798,9 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
          blend.DestBlendAlpha = D3D12_BLEND_ONE;
          blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
      }
@@ -9065,7 +9210,7 @@ index 9ddd87b..a55cb76 100644
      return pso.Get();
  }
  
-@@ -1488,7 +2679,8 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
+@@ -1488,7 +2809,8 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
                                                        float blend) {
      uint64_t seed = uint64_t(rtv) << 1 | (blend >= 0 ? 1 : 0);
      uint64_t source_seed = Hash(hlsl, std::strlen(hlsl), seed);
@@ -9075,7 +9220,7 @@ index 9ddd87b..a55cb76 100644
      if (pso) return pso.Get();
      uint64_t h;
      ID3DBlob* vs = Compile(hlsl, "vs", "vs_5_0", h);
-@@ -1502,7 +2694,9 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
+@@ -1502,7 +2824,9 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
          b.DestBlend = b.DestBlendAlpha = D3D12_BLEND_INV_BLEND_FACTOR;
          b.BlendOp = b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
      }
@@ -9086,7 +9231,7 @@ index 9ddd87b..a55cb76 100644
      return pso.Get();
  }
  
-@@ -1661,13 +2855,24 @@ float D3D12Backend::TargetScale() const {
+@@ -1661,13 +2985,24 @@ float D3D12Backend::TargetScale() const {
      return float(t->w) / float(t->gw);
  }
  
@@ -9112,7 +9257,7 @@ index 9ddd87b..a55cb76 100644
  ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps) {
      uint64_t h = Hash(&k, sizeof(k));
      auto it = psos_.find(h);
-@@ -1680,11 +2885,173 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
+@@ -1680,11 +3015,671 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
      if (k.topo == uint32_t(Topology::Points)) ExpandPoints(d, k.sprite);
      ComPtr<ID3D12PipelineState> pso;
      g_perf.psos++;
@@ -9132,6 +9277,503 @@ index 9ddd87b..a55cb76 100644
      return pso.Get();
  }
  
++void D3D12Backend::PrewarmBuiltinPipelines() {
++    if (!dev_ || !root_) return;
++    EnsureBlitPipeline(DXGI_FORMAT_B8G8R8A8_UNORM, false);
++    EnsureBlitPipeline(DXGI_FORMAT_B8G8R8A8_UNORM, true);
++    EnsureBlitPipeline(DXGI_FORMAT_R8G8B8A8_UNORM, false);
++    EnsureBlitPipeline(DXGI_FORMAT_R8G8B8A8_UNORM, true);
++    EnsureDepthCopyPipeline();
++    for (uint8_t mask : {uint8_t(0x7), uint8_t(0x8), uint8_t(0x1), uint8_t(0x2), uint8_t(0x4)}) {
++        EnsureClearPipeline(DXGI_FORMAT_B8G8R8A8_UNORM, mask);
++    }
++    uint64_t gh = 0;
++    Compile(PointHlsl(), "main", "gs_5_0", gh);
++    Compile(SpriteHlsl(), "main", "gs_5_0", gh);
++}
++
++size_t D3D12Backend::CompileBatchParallel(const std::vector<ShaderPrewarmItem>& batch) {
++    struct WorkItem {
++        uint64_t src_key = 0;
++        uint64_t blob_hash = 0;
++        bool is_pixel = false;
++        const std::string* hlsl = nullptr;
++    };
++    std::vector<WorkItem> work;
++    work.reserve(batch.size());
++    std::unordered_set<uint64_t> queued_blobs;
++    std::vector<std::pair<uint64_t, uint64_t>> already_cached_links;
++
++    for (const auto& item : batch) {
++        if (shader_src_.count(item.src_key)) continue;
++        const char* profile = item.is_pixel ? "ps_5_0" : "vs_5_0";
++        uint64_t pseed = Hash(profile, std::strlen(profile));
++        uint64_t eseed = Hash("main", 4, pseed);
++        uint64_t bhash = Hash(item.hlsl.data(), item.hlsl.size(), eseed);
++        auto bit = blobs_.find(bhash);
++        if (bit != blobs_.end() && bit->second) {
++            already_cached_links.emplace_back(item.src_key, bhash);
++            continue;
++        }
++        if (queued_blobs.insert(bhash).second) {
++            work.push_back(WorkItem{item.src_key, bhash, item.is_pixel, &item.hlsl});
++        } else {
++            already_cached_links.emplace_back(item.src_key, bhash);
++        }
++    }
++
++    for (const auto& [skey, bhash] : already_cached_links) {
++        if (blobs_.count(bhash) && blobs_[bhash]) {
++            shader_src_[skey] = bhash;
++            if (cache_enabled_) {
++                std::lock_guard<std::mutex> lock(cache_lock_);
++                if (known_src_keys_.insert(skey).second) {
++                    src_meta_entries_.push_back(SrcMetaEntry{skey, bhash});
++                    meta_dirty_ = true;
++                    cache_dirty_frame_ = presents_;
++                }
++            }
++        }
++    }
++
++    if (work.empty()) return 0;
++
++    g_warmup_total.fetch_add(uint32_t(work.size()), std::memory_order_relaxed);
++    std::vector<ComPtr<ID3DBlob>> out_blobs(work.size());
++    std::atomic<size_t> cursor{0};
++    uint32_t max_jobs = std::max<uint32_t>(1u, app::RecommendedCompileJobs());
++    uint32_t n_threads = std::min<uint32_t>({12u, max_jobs, uint32_t(work.size())});
++
++    auto worker = [&] {
++        for (;;) {
++            size_t idx = cursor.fetch_add(1, std::memory_order_relaxed);
++            if (idx >= work.size()) break;
++            const WorkItem& w = work[idx];
++            const char* profile = w.is_pixel ? "ps_5_0" : "vs_5_0";
++            ComPtr<ID3DBlob> code;
++            ComPtr<ID3DBlob> err;
++            HRESULT hr = D3DCompile(w.hlsl->data(), w.hlsl->size(), nullptr, nullptr, nullptr, "main", profile,
++                                    D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
++            if (SUCCEEDED(hr) && code && code->GetBufferSize() > 0) {
++                out_blobs[idx] = std::move(code);
++            }
++            g_warmup_done.fetch_add(1u, std::memory_order_relaxed);
++        }
++    };
++
++    std::vector<std::thread> pool;
++    pool.reserve(n_threads > 1 ? n_threads - 1 : 0);
++    for (uint32_t t = 1; t < n_threads; ++t) pool.emplace_back(worker);
++    worker();
++    for (auto& th : pool) th.join();
++
++    size_t compiled = 0;
++    for (size_t i = 0; i < work.size(); ++i) {
++        if (!out_blobs[i]) continue;
++        const WorkItem& w = work[i];
++        blobs_[w.blob_hash] = out_blobs[i];
++        shader_src_[w.src_key] = w.blob_hash;
++        ++compiled;
++        if (cache_enabled_) {
++            std::lock_guard<std::mutex> lock(cache_lock_);
++            const uint8_t* ptr = static_cast<const uint8_t*>(out_blobs[i]->GetBufferPointer());
++            shader_cache_entries_.emplace_back(w.blob_hash, std::vector<uint8_t>(ptr, ptr + out_blobs[i]->GetBufferSize()));
++            shaders_dirty_ = true;
++            if (known_src_keys_.insert(w.src_key).second) {
++                src_meta_entries_.push_back(SrcMetaEntry{w.src_key, w.blob_hash});
++                meta_dirty_ = true;
++            }
++            cache_dirty_frame_ = presents_;
++        }
++    }
++    // Link any secondary src_keys that shared a newly compiled blob_hash
++    for (const auto& [skey, bhash] : already_cached_links) {
++        auto bit = blobs_.find(bhash);
++        if (bit != blobs_.end() && bit->second && !shader_src_.count(skey)) {
++            shader_src_[skey] = bhash;
++            if (cache_enabled_) {
++                std::lock_guard<std::mutex> lock(cache_lock_);
++                if (known_src_keys_.insert(skey).second) {
++                    src_meta_entries_.push_back(SrcMetaEntry{skey, bhash});
++                    meta_dirty_ = true;
++                }
++            }
++        }
++    }
++    g_warmup_compiled_new.fetch_add(uint32_t(compiled), std::memory_order_relaxed);
++    return compiled;
++}
++
++void D3D12Backend::LoadAndPrewarmRecipes() {
++    constexpr uint64_t kSalt = 0x9E3779B97F4A7C15ull;
++    std::vector<ShaderPrewarmItem> batch;
++
++    if (cache_enabled_ && !cache_dir_.empty()) {
++        std::filesystem::path rpath = cache_dir_ / "shader_recipes.bin";
++        std::error_code ec;
++        auto fsize = std::filesystem::file_size(rpath, ec);
++        if (!ec && fsize >= sizeof(RecipeCacheHeader)) {
++            if (FILE* f = _wfopen(rpath.c_str(), L"rb")) {
++                RecipeCacheHeader rh{};
++                bool ok = std::fread(&rh, sizeof(rh), 1, f) == 1 && rh.magic == kRecipeCacheMagic &&
++                          rh.version == kRecipeCacheVersion && rh.sizeof_fixed_vs == sizeof(FixedVsRecipe) &&
++                          rh.sizeof_pixel_ps == sizeof(PixelRecipe) && rh.fixed_vs_count <= 65536u &&
++                          rh.pixel_ps_count <= 65536u;
++                uint64_t expect = uint64_t(sizeof(rh)) + uint64_t(rh.fixed_vs_count) * sizeof(FixedVsRecipe) +
++                                  uint64_t(rh.pixel_ps_count) * sizeof(PixelRecipe);
++                if (ok && expect == fsize) {
++                    std::vector<FixedVsRecipe> fv(rh.fixed_vs_count);
++                    std::vector<PixelRecipe> pp(rh.pixel_ps_count);
++                    if (rh.fixed_vs_count && std::fread(fv.data(), sizeof(FixedVsRecipe), rh.fixed_vs_count, f) != rh.fixed_vs_count)
++                        ok = false;
++                    if (ok && rh.pixel_ps_count && std::fread(pp.data(), sizeof(PixelRecipe), rh.pixel_ps_count, f) != rh.pixel_ps_count)
++                        ok = false;
++                    if (ok) {
++                        for (const auto& r : fv) {
++                            if (known_fixed_vs_recipes_.insert(r.vkey).second) fixed_vs_recipes_.push_back(r);
++                            if (!shader_src_.count(r.vkey)) {
++                                std::string hlsl = ReversedDepthHlsl(
++                                    FixedVertexHlsl(r.regs, r.pretransformed != 0, r.decode, r.fk));
++                                batch.push_back(ShaderPrewarmItem{
++                                    r.vkey, false, r.quad ? QuadHlsl(std::move(hlsl)) : std::move(hlsl)});
++                            }
++                        }
++                        for (const auto& r : pp) {
++                            if (known_pixel_ps_recipes_.insert(r.key).second) pixel_ps_recipes_.push_back(r);
++                            if (!shader_src_.count(r.key)) {
++                                batch.push_back(ShaderPrewarmItem{r.key, true, PixelHlsl(r.pk)});
++                            }
++                        }
++                    }
++                }
++                std::fclose(f);
++            }
++        }
++    }
++
++    auto seeds = BuildCommonFixedShaderPrewarmBatch(kSalt);
++    for (auto& s : seeds) {
++        if (!shader_src_.count(s.src_key)) batch.push_back(std::move(s));
++    }
++    if (!batch.empty()) {
++        auto t0 = PerfClock::now();
++        size_t n = CompileBatchParallel(batch);
++        if (n > 0) {
++            LOGR("d3d12: pre-compiled %zu fixed/recipe shaders at startup in %.1f ms", n, PerfMs(t0));
++        }
++    }
++}
++
++size_t D3D12Backend::BuildDeferredPsos() {
++    if (deferred_pso_keys_.empty()) return 0;
++    std::vector<PsoKey> remaining;
++    uint64_t gh = 0;
++    ID3DBlob* point_gs = Compile(PointHlsl(), "main", "gs_5_0", gh);
++    ID3DBlob* sprite_gs = Compile(SpriteHlsl(), "main", "gs_5_0", gh);
++    struct DeferredItem {
++        uint64_t hash;
++        PsoKey k;
++        ID3DBlob* vs;
++        ID3DBlob* ps;
++        ID3DBlob* gs;
++    };
++    std::vector<DeferredItem> ready;
++    for (const auto& k : deferred_pso_keys_) {
++        uint64_t h = Hash(&k, sizeof(k));
++        if (psos_.count(h)) continue;
++        auto vit = blobs_.find(k.vs);
++        auto pit = blobs_.find(k.ps);
++        if (vit == blobs_.end() || !vit->second || pit == blobs_.end() || !pit->second) {
++            remaining.push_back(k);
++            continue;
++        }
++        ID3DBlob* gs = (k.topo == uint32_t(Topology::Points)) ? (k.sprite ? sprite_gs : point_gs) : nullptr;
++        ready.push_back(DeferredItem{h, k, vit->second.Get(), pit->second.Get(), gs});
++    }
++    deferred_pso_keys_ = std::move(remaining);
++    if (ready.empty()) return 0;
++
++    std::vector<ComPtr<ID3D12PipelineState>> out_psos(ready.size());
++    std::atomic<size_t> cursor{0};
++    uint32_t max_jobs = std::max<uint32_t>(1u, app::RecommendedCompileJobs());
++    uint32_t n_threads = std::min<uint32_t>({12u, max_jobs, uint32_t(ready.size())});
++    auto worker = [&] {
++        for (;;) {
++            size_t idx = cursor.fetch_add(1, std::memory_order_relaxed);
++            if (idx >= ready.size()) break;
++            const auto& it = ready[idx];
++            D3D12_INPUT_ELEMENT_DESC el[16];
++            uint32_t n = FillInputLayout(it.k, el);
++            D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
++            d.InputLayout = {el, n};
++            FillPipelineDesc(it.k, it.vs, it.ps, d);
++            if (it.gs) {
++                d.GS = {it.gs->GetBufferPointer(), it.gs->GetBufferSize()};
++                d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
++                d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
++                d.RasterizerState.FrontCounterClockwise = FALSE;
++            }
++            ComPtr<ID3D12PipelineState> pso;
++            if (SUCCEEDED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso))) && pso) {
++                out_psos[idx] = std::move(pso);
++            }
++        }
++    };
++    std::vector<std::thread> pool;
++    pool.reserve(n_threads > 1 ? n_threads - 1 : 0);
++    for (uint32_t t = 1; t < n_threads; ++t) pool.emplace_back(worker);
++    worker();
++    for (auto& th : pool) th.join();
++
++    size_t deferred_built = 0;
++    for (size_t i = 0; i < ready.size(); ++i) {
++        if (!out_psos[i]) continue;
++        psos_[ready[i].hash] = out_psos[i];
++        if (known_pso_keys_.insert(ready[i].hash).second) pso_meta_entries_.push_back(ready[i].k);
++        if (pso_lib_) {
++            wchar_t wname[32];
++            std::swprintf(wname, 32, L"draw_%016llX", (unsigned long long)ready[i].hash);
++            if (SUCCEEDED(pso_lib_->StorePipeline(wname, out_psos[i].Get()))) pso_dirty_ = true;
++        }
++        ++deferred_built;
++    }
++    return deferred_built;
++}
++
++void D3D12Backend::DrainAsyncPrewarm(bool wait) {
++    if (!async_pw_running_.load(std::memory_order_acquire)) return;
++    if (wait && async_pw_thread_.joinable()) async_pw_thread_.join();
++
++    std::vector<AsyncReadyShader> ready;
++    {
++        std::lock_guard<std::mutex> lock(async_pw_mtx_);
++        ready.swap(async_pw_ready_);
++    }
++    for (auto& r : ready) {
++        if (!r.blob) continue;
++        bool new_blob = !blobs_.count(r.blob_hash) || !blobs_[r.blob_hash];
++        if (new_blob) blobs_[r.blob_hash] = r.blob;
++        shader_src_[r.src_key] = r.blob_hash;
++        if (new_blob) {
++            ++async_pw_compiled_;
++            g_warmup_compiled_new.fetch_add(1u, std::memory_order_relaxed);
++        }
++        if (cache_enabled_) {
++            std::lock_guard<std::mutex> lock(cache_lock_);
++            if (new_blob) {
++                const uint8_t* ptr = static_cast<const uint8_t*>(r.blob->GetBufferPointer());
++                shader_cache_entries_.emplace_back(r.blob_hash, std::vector<uint8_t>(ptr, ptr + r.blob->GetBufferSize()));
++                shaders_dirty_ = true;
++            }
++            if (known_src_keys_.insert(r.src_key).second) {
++                src_meta_entries_.push_back(SrcMetaEntry{r.src_key, r.blob_hash});
++                meta_dirty_ = true;
++            }
++            cache_dirty_frame_ = presents_;
++        }
++    }
++
++    if (wait || async_pw_done_flag_.load(std::memory_order_acquire)) {
++        if (async_pw_thread_.joinable()) async_pw_thread_.join();
++        std::vector<AsyncReadyShader> tail;
++        {
++            std::lock_guard<std::mutex> lock(async_pw_mtx_);
++            tail.swap(async_pw_ready_);
++        }
++        for (auto& r : tail) {
++            if (!r.blob) continue;
++            bool new_blob = !blobs_.count(r.blob_hash) || !blobs_[r.blob_hash];
++            if (new_blob) blobs_[r.blob_hash] = r.blob;
++            shader_src_[r.src_key] = r.blob_hash;
++            if (new_blob) {
++                ++async_pw_compiled_;
++                g_warmup_compiled_new.fetch_add(1u, std::memory_order_relaxed);
++            }
++            if (cache_enabled_) {
++                std::lock_guard<std::mutex> lock(cache_lock_);
++                if (new_blob) {
++                    const uint8_t* ptr = static_cast<const uint8_t*>(r.blob->GetBufferPointer());
++                    shader_cache_entries_.emplace_back(r.blob_hash,
++                                                       std::vector<uint8_t>(ptr, ptr + r.blob->GetBufferSize()));
++                    shaders_dirty_ = true;
++                }
++                if (known_src_keys_.insert(r.src_key).second) {
++                    src_meta_entries_.push_back(SrcMetaEntry{r.src_key, r.blob_hash});
++                    meta_dirty_ = true;
++                }
++                cache_dirty_frame_ = presents_;
++            }
++        }
++        for (const auto& [skey, bhash] : async_pw_links_) {
++            auto bit = blobs_.find(bhash);
++            if (bit != blobs_.end() && bit->second && !shader_src_.count(skey)) {
++                shader_src_[skey] = bhash;
++                if (cache_enabled_) {
++                    std::lock_guard<std::mutex> lock(cache_lock_);
++                    if (known_src_keys_.insert(skey).second) {
++                        src_meta_entries_.push_back(SrcMetaEntry{skey, bhash});
++                        meta_dirty_ = true;
++                    }
++                }
++            }
++        }
++        async_pw_links_.clear();
++        async_pw_running_.store(false, std::memory_order_release);
++        size_t deferred_built = BuildDeferredPsos();
++        double ms = PerfMs(async_pw_t0_);
++        g_warmup_elapsed_us.fetch_add(uint64_t(ms * 1000.0), std::memory_order_relaxed);
++        g_warmup_active.store(false, std::memory_order_release);
++        g_warmup_completed.store(true, std::memory_order_release);
++        g_warmup_completed_ms.store(NowMonoMs(), std::memory_order_release);
++        if (async_pw_compiled_ > 0 || deferred_built > 0) {
++            LOGR("d3d12: guest shader prewarm done in %.1f ms (async, vs_in=%zu, ps_in=%zu, compiled_new=%zu, deferred_psos=%zu, total_shaders=%zu)",
++                 ms, async_pw_vs_in_, async_pw_ps_in_, async_pw_compiled_, deferred_built,
++                 shader_cache_entries_.size());
++            SaveCaches(false, !frame_camera_.is_3d_gameplay);
++        }
++        PublishCacheStats();
++    }
++}
++
++void D3D12Backend::StopAsyncPrewarm() {
++    if (!async_pw_running_.load(std::memory_order_acquire) && !async_pw_thread_.joinable()) return;
++    async_pw_stop_.store(true, std::memory_order_release);
++    DrainAsyncPrewarm(true);
++    async_pw_stop_.store(false, std::memory_order_release);
++}
++
++void D3D12Backend::PrewarmGuestShaders(const std::vector<VertexShader>& vs_list,
++                                       const std::vector<PixelShader>& ps_list) {
++    if (vs_list.empty() && ps_list.empty()) return;
++    if (async_pw_running_.load(std::memory_order_acquire)) DrainAsyncPrewarm(true);
++    constexpr uint64_t kSalt = 0x9E3779B97F4A7C15ull;
++    auto t0 = PerfClock::now();
++    auto batch = BuildGuestShaderPrewarmBatch(vs_list, ps_list, kSalt);
++
++    // Check how many shaders actually need compilation vs already cached in blobs_
++    struct AsyncWorkItem {
++        uint64_t src_key = 0;
++        uint64_t blob_hash = 0;
++        bool is_pixel = false;
++        std::string hlsl;
++    };
++    std::vector<AsyncWorkItem> work;
++    std::unordered_set<uint64_t> queued_blobs;
++    std::vector<std::pair<uint64_t, uint64_t>> cached_links;
++    std::vector<std::pair<uint64_t, uint64_t>> secondary_links;
++
++    for (auto& item : batch) {
++        if (shader_src_.count(item.src_key)) continue;
++        const char* profile = item.is_pixel ? "ps_5_0" : "vs_5_0";
++        uint64_t pseed = Hash(profile, std::strlen(profile));
++        uint64_t eseed = Hash("main", 4, pseed);
++        uint64_t bhash = Hash(item.hlsl.data(), item.hlsl.size(), eseed);
++        auto bit = blobs_.find(bhash);
++        if (bit != blobs_.end() && bit->second) {
++            cached_links.emplace_back(item.src_key, bhash);
++            continue;
++        }
++        if (queued_blobs.insert(bhash).second) {
++            work.push_back(AsyncWorkItem{item.src_key, bhash, item.is_pixel, std::move(item.hlsl)});
++        } else {
++            secondary_links.emplace_back(item.src_key, bhash);
++        }
++    }
++
++    for (const auto& [skey, bhash] : cached_links) {
++        shader_src_[skey] = bhash;
++        if (cache_enabled_) {
++            std::lock_guard<std::mutex> lock(cache_lock_);
++            if (known_src_keys_.insert(skey).second) {
++                src_meta_entries_.push_back(SrcMetaEntry{skey, bhash});
++                meta_dirty_ = true;
++                cache_dirty_frame_ = presents_;
++            }
++        }
++    }
++
++    bool sync_mode = !cli_cap_bmp_.empty() || app::IsReplayOrAutotestActive() || work.size() <= 32;
++    if (!work.empty() && !sync_mode) {
++        g_warmup_active.store(true, std::memory_order_release);
++        g_warmup_total.fetch_add(uint32_t(work.size()), std::memory_order_relaxed);
++        async_pw_t0_ = t0;
++        async_pw_vs_in_ = vs_list.size();
++        async_pw_ps_in_ = ps_list.size();
++        async_pw_compiled_ = 0;
++        async_pw_links_ = std::move(secondary_links);
++        async_pw_done_flag_.store(false, std::memory_order_release);
++        async_pw_stop_.store(false, std::memory_order_release);
++        async_pw_running_.store(true, std::memory_order_release);
++
++        uint32_t max_jobs = std::max<uint32_t>(1u, app::RecommendedCompileJobs());
++        uint32_t n_threads = std::min<uint32_t>({10u, max_jobs, uint32_t(work.size())});
++        async_pw_thread_ = std::thread([this, wlist = std::move(work), n_threads]() {
++            std::atomic<size_t> cursor{0};
++            auto worker = [&] {
++                for (;;) {
++                    if (async_pw_stop_.load(std::memory_order_relaxed)) break;
++                    size_t idx = cursor.fetch_add(1, std::memory_order_relaxed);
++                    if (idx >= wlist.size()) break;
++                    const auto& w = wlist[idx];
++                    const char* profile = w.is_pixel ? "ps_5_0" : "vs_5_0";
++                    ComPtr<ID3DBlob> code;
++                    ComPtr<ID3DBlob> err;
++                    HRESULT hr = D3DCompile(w.hlsl.data(), w.hlsl.size(), nullptr, nullptr, nullptr, "main", profile,
++                                            D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
++                    if (SUCCEEDED(hr) && code && code->GetBufferSize() > 0) {
++                        std::lock_guard<std::mutex> lock(async_pw_mtx_);
++                        async_pw_ready_.push_back(AsyncReadyShader{w.src_key, w.blob_hash, std::move(code)});
++                    }
++                    g_warmup_done.fetch_add(1u, std::memory_order_relaxed);
++                }
++            };
++            std::vector<std::thread> pool;
++            pool.reserve(n_threads > 1 ? n_threads - 1 : 0);
++            for (uint32_t t = 1; t < n_threads; ++t) pool.emplace_back(worker);
++            worker();
++            for (auto& th : pool) th.join();
++            async_pw_done_flag_.store(true, std::memory_order_release);
++        });
++        return;
++    }
++
++    size_t compiled = 0;
++    if (!work.empty()) {
++        g_warmup_active.store(true, std::memory_order_release);
++        std::vector<ShaderPrewarmItem> sync_batch;
++        sync_batch.reserve(work.size() + secondary_links.size());
++        for (auto& w : work) sync_batch.push_back(ShaderPrewarmItem{w.src_key, w.is_pixel, std::move(w.hlsl)});
++        compiled = CompileBatchParallel(sync_batch);
++        for (const auto& [skey, bhash] : secondary_links) {
++            auto bit = blobs_.find(bhash);
++            if (bit != blobs_.end() && bit->second && !shader_src_.count(skey)) {
++                shader_src_[skey] = bhash;
++                if (cache_enabled_) {
++                    std::lock_guard<std::mutex> lock(cache_lock_);
++                    if (known_src_keys_.insert(skey).second) {
++                        src_meta_entries_.push_back(SrcMetaEntry{skey, bhash});
++                        meta_dirty_ = true;
++                    }
++                }
++            }
++        }
++    }
++
++    size_t deferred_built = BuildDeferredPsos();
++    double ms = PerfMs(t0);
++    g_warmup_elapsed_us.fetch_add(uint64_t(ms * 1000.0), std::memory_order_relaxed);
++    g_warmup_active.store(false, std::memory_order_release);
++    g_warmup_completed.store(true, std::memory_order_release);
++    g_warmup_completed_ms.store(NowMonoMs(), std::memory_order_release);
++
++    if (compiled > 0 || deferred_built > 0) {
++        LOGR("d3d12: guest shader prewarm done in %.1f ms (vs_in=%zu, ps_in=%zu, compiled_new=%zu, deferred_psos=%zu, total_shaders=%zu)",
++             ms, vs_list.size(), ps_list.size(), compiled, deferred_built, shader_cache_entries_.size());
++        SaveCaches(false, presents_ == 0 || !frame_camera_.is_3d_gameplay);
++    }
++    PublishCacheStats();
++}
++
 +void D3D12Backend::PrewarmCachedPsos() {
 +    if (!cache_enabled_ || cache_dir_.empty()) return;
 +    std::filesystem::path meta_path = PsoMetaPath();
@@ -9142,9 +9784,7 @@ index 9ddd87b..a55cb76 100644
 +    if (!f) return;
 +    PsoMetaHeader hdr{};
 +    bool ok = std::fread(&hdr, sizeof(hdr), 1, f) == 1 && hdr.magic == kPsoMetaMagic && hdr.version == kPsoMetaVersion &&
-+              hdr.sizeof_pso_key == sizeof(PsoKey) && hdr.vendor_id == adapter_desc_.VendorId &&
-+              hdr.device_id == adapter_desc_.DeviceId && hdr.subsys_id == adapter_desc_.SubSysId &&
-+              hdr.revision == adapter_desc_.Revision && hdr.src_count <= 65536u && hdr.pso_count <= 65536u;
++              hdr.sizeof_pso_key == sizeof(PsoKey) && hdr.src_count <= 65536u && hdr.pso_count <= 65536u;
 +    uint64_t expect = uint64_t(sizeof(PsoMetaHeader)) + uint64_t(hdr.src_count) * sizeof(SrcMetaEntry) +
 +                      uint64_t(hdr.pso_count) * sizeof(PsoKey);
 +    if (!ok || expect != fsize) {
@@ -9203,7 +9843,10 @@ index 9ddd87b..a55cb76 100644
 +        if (psos_.count(h) || !seen_hashes.insert(h).second) continue;
 +        auto vit = blobs_.find(k.vs);
 +        auto pit = blobs_.find(k.ps);
-+        if (vit == blobs_.end() || !vit->second || pit == blobs_.end() || !pit->second) continue;
++        if (vit == blobs_.end() || !vit->second || pit == blobs_.end() || !pit->second) {
++            deferred_pso_keys_.push_back(k);
++            continue;
++        }
 +        ID3DBlob* gs = nullptr;
 +        if (k.topo == uint32_t(Topology::Points)) {
 +            gs = k.sprite ? sprite_gs : point_gs;
@@ -9224,7 +9867,7 @@ index 9ddd87b..a55cb76 100644
 +    std::vector<PrepOut> results(items.size());
 +    std::atomic<size_t> cursor{0};
 +    uint32_t max_jobs = std::max<uint32_t>(1u, app::RecommendedCompileJobs());
-+    uint32_t n_threads = std::min<uint32_t>({4u, max_jobs, uint32_t(items.size())});
++    uint32_t n_threads = std::min<uint32_t>({12u, max_jobs, uint32_t(items.size())});
 +    auto worker = [&] {
 +        for (;;) {
 +            size_t idx = cursor.fetch_add(1, std::memory_order_relaxed);
@@ -9287,7 +9930,7 @@ index 9ddd87b..a55cb76 100644
  TexKind TextureKind(const TextureDesc& d) {
      if (d.cube) return kTexCube;
      if (d.depth > 1) return kTex3D;
-@@ -1709,7 +3076,9 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
+@@ -1709,7 +3704,9 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
      info.kind = kTex2D;
      // a pass shrinking it averages each tap over a console texel, else upscaled taps skip texels and ghost
      Target* rt = FindTarget(s.rt, false);
@@ -9298,7 +9941,7 @@ index 9ddd87b..a55cb76 100644
      if (!t.depth && box && k > kUpscaledMin && rt && rt != &t && (t.gw > rt->gw || t.gh > rt->gh)) {
          stages.wide[stage] = k;
          info.flags |= kTexWide;
-@@ -1732,7 +3101,7 @@ bool SameTexture(const Tex& tx, const TextureDesc& d) {
+@@ -1732,7 +3729,7 @@ bool SameTexture(const Tex& tx, const TextureDesc& d) {
  // false when the texture could not be made, its entry dropped
  bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint64_t key) {
      g_perf.newtex++;
@@ -9307,7 +9950,7 @@ index 9ddd87b..a55cb76 100644
      tx = Tex{};
      tx.d = d;
      tx.fmt = HostFormat(fi.host);
-@@ -1745,7 +3114,6 @@ bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo
+@@ -1745,7 +3742,6 @@ bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo
          h = (h + 3) & ~3u;
          tx.levels = 1;
      }
@@ -9315,7 +9958,7 @@ index 9ddd87b..a55cb76 100644
      D3D12_RESOURCE_DESC td{};
      td.Dimension = d.depth > 1 ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
      td.Width = w;
-@@ -1754,6 +3122,24 @@ bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo
+@@ -1754,6 +3750,24 @@ bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo
      td.MipLevels = UINT16(tx.levels);
      td.Format = tx.fmt;
      td.SampleDesc.Count = 1;
@@ -9340,7 +9983,7 @@ index 9ddd87b..a55cb76 100644
      if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                               IID_PPV_ARGS(&tx.res)))) {
          textures_.erase(key);
-@@ -1802,13 +3188,13 @@ void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo
+@@ -1802,13 +3816,13 @@ void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo
      D3D12_RESOURCE_STATES st = same ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_DEST;
      Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_COPY_DEST);
      uint32_t faces = d.cube ? 6 : 1;
@@ -9358,7 +10001,14 @@ index 9ddd87b..a55cb76 100644
          }
      }
      Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-@@ -2100,11 +3486,20 @@ void D3D12Backend::EnsureVertexShader(const State& s, const Assembled& a, DrawSh
+@@ -2097,14 +4111,33 @@ std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh
+ // sets sh.vh and sh.vs_code, compiling the shader on a cache miss
+ void D3D12Backend::EnsureVertexShader(const State& s, const Assembled& a, DrawShaders& sh) {
+     auto vit = shader_src_.find(sh.vkey);
++    if (vit == shader_src_.end() && async_pw_running_.load(std::memory_order_acquire)) {
++        DrainAsyncPrewarm(false);
++        vit = shader_src_.find(sh.vkey);
++    }
      if (vit != shader_src_.end()) {
          sh.vs_code = blobs_[vit->second].Get();
          sh.vh = vit->second;
@@ -9375,17 +10025,27 @@ index 9ddd87b..a55cb76 100644
 +            meta_dirty_ = true;
 +            cache_dirty_frame_ = presents_;
 +        }
++        if (!sh.prog && known_fixed_vs_recipes_.insert(sh.vkey).second) {
++            fixed_vs_recipes_.push_back(FixedVsRecipe{sh.vkey, a.decode, sh.fk, a.regs, uint8_t(a.pretransformed),
++                                                      uint8_t(sh.quad), 0u});
++            recipes_dirty_ = true;
++            cache_dirty_frame_ = presents_;
++        }
 +    }
  }
  
  bool D3D12Backend::BindStageTexturesAndTargets(const State& s, DrawTextures& stages) {
-@@ -2126,14 +3521,24 @@ constexpr uint64_t kPixelKeySalt = 0x9E3779B97F4A7C15ull;
+@@ -2126,14 +4159,33 @@ constexpr uint64_t kPixelKeySalt = 0x9E3779B97F4A7C15ull;
  // sets sh.ph and sh.ps_code, compiling the shader on a cache miss
  void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
      // pixel shaders share the map with vertex shaders, the salt keeps their keys apart
 -    auto pit = shader_src_.find(sh.pkey ^ kPixelKeySalt);
 +    uint64_t key = sh.pkey ^ kPixelKeySalt;
 +    auto pit = shader_src_.find(key);
++    if (pit == shader_src_.end() && async_pw_running_.load(std::memory_order_acquire)) {
++        DrainAsyncPrewarm(false);
++        pit = shader_src_.find(key);
++    }
      if (pit != shader_src_.end()) {
          sh.ps_code = blobs_[pit->second].Get();
          sh.ph = pit->second;
@@ -9402,11 +10062,16 @@ index 9ddd87b..a55cb76 100644
 +            meta_dirty_ = true;
 +            cache_dirty_frame_ = presents_;
 +        }
++        if (known_pixel_ps_recipes_.insert(key).second) {
++            pixel_ps_recipes_.push_back(PixelRecipe{key, pk});
++            recipes_dirty_ = true;
++            cache_dirty_frame_ = presents_;
++        }
 +    }
  }
  
  void KeyBlend(const State& s, PsoKey& k) {
-@@ -2156,7 +3561,8 @@ bool OffsetsPolygons(const State& s, Topology topology) {
+@@ -2156,7 +4208,8 @@ bool OffsetsPolygons(const State& s, Topology topology) {
  
  // polygon offset slopes are per console pixel, an upscaled target's pixels are smaller
  float HostSlopeScale(const State& s, const Target* ds) {
@@ -9416,7 +10081,7 @@ index 9ddd87b..a55cb76 100644
  }
  
  void D3D12Backend::KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k) {
-@@ -2270,7 +3676,10 @@ void D3D12Backend::FillTextureConstants(const State& s, const DrawShaders& sh, c
+@@ -2270,7 +4323,10 @@ void D3D12Backend::FillTextureConstants(const State& s, const DrawShaders& sh, c
      for (int i = 0; i < 4; i++) {
          TextureDesc d;
          if (s.textures[size_t(i)] && Describe(s.textures[size_t(i)], d)) FillTexelConstants(i, d, stages, c);
@@ -9428,7 +10093,7 @@ index 9ddd87b..a55cb76 100644
          const auto& t = s.tss[size_t(i)];
          c.bump[i][0] = Bits(t[kTssBumpEnvMat00]);
          c.bump[i][1] = Bits(t[kTssBumpEnvMat01]);
-@@ -2452,8 +3861,8 @@ uint8_t* D3D12Backend::UploadVertexConstants(const State& s) {
+@@ -2452,8 +4508,8 @@ uint8_t* D3D12Backend::UploadVertexConstants(const State& s) {
      return vc.cpu;
  }
  
@@ -9439,7 +10104,7 @@ index 9ddd87b..a55cb76 100644
      // the extension edits the uploaded copy, so its draws always get their own
      bool same = !ext_ && last_vsc_gpu_ && !std::memcmp(last_vsc_.data(), s.vsc.data(), sizeof(s.vsc));
      uint8_t* vsc = same ? nullptr : UploadVertexConstants(s);
-@@ -2465,6 +3874,25 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
+@@ -2465,6 +4521,25 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
      if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vsc), c.ext, bound_rt_, k.blend ? k.src : 1);
      FillDepthConstants(s, sh, k, c);
      FillTextureConstants(s, sh, stages, c);
@@ -9465,7 +10130,7 @@ index 9ddd87b..a55cb76 100644
      if (sh.fixed_transform) {
          FillTransformConstants(s, size, c);
          FillLightConstants(s, sh.fk, c);
-@@ -2630,20 +4058,21 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
+@@ -2630,20 +4705,21 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
  }
  
  // viewport covers the target, the guest viewport is in the shader; scissor clips to it
@@ -9497,7 +10162,7 @@ index 9ddd87b..a55cb76 100644
      }
      D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
                      std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
-@@ -2827,8 +4256,6 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+@@ -2827,8 +4903,6 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
      if (ext_) ext_->BeginDraw(s);
      Assembled& a = asm_;
      if (!AssembleDraw(s, prim, start, count, indices, a)) return;
@@ -9506,7 +10171,7 @@ index 9ddd87b..a55cb76 100644
      if (!BindTargets(s)) return;
      if (ext_ && ext_->Bound(*this, s, bound_rt_, bound_ds_, a.pretransformed) && !BindTargets(s)) return;
  
-@@ -2861,7 +4288,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+@@ -2861,7 +4935,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
      GuestExtent size;
      SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
      DrawConstants c{};
@@ -9515,7 +10180,7 @@ index 9ddd87b..a55cb76 100644
      if (ext_) binds_ = {};
  
      if (cap_) {
-@@ -2872,7 +4299,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+@@ -2872,7 +4946,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
  
      // texture views and samplers, viewport and scissor, blend factor and stencil reference
      SetTextureViewsAndSamplers(s, a, stages);
@@ -9524,7 +10189,7 @@ index 9ddd87b..a55cb76 100644
      SetBlendFactorStencilRef(s);
  
      // geometry, counted while the title runs a visibility test
-@@ -2883,9 +4310,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+@@ -2883,9 +4957,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
  
  // a guest rect scaled to the target and clamped to it
  D3D12_RECT ScaledRect(const Target& t, int x0, int y0, int x1, int y1) {
@@ -9538,7 +10203,7 @@ index 9ddd87b..a55cb76 100644
  }
  
  // rs: the rects buffer, reused across targets
-@@ -2929,7 +4357,8 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
+@@ -2929,7 +5004,8 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
  // ClearChannels' pipeline for the target format and channel mask, kept in blit_psos_; null when it can't be made
  ID3D12PipelineState* D3D12Backend::EnsureClearPipeline(DXGI_FORMAT rtv, uint8_t mask) {
      uint64_t seed = uint64_t(rtv) << 8 | mask;
@@ -9548,7 +10213,7 @@ index 9ddd87b..a55cb76 100644
      if (pso) return pso.Get();
      uint64_t h;
      ID3DBlob* vs = Compile(kClearHlsl, "vs", "vs_5_0", h);
-@@ -2937,7 +4366,9 @@ ID3D12PipelineState* D3D12Backend::EnsureClearPipeline(DXGI_FORMAT rtv, uint8_t
+@@ -2937,7 +5013,9 @@ ID3D12PipelineState* D3D12Backend::EnsureClearPipeline(DXGI_FORMAT rtv, uint8_t
      if (!vs || !ps) return nullptr;
      D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
      d.BlendState.RenderTarget[0].RenderTargetWriteMask = mask;
@@ -9559,7 +10224,7 @@ index 9ddd87b..a55cb76 100644
      return pso.Get();
  }
  
-@@ -3061,8 +4492,10 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
+@@ -3061,8 +5139,10 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
      D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), dst_t.view, rtv_inc_);
      cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
      float gw = src_t.gw * l.kx, gh = src_t.gh * l.ky;  // the source in the guest pixels the rects use
@@ -9572,7 +10237,7 @@ index 9ddd87b..a55cb76 100644
      bool listed = l.count && l.src_rects;
      uint32_t n = listed ? l.count : 1;
      for (uint32_t i = 0; i < n; i++) {
-@@ -3071,8 +4504,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
+@@ -3071,8 +5151,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
          DrawnRect r{.x0 = 0, .y0 = 0, .x1 = whole_w, .y1 = whole_h};
          if (listed) r = ReadDrawnRect(l.src_rects, l.dst_points, i);
          if (r.x1 <= r.x0 || r.y1 <= r.y0) continue;
@@ -9582,7 +10247,7 @@ index 9ddd87b..a55cb76 100644
          LONG right = std::min(LONG(vp.TopLeftX + vp.Width), LONG(dst_t.w));
          LONG bottom = std::min(LONG(vp.TopLeftY + vp.Height), LONG(dst_t.h));
          D3D12_RECT scissor{LONG(vp.TopLeftX), LONG(vp.TopLeftY), right, bottom};
-@@ -3081,7 +4513,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
+@@ -3081,7 +5160,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
          cl_->RSSetScissorRects(1, &scissor);
          binds_ = {};
          float uv[4] = {r.x0 / gw, r.y0 / gh, (r.x1 - r.x0) / gw, (r.y1 - r.y0) / gh};
@@ -9591,7 +10256,7 @@ index 9ddd87b..a55cb76 100644
          float mul = 1 / dst_t.range;
          BlitOptions o{.alpha = true, .taps = taps, .mul = mul, .rtv = dst_t.fmt};
          Blit(src_res, src_t.fmt, uv, o);
-@@ -3097,7 +4529,8 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
+@@ -3097,7 +5176,8 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
      Transition(dst_t.res.Get(), dst_t.state, D3D12_RESOURCE_STATE_COPY_DEST);
      D3D12_TEXTURE_COPY_LOCATION dl{dst_t.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
      D3D12_TEXTURE_COPY_LOCATION sl{src_res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
@@ -9601,7 +10266,7 @@ index 9ddd87b..a55cb76 100644
      bool listed = l.count && l.src_rects;
      uint32_t n = listed ? l.count : 1;
      for (uint32_t i = 0; i < n; i++) {
-@@ -3106,16 +4539,16 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
+@@ -3106,16 +5186,16 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
          uint32_t dy = 0;
          if (listed) {
              GuestRect r = ReadGuestRect(l.src_rects, i);
@@ -9624,7 +10289,7 @@ index 9ddd87b..a55cb76 100644
              }
          }
          if (b.right <= b.left || b.bottom <= b.top || dx >= dst_t.w || dy >= dst_t.h) continue;
-@@ -3164,20 +4597,30 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count,
+@@ -3164,20 +5244,30 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count,
  
  void D3D12Backend::ResizeSwap() {
      HWND hwnd = static_cast<HWND>(app::Window());
@@ -9659,7 +10324,7 @@ index 9ddd87b..a55cb76 100644
  }
  
  void D3D12Backend::FinishCapture(const Surface& front) {
-@@ -3267,6 +4710,7 @@ void D3D12Backend::RenderUi() {
+@@ -3267,6 +5357,7 @@ void D3D12Backend::RenderUi() {
  }
  
  void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
@@ -9667,7 +10332,7 @@ index 9ddd87b..a55cb76 100644
      D3D12_RESOURCE_STATES bs = D3D12_RESOURCE_STATE_PRESENT;
      Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
      D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), kRtvCount + bi, rtv_inc_);
-@@ -3274,20 +4718,153 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
+@@ -3274,20 +5365,153 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
      cl_->ClearRenderTargetView(rh, black, 0, nullptr);
      cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
      bound_rt_ = bound_ds_ = nullptr;
@@ -9829,7 +10494,7 @@ index 9ddd87b..a55cb76 100644
              it = textures_.erase(it);
          } else {
              ++it;
-@@ -3302,8 +4879,16 @@ void D3D12Backend::ResetFrame() {
+@@ -3302,8 +5526,16 @@ void D3D12Backend::ResetFrame() {
          WaitFence(f.fence);
          g_perf.wait += PerfMs(perf_wait);
      }
@@ -9846,7 +10511,7 @@ index 9ddd87b..a55cb76 100644
      f.used = 0;
      f.srv = 0;
      cl_->Reset(f.alloc.Get(), nullptr);
-@@ -3352,6 +4937,7 @@ void LogPerf() {
+@@ -3352,6 +5584,7 @@ void LogPerf() {
               p.targets / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n,
               (unsigned long long)p.shaders, (unsigned long long)p.psos);
          g_perf = Perf{};
@@ -9854,7 +10519,7 @@ index 9ddd87b..a55cb76 100644
          perf_start = PerfClock::now();
          perf_frames = 0;
      }
-@@ -3371,22 +4957,115 @@ void D3D12Backend::Present(const Surface& front) {
+@@ -3371,22 +5604,125 @@ void D3D12Backend::Present(const Surface& front) {
      if (ramp_dirty_) UploadGammaRamp();
      Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
  
@@ -9925,17 +10590,27 @@ index 9ddd87b..a55cb76 100644
 +        LOG_FIRST(4, "d3d12: Present failed (hr=0x%08lX, removed=0x%08lX)", (unsigned long)phr, (unsigned long)reason);
 +    }
  
++    bool in_3d = frame_camera_.is_3d_gameplay;
 +    frame_jitter_latched_ = false;
 +    has_queued_camera_ = false;
      presents_++;
      presents_seen_.store(presents_);
      frame_++;
-+    if (cache_enabled_ && (shaders_dirty_ || pso_dirty_ || meta_dirty_) && presents_ >= cache_dirty_frame_ + 120) {
-+        SaveCaches(false);
-+        PublishCacheStats();
-+    } else if ((presents_ % 60) == 0) {
-+        g_cache_shaders_stat.store(uint32_t(shader_cache_entries_.size()), std::memory_order_relaxed);
-+        g_cache_psos_stat.store(uint32_t(psos_.size() + blit_psos_.size()), std::memory_order_relaxed);
++    if (async_pw_running_.load(std::memory_order_acquire)) DrainAsyncPrewarm(false);
++    if (cache_enabled_) {
++        if (!in_3d && (shaders_dirty_ || pso_dirty_ || meta_dirty_ || recipes_dirty_) &&
++            presents_ >= cache_dirty_frame_ + 30) {
++            SaveCaches(false, true);
++            PublishCacheStats();
++        } else if (in_3d && (shaders_dirty_ || meta_dirty_ || recipes_dirty_) &&
++                   presents_ >= cache_dirty_frame_ + 300) {
++            // Checkpoint lightweight shader/meta/recipe caches (< 0.2 ms) without stalling 3D gameplay on PSO Serialize
++            SaveCaches(false, false);
++            PublishCacheStats();
++        } else if ((presents_ % 60) == 0) {
++            g_cache_shaders_stat.store(uint32_t(shader_cache_entries_.size()), std::memory_order_relaxed);
++            g_cache_psos_stat.store(uint32_t(psos_.size() + blit_psos_.size()), std::memory_order_relaxed);
++        }
 +    }
      ReleaseOldTextures();
      ResetFrame();
@@ -9972,7 +10647,7 @@ index 9ddd87b..a55cb76 100644
      if (diag::Perf()) LogPerf();
      ApplySettings();
  }
-@@ -3398,16 +5077,45 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
+@@ -3398,16 +5734,45 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
  }
  
  void D3D12Backend::ApplySettings() {
@@ -10023,7 +10698,7 @@ index 9ddd87b..a55cb76 100644
      }
  }
  
-@@ -3442,9 +5150,21 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
+@@ -3442,9 +5807,21 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
                    it->second.w, it->second.h);
      }
      Target& t = it->second;
@@ -10046,7 +10721,7 @@ index 9ddd87b..a55cb76 100644
      std::vector<uint8_t> px;
      if (!ReadBack(src.res, t.gw, t.gh, px)) return;
      // color targets are 32 bit linear in guest memory, the pitch rounds to 64 bytes
-@@ -3610,23 +5330,27 @@ bool D3D12Backend::ReadBack(ID3D12Resource* res, uint32_t w, uint32_t h, std::ve
+@@ -3610,23 +5987,27 @@ bool D3D12Backend::ReadBack(ID3D12Resource* res, uint32_t w, uint32_t h, std::ve
      UINT64 row_size;
      UINT64 bytes;
      dev_->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &rows, &row_size, &bytes);
@@ -10083,7 +10758,7 @@ index 9ddd87b..a55cb76 100644
      return true;
  }
  
-@@ -3704,4 +5428,39 @@ void D3D12Backend::SetGamma(const uint8_t* ramp) {
+@@ -3704,4 +6085,53 @@ void D3D12Backend::SetGamma(const uint8_t* ramp) {
  
  std::unique_ptr<Backend> CreateBackend() { return std::make_unique<D3D12Backend>(); }
  
@@ -10092,6 +10767,20 @@ index 9ddd87b..a55cb76 100644
 +            g_cache_shaders_stat.load(std::memory_order_relaxed),
 +            g_cache_psos_stat.load(std::memory_order_relaxed),
 +            g_cache_bytes_stat.load(std::memory_order_relaxed)};
++}
++
++ShaderWarmupStatus GetShaderWarmupStatus() {
++    ShaderWarmupStatus s{};
++    s.active = g_warmup_active.load(std::memory_order_acquire);
++    s.completed = g_warmup_completed.load(std::memory_order_acquire);
++    s.done = g_warmup_done.load(std::memory_order_relaxed);
++    s.total = g_warmup_total.load(std::memory_order_relaxed);
++    s.compiled_new = g_warmup_compiled_new.load(std::memory_order_relaxed);
++    s.cached_shaders = g_cache_shaders_stat.load(std::memory_order_relaxed);
++    s.cached_psos = g_cache_psos_stat.load(std::memory_order_relaxed);
++    s.elapsed_ms = double(g_warmup_elapsed_us.load(std::memory_order_relaxed)) / 1000.0;
++    s.completed_ms = g_warmup_completed_ms.load(std::memory_order_acquire);
++    return s;
 +}
 +
 +void RequestCacheReset() { g_cache_reset_requested.store(true, std::memory_order_release); }
@@ -10167,7 +10856,7 @@ index 0000000..a303fae
 +
 +#endif
 diff --git a/runtime/gpu/render_thread.cpp b/runtime/gpu/render_thread.cpp
-index fed4612..a1b5b75 100644
+index fed4612..85fd349 100644
 --- a/runtime/gpu/render_thread.cpp
 +++ b/runtime/gpu/render_thread.cpp
 @@ -2,6 +2,7 @@
@@ -10207,24 +10896,30 @@ index fed4612..a1b5b75 100644
  #include "kernel/kernel.h"
  #include "kernel/memory.h"
  
-@@ -43,7 +51,7 @@ constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a
+@@ -43,7 +51,12 @@ constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a
  
  enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
  
 -enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport };
-+enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport, Camera };
++enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport, Camera, PrewarmShaders };
++
++struct PrewarmBatch {
++    std::vector<VertexShader> vs;
++    std::vector<PixelShader> ps;
++};
  
  struct Cmd {
      Op op;
-@@ -60,6 +68,7 @@ struct Batch {
+@@ -60,6 +73,8 @@ struct Batch {
      std::vector<uint8_t> bytes;
      std::vector<std::shared_ptr<VertexShader>> vs;
      std::vector<std::shared_ptr<PixelShader>> ps;
 +    std::vector<CameraFrameData> cameras;
++    std::vector<PrewarmBatch> prewarms;
  };
  
  // the plain data in State, around its shader pointers and the resource headers (sent as copies); of the transforms only
-@@ -114,10 +123,25 @@ public:
+@@ -114,10 +129,25 @@ public:
          if (!done_cv_.wait_for(lock, std::chrono::milliseconds(500), [&] { return exited_; })) (void)inner_.release();
      }
  
@@ -10251,7 +10946,7 @@ index fed4612..a1b5b75 100644
          SendState(s);
          Cmd c{Op::Draw};
          c.a = prim;
-@@ -181,6 +205,10 @@ public:
+@@ -181,6 +211,10 @@ public:
  
      void Present(const Surface& front) override {
          auto t = Clock::now();
@@ -10262,7 +10957,7 @@ index fed4612..a1b5b75 100644
          Cmd c{Op::Present};
          c.s1 = front;
          c.s1.header = Header(front.header);
-@@ -191,7 +219,22 @@ public:
+@@ -191,7 +225,22 @@ public:
          // the title records one frame while the one before it draws, on the GPU too: a GPU bound frame rate then paces
          // the game like a frame rate cap, and the frame times the game measures match the frames shown
          Wait(last_present_, WaitFor::Frame, nullptr);
@@ -10286,15 +10981,25 @@ index fed4612..a1b5b75 100644
          presents_++;
          last_present_ = id;
      }
-@@ -213,6 +256,7 @@ public:
+@@ -213,6 +262,17 @@ public:
          cur_->cmds.push_back(Cmd{Op::Flush});
          Wait(Submit(), WaitFor::Flush, "flush");
      }
-+    void FlushCaches() override { inner_->FlushCaches(); }
++    void FlushCaches() override {
++        Flush();
++        inner_->FlushCaches();
++    }
++    void PrewarmGuestShaders(const std::vector<VertexShader>& vs, const std::vector<PixelShader>& ps) override {
++        if (vs.empty() && ps.empty()) return;
++        Cmd c{Op::PrewarmShaders};
++        c.a = uint32_t(cur_->prewarms.size());
++        cur_->prewarms.push_back(PrewarmBatch{vs, ps});
++        cur_->cmds.push_back(c);
++    }
  
      void SetGamma(const uint8_t* ramp) override {
          Cmd c{Op::Gamma};
-@@ -240,6 +284,15 @@ public:
+@@ -240,6 +300,15 @@ public:
      }
  
  private:
@@ -10310,7 +11015,7 @@ index fed4612..a1b5b75 100644
      Batch* NewBatch() {
          Batch* b;
          {
-@@ -405,6 +458,7 @@ private:
+@@ -405,6 +474,7 @@ private:
          uint64_t ns = Ns(t);
          g_perf_wait_ns += ns;
          g_perf_wait_kind_ns[size_t(kind)] += ns;
@@ -10318,7 +11023,7 @@ index fed4612..a1b5b75 100644
          if (why) {
              g_perf_waits++;
              if (diag::Perf()) LOG_FIRST(32, "render thread: the title waited %.2f ms for a %s", ns / 1e6, why);
-@@ -412,10 +466,15 @@ private:
+@@ -412,10 +482,15 @@ private:
      }
  
      void Run() {
@@ -10334,23 +11039,29 @@ index fed4612..a1b5b75 100644
          for (;;) {
              Batch* b;
              {
-@@ -431,6 +490,7 @@ private:
+@@ -431,6 +506,8 @@ private:
              b->bytes.clear();
              b->vs.clear();
              b->ps.clear();
 +            b->cameras.clear();
++            b->prewarms.clear();
              {
                  std::lock_guard lock(m_);
                  free_.push_back(b);
-@@ -468,6 +528,7 @@ private:
+@@ -468,6 +545,12 @@ private:
              case Op::Gamma: inner_->SetGamma(data); break;
              case Op::ClearReport: inner_->ClearReport(); break;
              case Op::GetReport: inner_->GetReport(c.a); break;
 +            case Op::Camera: inner_->SetFrameCamera(b.cameras[c.a]); break;
++            case Op::PrewarmShaders: {
++                const PrewarmBatch& pb = b.prewarms[c.a];
++                inner_->PrewarmGuestShaders(pb.vs, pb.ps);
++                break;
++            }
          }
      }
  
-@@ -498,6 +559,11 @@ private:
+@@ -498,6 +581,11 @@ private:
      std::unordered_set<uint64_t> logged_;   // perf diagnostic: read-backs named once, by address and kind
      uint64_t next_id_ = 0, last_present_ = 0;
      uint64_t presents_ = 0;
@@ -10363,10 +11074,18 @@ index fed4612..a1b5b75 100644
      // the render thread
      State state_;
 diff --git a/runtime/gpu/shaders.cpp b/runtime/gpu/shaders.cpp
-index 2bd0667..3dfae1e 100644
+index 2bd0667..16f0087 100644
 --- a/runtime/gpu/shaders.cpp
 +++ b/runtime/gpu/shaders.cpp
-@@ -53,8 +53,10 @@ const char* kCommonTail = R"(    float4 spread[4];
+@@ -6,6 +6,7 @@
+ #include <cstdarg>
+ #include <cstdio>
+ #include <cstring>
++#include <unordered_set>
+ 
+ namespace gpu {
+ 
+@@ -53,8 +54,10 @@ const char* kCommonTail = R"(    float4 spread[4];
      float4 mat[5];
      float4 amb;
      float4 lt[56];
@@ -10378,7 +11097,7 @@ index 2bd0667..3dfae1e 100644
  };
  )";
  
-@@ -394,8 +396,7 @@ std::string TexUv(const TexInfo& t, int i, const std::string& uv) {
+@@ -394,8 +397,7 @@ std::string TexUv(const TexInfo& t, int i, const std::string& uv) {
      if (t.rect) n += F(" / texsize[%d].xy", i);
      n += F(" + texsize[%d].zw", i);
      if (!(t.flags & kTexTarget)) return n;
@@ -10388,7 +11107,7 @@ index 2bd0667..3dfae1e 100644
  }
  
  // texture shader stage i, per its mode
-@@ -1058,10 +1059,13 @@ bool InsertAfter(std::string& s, const char* at, const char* text) {
+@@ -1058,10 +1060,13 @@ bool InsertAfter(std::string& s, const char* at, const char* text) {
  std::string ReversedDepthHlsl(std::string s) {
      size_t entry = s.find("VOut main(");
      if (entry != std::string::npos) s.insert(entry, kReversedClipHlsl);
@@ -10403,8 +11122,255 @@ index 2bd0667..3dfae1e 100644
                  "    precise float wz = dot(ip, wvp._m03_m13_m23_m33 - wvp._m02_m12_m22_m32);\n"
                  "    o.pos.z = ReversedClip(wz, cp.w);\n");
      return s;
+@@ -1085,4 +1090,246 @@ void main(point VOut v[1], inout TriangleStream<VOut> strip) {
+ )";
+ }
+ 
++namespace {
++
++constexpr uint64_t kPrewarmDeclSalt = 0x10000;
++constexpr uint64_t kPrewarmPretransSalt = 0x5A5A;
++constexpr uint64_t kPrewarmQuadSalt = 0xC3C30000;
++
++uint64_t ProgVsKey(uint64_t prog_hash, uint16_t regs, uint64_t decode, bool quad) {
++    uint64_t vkey = Hash(&decode, 8, prog_hash ^ regs);
++    if (quad) vkey ^= kPrewarmQuadSalt;
++    return vkey;
++}
++
++uint64_t FixedVsKey(uint32_t vs_handle, uint16_t regs, uint64_t decode, bool pretransformed, bool quad,
++                    const FixedKey& fk) {
++    uint64_t seed = Hash(&vs_handle, 4, regs | kPrewarmDeclSalt);
++    uint64_t vkey = Hash(&decode, 8, seed);
++    if (pretransformed) vkey ^= kPrewarmPretransSalt;
++    if (quad) vkey ^= kPrewarmQuadSalt;
++    return Hash(&fk, sizeof(fk), vkey);
++}
++
++void ApplyPsDefToState(State& s, const std::shared_ptr<PixelShader>& ps) {
++    s.ps = ps;
++    const uint32_t* d = ps->def;
++    for (int i = 0; i < 8; ++i) {
++        s.simple[(kMPsAlphaInputs + i * 4) >> 2] = d[0 + i];
++        s.simple[(kMPsConstant0 + i * 4) >> 2] = d[10 + i];
++        s.simple[(kMPsConstant1 + i * 4) >> 2] = d[18 + i];
++        s.simple[(kMPsAlphaOutputs + i * 4) >> 2] = d[26 + i];
++        s.simple[(kMPsRgbInputs + i * 4) >> 2] = d[34 + i];
++        s.simple[(kMPsRgbOutputs + i * 4) >> 2] = d[45 + i];
++    }
++    s.simple[kMPsFinalAbcd >> 2] = d[8];
++    s.simple[kMPsFinalEfgh >> 2] = d[9];
++    s.simple[kMPsCompareMode >> 2] = d[42];
++    s.simple[kMPsFinalConstant0 >> 2] = d[43];
++    s.simple[kMPsFinalConstant1 >> 2] = d[44];
++    s.simple[kMPsCombinerCount >> 2] = d[53];
++    s.simple[kMPsDotMapping >> 2] = d[55];
++    s.simple[kMPsInputTexture >> 2] = d[56];
++    s.rs[kRsPsTextureModes] = d[54];
++}
++
++}  // namespace
++
++std::vector<ShaderPrewarmItem> BuildGuestShaderPrewarmBatch(const std::vector<VertexShader>& vs_list,
++                                                            const std::vector<PixelShader>& ps_list,
++                                                            uint64_t pixel_key_salt) {
++    std::vector<ShaderPrewarmItem> out;
++    std::unordered_set<uint64_t> seen;
++    auto push_vs = [&](uint64_t prog_hash, const std::vector<uint32_t>& prog, uint16_t regs, uint64_t decode,
++                       bool also_quad) {
++        if (!regs || prog.empty()) return;
++        uint64_t k0 = ProgVsKey(prog_hash, regs, decode, false);
++        std::string base;
++        if (seen.insert(k0).second) {
++            base = ReversedDepthHlsl(VertexProgramHlsl(prog, regs, decode));
++            out.push_back(ShaderPrewarmItem{k0, false, base});
++        }
++        if (also_quad) {
++            uint64_t kq = ProgVsKey(prog_hash, regs, decode, true);
++            if (seen.insert(kq).second) {
++                if (base.empty()) base = ReversedDepthHlsl(VertexProgramHlsl(prog, regs, decode));
++                out.push_back(ShaderPrewarmItem{kq, false, QuadHlsl(base)});
++            }
++        }
++    };
++
++    for (const auto& vs : vs_list) {
++        if (vs.program.empty()) continue;
++        uint64_t prog_hash = vs.hash ? vs.hash : (Hash(vs.program.data(), vs.program.size() * 4) | 1ull);
++        uint16_t regs = 0, s0_regs = 0;
++        uint64_t raw_dec = 0, s0_dec = 0;
++        bool can_raw = false;
++        GuestVertexDecode(vs, regs, raw_dec, can_raw, &s0_regs, &s0_dec);
++        if (!regs) continue;
++        bool may_quad = std::popcount(regs) <= 2;
++        bool single_stream = (s0_regs == 0 || s0_regs == regs);
++        if (can_raw) {
++            push_vs(prog_hash, vs.program, regs, raw_dec, may_quad);
++        }
++        if (!can_raw || (raw_dec != 0 && single_stream && std::popcount(regs) <= 2)) {
++            push_vs(prog_hash, vs.program, regs, 0ull, may_quad);
++        }
++        if (s0_regs != 0 && s0_regs != regs) {
++            push_vs(prog_hash, vs.program, s0_regs, s0_dec, false);
++        }
++    }
++
++    for (const auto& ps_val : ps_list) {
++        auto ps_ptr = std::make_shared<PixelShader>(ps_val);
++        State s{};
++        ApplyPsDefToState(s, ps_ptr);
++        uint32_t tmodes = ps_val.def[54];
++        TexInfo t_swiz[4]{};
++        TexInfo t_rect0[4]{};
++        int active_stages = 0;
++        for (int i = 0; i < 4; ++i) {
++            uint32_t m = (tmodes >> (i * 5)) & 0x1Fu;
++            bool uses_2d = (m != 0 && m != 4 && m != 5 && m != 0xAu && m != 0x11u);
++            if (uses_2d) {
++                t_swiz[i].kind = (m == 2u) ? kTexCube : (m == 3u ? kTex3D : kTex2D);
++                t_rect0[i] = t_swiz[i];
++                ++active_stages;
++            }
++        }
++        if (t_rect0[0].kind == kTex2D) {
++            t_rect0[0].rect = 1;
++            t_rect0[0].flags = kTexTarget;
++        }
++        auto emit_pk = [&](const TexInfo ti[4], bool atest, bool quad) {
++            s.simple[kMAlphaTestEnable >> 2] = atest ? 1u : 0u;
++            PixelKey pk = MakePixelKey(s, ti);
++            pk.quad = quad ? 1u : 0u;
++            uint64_t key = Hash(&pk, sizeof(pk)) ^ pixel_key_salt;
++            if (seen.insert(key).second) {
++                out.push_back(ShaderPrewarmItem{key, true, PixelHlsl(pk)});
++            }
++        };
++        emit_pk(t_swiz, false, false);
++        emit_pk(t_swiz, true, false);
++        if (active_stages <= 2) {
++            emit_pk(t_swiz, false, true);
++            if (t_rect0[0].rect) {
++                emit_pk(t_rect0, false, true);
++                emit_pk(t_rect0, false, false);
++            }
++        }
++    }
++    return out;
++}
++
++std::vector<ShaderPrewarmItem> BuildCommonFixedShaderPrewarmBatch(uint64_t pixel_key_salt) {
++    std::vector<ShaderPrewarmItem> out;
++    std::unordered_set<uint64_t> seen;
++
++    // 1. Common D3D8 FVF fixed-function vertex shaders (2D UI/HUD/FMV XYZRHW + 3D unlit/lit geometry)
++    struct FvfSeed {
++        uint32_t fvf;
++        bool pretrans;
++        bool quad;
++        uint32_t light_flags;
++        uint32_t light_types;
++    };
++    static constexpr FvfSeed kFvfSeeds[] = {
++        {0x044u, true, true, 0u, 0u},    // XYZRHW | DIFFUSE (2D fades/boxes)
++        {0x144u, true, true, 0u, 0u},    // XYZRHW | DIFFUSE | TEX1 (2D UI, fonts, HUD, FMV)
++        {0x144u, true, false, 0u, 0u},   // XYZRHW | DIFFUSE | TEX1 (non-quad sprites/HUD strips)
++        {0x104u, true, true, 0u, 0u},    // XYZRHW | TEX1 (fullscreen blits/FMV)
++        {0x244u, true, true, 0u, 0u},    // XYZRHW | DIFFUSE | TEX2
++        {0x042u, false, false, 0u, 0u},  // XYZ | DIFFUSE (debug/lines/particles)
++        {0x142u, false, false, 0u, 0u},  // XYZ | DIFFUSE | TEX1 (unlit 3D decals/particles/sky)
++        {0x142u, false, true, 0u, 0u},   // XYZ | DIFFUSE | TEX1 (quad)
++        {0x102u, false, false, 0u, 0u},  // XYZ | TEX1
++        {0x242u, false, false, 0u, 0u},  // XYZ | DIFFUSE | TEX2 (lightmapped 3D)
++        {0x112u, false, false, 0u, 0u},  // XYZ | NORMAL | TEX1 (unlit)
++        {0x112u, false, false, 9u, 3u},  // XYZ | NORMAL | TEX1 (directional lit)
++        {0x152u, false, false, 0u, 0u},  // XYZ | NORMAL | DIFFUSE | TEX1 (unlit)
++        {0x152u, false, false, 0x109u, 3u},  // XYZ | NORMAL | DIFFUSE | TEX1 (lit vertex diffuse)
++    };
++    for (const auto& fs : kFvfSeeds) {
++        VertexShader vs{};
++        FvfInputs(fs.fvf, vs);
++        uint16_t regs = 0;
++        uint64_t dec = 0;
++        bool can_raw = false;
++        GuestVertexDecode(vs, regs, dec, can_raw);
++        if (!regs) continue;
++        State st{};
++        st.vs_handle = fs.fvf;
++        FixedKey fk = MakeFixedKey(st);
++        fk.light = fs.light_flags;
++        fk.types = fs.light_types;
++        uint64_t vk = FixedVsKey(fs.fvf, regs, can_raw ? dec : 0ull, fs.pretrans, fs.quad, fk);
++        if (seen.insert(vk).second) {
++            std::string hlsl = ReversedDepthHlsl(FixedVertexHlsl(regs, fs.pretrans, can_raw ? dec : 0ull, fk));
++            out.push_back(ShaderPrewarmItem{vk, false, fs.quad ? QuadHlsl(std::move(hlsl)) : std::move(hlsl)});
++        }
++    }
++
++    // 2. Common D3D8 fixed-function TextureStageState pixel shaders (UI, FMV, decals, opaque/alphatest 3D)
++    struct StageSeed {
++        uint32_t cop0, ca1_0, ca2_0, aop0, aa1_0, aa2_0;
++        uint8_t kind0, rect0;
++        uint32_t cop1, aop1;
++        bool alphatest;
++        bool quad;
++    };
++    // D3DTOP: 1=DISABLE, 2=SELECTARG1, 4=MODULATE, 5=MODULATE2X, 7=ADD; D3DTA: 0=DIFFUSE, 1=CURRENT, 2=TEXTURE, 3=TFACTOR
++    static constexpr StageSeed kPsSeeds[] = {
++        {2, 0, 1, 2, 0, 1, kTexNone, 0, 1, 1, false, true},   // Solid vertex diffuse quad (fades/bars)
++        {2, 0, 1, 2, 0, 1, kTexNone, 0, 1, 1, false, false},  // Solid vertex diffuse 3D
++        {2, 3, 1, 2, 3, 1, kTexNone, 0, 1, 1, false, true},   // Solid tfactor quad
++        {2, 2, 1, 2, 2, 1, kTex2D, 0, 1, 1, false, true},     // Texture-only 2D quad
++        {2, 2, 1, 2, 2, 1, kTex2D, 1, 1, 1, false, true},     // Linear/YUY2 FMV texture-only quad
++        {4, 2, 0, 4, 2, 0, kTex2D, 0, 1, 1, false, true},     // Modulate(tex, diffuse) 2D UI/HUD quad
++        {4, 2, 0, 4, 2, 0, kTex2D, 0, 1, 1, true, true},      // Modulate(tex, diffuse) alphatest UI/font quad
++        {4, 2, 0, 4, 2, 0, kTex2D, 1, 1, 1, false, true},     // Modulate(linear_tex, diffuse) splash/menu quad
++        {4, 2, 0, 4, 2, 0, kTex2D, 0, 1, 1, false, false},    // Modulate(tex, diffuse) standard 3D mesh/particles
++        {4, 2, 0, 4, 2, 0, kTex2D, 0, 1, 1, true, false},     // Modulate(tex, diffuse) alphatest 3D foliage/grates
++        {4, 2, 0, 2, 2, 0, kTex2D, 0, 1, 1, false, false},    // RGB modulate, Alpha = tex
++        {4, 2, 0, 2, 0, 0, kTex2D, 0, 1, 1, false, false},    // RGB modulate, Alpha = diffuse
++        {5, 2, 0, 4, 2, 0, kTex2D, 0, 1, 1, false, false},    // Modulate2X(tex, diffuse) 3D lit
++        {5, 2, 0, 4, 2, 0, kTex2D, 0, 1, 1, true, false},     // Modulate2X(tex, diffuse) alphatest
++        {4, 2, 3, 4, 2, 3, kTex2D, 0, 1, 1, false, true},     // Modulate(tex, tfactor) quad
++        {4, 2, 0, 4, 2, 0, kTex2D, 0, 4, 1, false, false},    // 2-stage Modulate lightmap
++        {4, 2, 0, 4, 2, 0, kTex2D, 0, 5, 1, false, false},    // 2-stage Modulate2X lightmap
++        {4, 2, 0, 4, 2, 0, kTex2D, 0, 7, 1, false, false},    // 2-stage Add detail/glow
++    };
++    for (const auto& ps : kPsSeeds) {
++        State st{};
++        st.tss[0][kTssColorOp] = ps.cop0;
++        st.tss[0][kTssColorArg1] = ps.ca1_0;
++        st.tss[0][kTssColorArg2] = ps.ca2_0;
++        st.tss[0][kTssAlphaOp] = ps.aop0;
++        st.tss[0][kTssAlphaArg1] = ps.aa1_0;
++        st.tss[0][kTssAlphaArg2] = ps.aa2_0;
++        st.tss[1][kTssColorOp] = ps.cop1;
++        st.tss[1][kTssColorArg1] = 2;
++        st.tss[1][kTssColorArg2] = 1;
++        st.tss[1][kTssAlphaOp] = ps.aop1;
++        st.tss[1][kTssAlphaArg1] = 2;
++        st.tss[1][kTssAlphaArg2] = 1;
++        st.tss[2][kTssColorOp] = 1;
++        st.tss[2][kTssAlphaOp] = 1;
++        st.tss[3][kTssColorOp] = 1;
++        st.tss[3][kTssAlphaOp] = 1;
++        st.simple[kMAlphaTestEnable >> 2] = ps.alphatest ? 1u : 0u;
++        TexInfo ti[4]{};
++        ti[0].kind = ps.kind0;
++        ti[0].rect = ps.rect0;
++        if (ps.cop1 > 1) ti[1].kind = kTex2D;
++        PixelKey pk = MakePixelKey(st, ti);
++        pk.quad = ps.quad ? 1u : 0u;
++        uint64_t key = Hash(&pk, sizeof(pk)) ^ pixel_key_salt;
++        if (seen.insert(key).second) {
++            out.push_back(ShaderPrewarmItem{key, true, PixelHlsl(pk)});
++        }
++    }
++    return out;
++}
++
+ }  // namespace gpu
 diff --git a/runtime/gpu/shaders.h b/runtime/gpu/shaders.h
-index 08d9bff..527490c 100644
+index 08d9bff..56aa462 100644
 --- a/runtime/gpu/shaders.h
 +++ b/runtime/gpu/shaders.h
 @@ -1,4 +1,5 @@
@@ -10413,7 +11379,28 @@ index 08d9bff..527490c 100644
  #include <cstdint>
  #include <string>
  #include <vector>
-@@ -103,8 +104,10 @@ struct DrawConstants {
+@@ -63,6 +64,20 @@ std::string ReversedDepthHlsl(std::string s);
+ // the geometry shader that draws a point as its console pixel
+ std::string PointHlsl();
+ 
++struct ShaderPrewarmItem {
++    uint64_t src_key = 0;
++    bool is_pixel = false;
++    std::string hlsl;
++};
++
++// Generates exact ahead-of-time HLSL sources & lookup keys for guest programmable VS / combiner PS definitions.
++std::vector<ShaderPrewarmItem> BuildGuestShaderPrewarmBatch(const std::vector<VertexShader>& vs_list,
++                                                            const std::vector<PixelShader>& ps_list,
++                                                            uint64_t pixel_key_salt);
++
++// Generates standard clean-room D3D8 fixed-function VS & PS combinations for cold-cache first-boot warmup.
++std::vector<ShaderPrewarmItem> BuildCommonFixedShaderPrewarmBatch(uint64_t pixel_key_salt);
++
+ // HLSL a backend extension adds; the defaults write the console path
+ struct ShaderHooks {
+     virtual ~ShaderHooks() = default;
+@@ -103,8 +118,10 @@ struct DrawConstants {
      float mat[5][4];     // material diffuse, ambient, specular, emissive, power
      float amb[4];        // D3DRS_AMBIENT
      float lt[8][7][4];   // per light: diffuse, specular, ambient, position range, direction falloff, attenuation, cos theta/2 phi/2
@@ -11169,7 +12156,7 @@ index b0facfb..028548a 100644
  #include "gpu/texture.h"
  
 diff --git a/runtime/gpu/vertex.cpp b/runtime/gpu/vertex.cpp
-index 0b95c4b..744db55 100644
+index 0b95c4b..213263a 100644
 --- a/runtime/gpu/vertex.cpp
 +++ b/runtime/gpu/vertex.cpp
 @@ -2,8 +2,13 @@
@@ -11186,12 +12173,63 @@ index 0b95c4b..744db55 100644
  
  #include "core/log.h"
  #include "kernel/kernel.h"
+@@ -434,6 +439,35 @@ void FvfInputs(uint32_t fvf, VertexShader& vs) {
+     vs.stream_stride[0] = off;
+ }
+ 
++void GuestVertexDecode(const VertexShader& vs, uint16_t& out_regs, uint64_t& out_raw_decode, bool& out_can_raw,
++                       uint16_t* out_stream0_regs, uint64_t* out_stream0_decode) {
++    out_regs = 0;
++    out_raw_decode = 0;
++    out_can_raw = true;
++    uint16_t s0_regs = 0;
++    uint64_t s0_dec = 0;
++    for (int r = 0; r < 16; ++r) {
++        const auto& in = vs.inputs[size_t(r)];
++        if (in.stream < 0 || !in.type || in.type == kTypeNone) continue;
++        out_regs |= uint16_t(1u << r);
++        HostElement he = HostFormat(in.type);
++        uint32_t stride = (size_t(in.stream) < vs.stream_stride.size()) ? vs.stream_stride[size_t(in.stream)] : 0u;
++        bool readable = he.format && stride && (stride % kStrideAlign == 0) && in.offset < kElementOffsetEnd &&
++                        (in.offset % std::min<uint32_t>(he.bytes, 4u) == 0);
++        if (!readable) {
++            out_can_raw = false;
++        } else {
++            out_raw_decode |= uint64_t(he.decode) << (r * 4);
++        }
++        if (in.stream == 0) {
++            s0_regs |= uint16_t(1u << r);
++            if (readable) s0_dec |= uint64_t(he.decode) << (r * 4);
++        }
++    }
++    if (out_stream0_regs) *out_stream0_regs = s0_regs;
++    if (out_stream0_decode) *out_stream0_decode = s0_dec;
++}
++
+ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* ip, Assembled& out) {
+     ResetAssembled(out);
+     if (!count || prim < 1 || prim > 10) return false;
+diff --git a/runtime/gpu/vertex.h b/runtime/gpu/vertex.h
+index 6bd6d0b..ac627f2 100644
+--- a/runtime/gpu/vertex.h
++++ b/runtime/gpu/vertex.h
+@@ -55,6 +55,10 @@ struct Assembled {
+ // the FVF bits translated to the register layout the XDK's declarations use
+ void FvfInputs(uint32_t fvf, VertexShader& out);
+ 
++// derives the declared input register mask and raw-IA decode mask directly from a guest VertexShader declaration
++void GuestVertexDecode(const VertexShader& vs, uint16_t& out_regs, uint64_t& out_raw_decode, bool& out_can_raw,
++                       uint16_t* out_stream0_regs = nullptr, uint64_t* out_stream0_decode = nullptr);
++
+ // false when there is nothing to draw
+ // indices: the title's 16 bit indices, null for an unindexed draw
+ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, Assembled& out);
 diff --git a/runtime/gpu/vulkan.cpp b/runtime/gpu/vulkan.cpp
 new file mode 100644
-index 0000000..ea449b5
+index 0000000..232d3f7
 --- /dev/null
 +++ b/runtime/gpu/vulkan.cpp
-@@ -0,0 +1,6569 @@
+@@ -0,0 +1,7316 @@
 +// Native Vulkan 1.2 backend for Linux x86_64 & Steam Deck (RADV / NVIDIA / Intel ANV / Mesa llvmpipe).
 +// Implements 100% parity with d3d12.cpp: reversed-Z D32_SFLOAT_S8_UINT, SizedTargetKey Swap(2)/Swap(4),
 +// glslang HLSL->SPIR-V compiler with persistent vk_shaders.bin & vk_psos_*.bin caches, negative-height
@@ -12295,6 +13333,20 @@ index 0000000..ea449b5
 +std::atomic<uint64_t> g_cache_bytes_stat{0};
 +std::atomic<bool> g_cache_reset_requested{false};
 +
++std::atomic<bool> g_warmup_active{false};
++std::atomic<bool> g_warmup_completed{false};
++std::atomic<uint32_t> g_warmup_done{0};
++std::atomic<uint32_t> g_warmup_total{0};
++std::atomic<uint32_t> g_warmup_compiled_new{0};
++std::atomic<uint64_t> g_warmup_elapsed_us{0};
++std::atomic<uint64_t> g_warmup_completed_ms{0};
++
++uint64_t NowMonoMs() {
++    return uint64_t(
++        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
++            .count());
++}
++
 +std::mutex g_bb_cap_lock;
 +std::filesystem::path g_bb_cap_path;
 +
@@ -12376,8 +13428,19 @@ index 0000000..ea449b5
 +
 +constexpr uint32_t kVkPsoMetaMagic = 0x50534F4Du;
 +constexpr uint32_t kVkPsoMetaVersion = 1u;
++constexpr uint32_t kRecipeCacheMagic = 0x43524258u;  // 'XBRC'
++constexpr uint32_t kRecipeCacheVersion = 1u;
 +constexpr VkDeviceSize kVkTexSlabSize = 32ull << 20;
 +constexpr VkDeviceSize kVkTexSlabMaxAlloc = 8ull << 20;
++
++struct RecipeCacheHeader {
++    uint32_t magic;
++    uint32_t version;
++    uint32_t sizeof_fixed_vs;
++    uint32_t sizeof_pixel_ps;
++    uint32_t fixed_vs_count;
++    uint32_t pixel_ps_count;
++};
 +
 +void WriteAtomicFilePosix(const std::filesystem::path& dst, const std::vector<uint8_t>& bytes) {
 +    if (bytes.empty()) return;
@@ -12843,6 +13906,7 @@ index 0000000..ea449b5
 +        queued_camera_ = cam;
 +        has_queued_camera_ = true;
 +    }
++    void PrewarmGuestShaders(const std::vector<VertexShader>& vs, const std::vector<PixelShader>& ps) override;
 +
 +private:
 +    struct Frame {
@@ -12874,6 +13938,19 @@ index 0000000..ea449b5
 +        uint64_t src_key = 0;
 +        uint64_t blob_hash = 0;
 +    };
++    struct FixedVsRecipe {
++        uint64_t vkey = 0;
++        uint64_t decode = 0;
++        FixedKey fk{};
++        uint16_t regs = 0;
++        uint8_t pretransformed = 0;
++        uint8_t quad = 0;
++        uint32_t pad = 0;
++    };
++    struct PixelRecipe {
++        uint64_t key = 0;
++        PixelKey pk{};
++    };
 +    struct CacheSaveJob {
 +        std::filesystem::path dir;
 +        bool write_shaders = false;
@@ -12884,6 +13961,8 @@ index 0000000..ea449b5
 +        bool write_meta = false;
 +        std::filesystem::path meta_path;
 +        std::vector<uint8_t> meta_bytes;
++        bool write_recipes = false;
++        std::vector<uint8_t> recipes_bytes;
 +    };
 +
 +    struct Alloc {
@@ -13015,8 +14094,14 @@ index 0000000..ea449b5
 +    std::filesystem::path PsoCachePath() const;
 +    std::filesystem::path PsoMetaPath() const;
 +    void InitCaches();
++    void PrewarmBuiltinPipelines();
++    size_t CompileBatchParallel(const std::vector<ShaderPrewarmItem>& batch);
++    size_t BuildDeferredPsos();
++    void DrainAsyncPrewarm(bool wait);
++    void StopAsyncPrewarm();
++    void LoadAndPrewarmRecipes();
 +    void PrewarmCachedPsos();
-+    void SaveCaches(bool sync = false);
++    void SaveCaches(bool sync = false, bool include_pso_lib = true);
 +    void StartSaveThread();
 +    void DrainSaveThread();
 +    void StopSaveThread();
@@ -13202,12 +14287,19 @@ index 0000000..ea449b5
 +    std::unordered_set<uint64_t> disk_blob_pending_;
 +    std::unordered_set<uint64_t> known_src_keys_;
 +    std::unordered_set<uint64_t> known_pso_keys_;
++    std::unordered_set<uint64_t> known_fixed_vs_recipes_;
++    std::unordered_set<uint64_t> known_pixel_ps_recipes_;
 +    std::vector<SrcMetaEntry> src_meta_entries_;
 +    std::vector<PsoKey> pso_meta_entries_;
++    std::vector<PsoKey> deferred_pso_keys_;
++    std::vector<FixedVsRecipe> fixed_vs_recipes_;
++    std::vector<PixelRecipe> pixel_ps_recipes_;
 +    VkPipelineCache pipe_cache_ = VK_NULL_HANDLE;
++    bool pso_cache_loaded_ = false;
 +    bool shaders_dirty_ = false;
 +    bool pso_dirty_ = false;
 +    bool meta_dirty_ = false;
++    bool recipes_dirty_ = false;
 +    uint64_t cache_dirty_frame_ = 0;
 +    std::mutex save_mtx_;
 +    std::condition_variable save_cv_;
@@ -13217,6 +14309,22 @@ index 0000000..ea449b5
 +    bool save_has_pending_ = false;
 +    bool save_writing_ = false;
 +    CacheSaveJob save_pending_{};
++    struct AsyncReadyShader {
++        uint64_t src_key = 0;
++        uint64_t blob_hash = 0;
++        std::vector<uint32_t> spv;
++    };
++    std::mutex async_pw_mtx_;
++    std::vector<AsyncReadyShader> async_pw_ready_;
++    std::vector<std::pair<uint64_t, uint64_t>> async_pw_links_;
++    std::thread async_pw_thread_;
++    std::atomic<bool> async_pw_running_{false};
++    std::atomic<bool> async_pw_done_flag_{false};
++    std::atomic<bool> async_pw_stop_{false};
++    PerfClock::time_point async_pw_t0_{};
++    size_t async_pw_vs_in_ = 0;
++    size_t async_pw_ps_in_ = 0;
++    size_t async_pw_compiled_ = 0;
 +
 +    std::unordered_map<uint64_t, VkShaderModule> shader_mods_;
 +    std::unordered_map<uint64_t, uint64_t> shader_src_;
@@ -13323,6 +14431,7 @@ index 0000000..ea449b5
 +};
 +
 +VulkanBackend::~VulkanBackend() {
++    StopAsyncPrewarm();
 +    if (dev_ != VK_NULL_HANDLE) {
 +        vk_.dev_wait_idle(dev_);
 +    }
@@ -14973,6 +16082,7 @@ index 0000000..ea449b5
 +        if (job.write_shaders) WriteAtomicFilePosix(job.dir / "vk_shaders.bin", job.shaders_bytes);
 +        if (job.write_pso) WriteAtomicFilePosix(job.pso_path, job.pso_bytes);
 +        if (job.write_meta) WriteAtomicFilePosix(job.meta_path, job.meta_bytes);
++        if (job.write_recipes) WriteAtomicFilePosix(job.dir / "shader_recipes.bin", job.recipes_bytes);
 +        {
 +            std::lock_guard<std::mutex> lock(save_mtx_);
 +            save_writing_ = false;
@@ -14996,6 +16106,9 @@ index 0000000..ea449b5
 +        ec.clear();
 +        auto msz = std::filesystem::file_size(PsoMetaPath(), ec);
 +        if (!ec) bytes += msz;
++        ec.clear();
++        auto rsz = std::filesystem::file_size(cache_dir_ / "shader_recipes.bin", ec);
++        if (!ec) bytes += rsz;
 +    }
 +    g_cache_bytes_stat.store(bytes, std::memory_order_relaxed);
 +}
@@ -15048,6 +16161,7 @@ index 0000000..ea449b5
 +        }
 +    }
 +
++    pso_cache_loaded_ = !pso_init_data.empty();
 +    VkPipelineCacheCreateInfo pcci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
 +    pcci.initialDataSize = pso_init_data.size();
 +    pcci.pInitialData = pso_init_data.empty() ? nullptr : pso_init_data.data();
@@ -15055,17 +16169,27 @@ index 0000000..ea449b5
 +
 +    LOGR("vulkan: cache initialized (enabled=%s, shaders_loaded=%zu, pso_blob=%zu B)",
 +         cache_enabled_ ? "true" : "false", loaded_shaders, pso_init_data.size());
++    auto boot_t0 = PerfClock::now();
++    g_warmup_active.store(true, std::memory_order_release);
++    PrewarmBuiltinPipelines();
 +    PrewarmCachedPsos();
++    LoadAndPrewarmRecipes();
++    g_warmup_elapsed_us.fetch_add(uint64_t(PerfMs(boot_t0) * 1000.0), std::memory_order_relaxed);
++    g_warmup_active.store(false, std::memory_order_release);
++    g_warmup_completed.store(true, std::memory_order_release);
++    g_warmup_completed_ms.store(NowMonoMs(), std::memory_order_release);
++    if (cache_enabled_ && (shaders_dirty_ || pso_dirty_ || meta_dirty_ || recipes_dirty_)) SaveCaches(false, true);
 +    PublishCacheStats();
 +}
 +
-+void VulkanBackend::SaveCaches(bool sync) {
++void VulkanBackend::SaveCaches(bool sync, bool include_pso_lib) {
 +    if (!cache_enabled_) return;
 +    CacheSaveJob job{};
 +    job.dir = cache_dir_;
 +    {
 +        std::lock_guard<std::mutex> lock(cache_lock_);
-+        if (!shaders_dirty_ && !pso_dirty_ && !meta_dirty_) {
++        bool want_pso = pso_dirty_ && (include_pso_lib || sync);
++        if (!shaders_dirty_ && !want_pso && !meta_dirty_ && !recipes_dirty_) {
 +            if (!sync) return;
 +        } else {
 +            cache_dirty_frame_ = presents_;
@@ -15093,7 +16217,7 @@ index 0000000..ea449b5
 +                job.write_shaders = true;
 +                shaders_dirty_ = false;
 +            }
-+            if (pso_dirty_ && pipe_cache_ != VK_NULL_HANDLE) {
++            if (want_pso && pipe_cache_ != VK_NULL_HANDLE) {
 +                size_t sz = 0;
 +                if (vk_.get_pipe_cache_data(dev_, pipe_cache_, &sz, nullptr) == VK_SUCCESS && sz > 0 &&
 +                    sz < (256u << 20)) {
@@ -15111,6 +16235,8 @@ index 0000000..ea449b5
 +                        job.pso_bytes.clear();
 +                    }
 +                }
++                pso_dirty_ = false;
++            } else if (want_pso) {
 +                pso_dirty_ = false;
 +            }
 +            if (meta_dirty_) {
@@ -15139,9 +16265,31 @@ index 0000000..ea449b5
 +                job.write_meta = true;
 +                meta_dirty_ = false;
 +            }
++            if (recipes_dirty_) {
++                RecipeCacheHeader rh{};
++                rh.magic = kRecipeCacheMagic;
++                rh.version = kRecipeCacheVersion;
++                rh.sizeof_fixed_vs = uint32_t(sizeof(FixedVsRecipe));
++                rh.sizeof_pixel_ps = uint32_t(sizeof(PixelRecipe));
++                rh.fixed_vs_count = uint32_t(fixed_vs_recipes_.size());
++                rh.pixel_ps_count = uint32_t(pixel_ps_recipes_.size());
++                size_t fv_bytes = fixed_vs_recipes_.size() * sizeof(FixedVsRecipe);
++                size_t pp_bytes = pixel_ps_recipes_.size() * sizeof(PixelRecipe);
++                job.recipes_bytes.resize(sizeof(rh) + fv_bytes + pp_bytes);
++                uint8_t* p = job.recipes_bytes.data();
++                std::memcpy(p, &rh, sizeof(rh));
++                p += sizeof(rh);
++                if (fv_bytes) {
++                    std::memcpy(p, fixed_vs_recipes_.data(), fv_bytes);
++                    p += fv_bytes;
++                }
++                if (pp_bytes) std::memcpy(p, pixel_ps_recipes_.data(), pp_bytes);
++                job.write_recipes = true;
++                recipes_dirty_ = false;
++            }
 +        }
 +    }
-+    if (job.write_shaders || job.write_pso || job.write_meta) {
++    if (job.write_shaders || job.write_pso || job.write_meta || job.write_recipes) {
 +        StartSaveThread();
 +        {
 +            std::lock_guard<std::mutex> lock(save_mtx_);
@@ -15160,6 +16308,10 @@ index 0000000..ea449b5
 +                save_pending_.meta_path = std::move(job.meta_path);
 +                save_pending_.meta_bytes = std::move(job.meta_bytes);
 +            }
++            if (job.write_recipes) {
++                save_pending_.write_recipes = true;
++                save_pending_.recipes_bytes = std::move(job.recipes_bytes);
++            }
 +            save_has_pending_ = true;
 +        }
 +        save_cv_.notify_one();
@@ -15168,6 +16320,7 @@ index 0000000..ea449b5
 +}
 +
 +void VulkanBackend::ResetCaches() {
++    StopAsyncPrewarm();
 +    Flush();
 +    DrainSaveThread();
 +    {
@@ -15176,11 +16329,17 @@ index 0000000..ea449b5
 +        disk_blob_pending_.clear();
 +        known_src_keys_.clear();
 +        known_pso_keys_.clear();
++        known_fixed_vs_recipes_.clear();
++        known_pixel_ps_recipes_.clear();
 +        src_meta_entries_.clear();
 +        pso_meta_entries_.clear();
++        deferred_pso_keys_.clear();
++        fixed_vs_recipes_.clear();
++        pixel_ps_recipes_.clear();
 +        shaders_dirty_ = false;
 +        pso_dirty_ = false;
 +        meta_dirty_ = false;
++        recipes_dirty_ = false;
 +        if (pipe_cache_ != VK_NULL_HANDLE) {
 +            vk_.destroy_pipe_cache(dev_, pipe_cache_, nullptr);
 +            pipe_cache_ = VK_NULL_HANDLE;
@@ -15189,6 +16348,8 @@ index 0000000..ea449b5
 +            std::error_code ec;
 +            std::filesystem::remove(cache_dir_ / "vk_shaders.bin", ec);
 +            std::filesystem::remove(cache_dir_ / "vk_shaders.bin.tmp", ec);
++            std::filesystem::remove(cache_dir_ / "shader_recipes.bin", ec);
++            std::filesystem::remove(cache_dir_ / "shader_recipes.bin.tmp", ec);
 +            for (auto& e : std::filesystem::directory_iterator(cache_dir_, ec)) {
 +                std::string fn = e.path().filename().string();
 +                if (fn.rfind("vk_psos_", 0) == 0 || fn.rfind("vk_pso_meta_", 0) == 0)
@@ -15203,7 +16364,8 @@ index 0000000..ea449b5
 +}
 +
 +void VulkanBackend::FlushCaches() {
-+    SaveCaches(true);
++    DrainAsyncPrewarm(true);
++    SaveCaches(true, true);
 +    PublishCacheStats();
 +}
 +
@@ -15404,6 +16566,584 @@ index 0000000..ea449b5
 +    return pipe;
 +}
 +
++void VulkanBackend::PrewarmBuiltinPipelines() {
++    VkFormat fmts[3] = {swap_fmt_, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
++    for (VkFormat fmt : fmts) {
++        if (fmt == VK_FORMAT_UNDEFINED) continue;
++        EnsureBlitPipeline(fmt, false);
++        EnsureBlitPipeline(fmt, true);
++        static constexpr uint8_t kClearMasks[] = {0x7, 0x8, 0x1, 0x2, 0x4};
++        for (uint8_t m : kClearMasks) EnsureClearPipeline(fmt, m);
++    }
++    EnsureDepthCopyPipeline();
++    uint64_t gh = 0;
++    Compile(PointHlsl(), "main", "gs_5_0", gh);
++    Compile(SpriteHlsl(), "main", "gs_5_0", gh);
++}
++
++size_t VulkanBackend::CompileBatchParallel(const std::vector<ShaderPrewarmItem>& batch) {
++    if (batch.empty()) return 0;
++    struct WorkItem {
++        uint64_t src_key = 0;
++        uint64_t blob_hash = 0;
++        bool is_pixel = false;
++        const std::string* hlsl = nullptr;
++    };
++    std::vector<WorkItem> work;
++    work.reserve(batch.size());
++    std::unordered_set<uint64_t> queued_blobs;
++    std::vector<std::pair<uint64_t, uint64_t>> already_cached_links;
++
++    for (const auto& item : batch) {
++        if (shader_src_.count(item.src_key)) continue;
++        const char* profile = item.is_pixel ? "ps_5_0" : "vs_5_0";
++        uint64_t pseed = Hash(profile, std::strlen(profile));
++        uint64_t eseed = Hash("main", 4, pseed);
++        uint64_t bhash = Hash(item.hlsl.data(), item.hlsl.size(), eseed);
++        auto bit = shader_mods_.find(bhash);
++        if (bit != shader_mods_.end() && bit->second != VK_NULL_HANDLE) {
++            already_cached_links.emplace_back(item.src_key, bhash);
++            continue;
++        }
++        if (queued_blobs.insert(bhash).second) {
++            work.push_back(WorkItem{item.src_key, bhash, item.is_pixel, &item.hlsl});
++        } else {
++            already_cached_links.emplace_back(item.src_key, bhash);
++        }
++    }
++
++    for (const auto& [skey, bhash] : already_cached_links) {
++        auto bit = shader_mods_.find(bhash);
++        if (bit != shader_mods_.end() && bit->second != VK_NULL_HANDLE) {
++            shader_src_[skey] = bhash;
++            if (cache_enabled_) {
++                std::lock_guard<std::mutex> lock(cache_lock_);
++                if (known_src_keys_.insert(skey).second) {
++                    src_meta_entries_.push_back(SrcMetaEntry{skey, bhash});
++                    meta_dirty_ = true;
++                    cache_dirty_frame_ = presents_;
++                }
++            }
++        }
++    }
++
++    if (work.empty()) return 0;
++
++    // Ensure glslang is initialized once before worker threads run
++    {
++        std::vector<uint32_t> dummy_spv;
++        std::string dummy_err;
++        static bool glslang_ready = false;
++        if (!glslang_ready) {
++            glslang_ready = true;
++            CompileHlslToSpirv("float4 main() : SV_Target { return 0; }", "main", "ps_5_0", dummy_spv, dummy_err);
++        }
++    }
++
++    g_warmup_total.fetch_add(uint32_t(work.size()), std::memory_order_relaxed);
++    std::vector<std::vector<uint32_t>> out_spv(work.size());
++    std::atomic<size_t> cursor{0};
++    uint32_t max_jobs = std::max<uint32_t>(1u, app::RecommendedCompileJobs());
++    uint32_t n_threads = std::min<uint32_t>({12u, max_jobs, uint32_t(work.size())});
++
++    auto worker = [&] {
++        for (;;) {
++            size_t idx = cursor.fetch_add(1, std::memory_order_relaxed);
++            if (idx >= work.size()) break;
++            const WorkItem& w = work[idx];
++            const char* profile = w.is_pixel ? "ps_5_0" : "vs_5_0";
++            std::vector<uint32_t> spv;
++            std::string err;
++            if (CompileHlslToSpirv(*w.hlsl, "main", profile, spv, err) && !spv.empty()) {
++                out_spv[idx] = std::move(spv);
++            }
++            g_warmup_done.fetch_add(1u, std::memory_order_relaxed);
++        }
++    };
++
++    std::vector<std::thread> pool;
++    pool.reserve(n_threads > 1 ? n_threads - 1 : 0);
++    for (uint32_t t = 1; t < n_threads; ++t) pool.emplace_back(worker);
++    worker();
++    for (auto& th : pool) th.join();
++
++    size_t compiled = 0;
++    for (size_t i = 0; i < work.size(); ++i) {
++        if (out_spv[i].empty()) continue;
++        const WorkItem& w = work[i];
++        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++        ci.codeSize = out_spv[i].size() * sizeof(uint32_t);
++        ci.pCode = out_spv[i].data();
++        VkShaderModule mod = VK_NULL_HANDLE;
++        if (vk_.create_shader(dev_, &ci, nullptr, &mod) != VK_SUCCESS || mod == VK_NULL_HANDLE) continue;
++        shader_mods_[w.blob_hash] = mod;
++        shader_src_[w.src_key] = w.blob_hash;
++        ++compiled;
++        if (cache_enabled_) {
++            std::lock_guard<std::mutex> lock(cache_lock_);
++            shader_cache_entries_.emplace_back(w.blob_hash, std::move(out_spv[i]));
++            shaders_dirty_ = true;
++            if (known_src_keys_.insert(w.src_key).second) {
++                src_meta_entries_.push_back(SrcMetaEntry{w.src_key, w.blob_hash});
++                meta_dirty_ = true;
++            }
++            cache_dirty_frame_ = presents_;
++        }
++    }
++    for (const auto& [skey, bhash] : already_cached_links) {
++        auto bit = shader_mods_.find(bhash);
++        if (bit != shader_mods_.end() && bit->second != VK_NULL_HANDLE && !shader_src_.count(skey)) {
++            shader_src_[skey] = bhash;
++            if (cache_enabled_) {
++                std::lock_guard<std::mutex> lock(cache_lock_);
++                if (known_src_keys_.insert(skey).second) {
++                    src_meta_entries_.push_back(SrcMetaEntry{skey, bhash});
++                    meta_dirty_ = true;
++                }
++            }
++        }
++    }
++    g_warmup_compiled_new.fetch_add(uint32_t(compiled), std::memory_order_relaxed);
++    return compiled;
++}
++
++void VulkanBackend::LoadAndPrewarmRecipes() {
++    constexpr uint64_t kSalt = 0x9E3779B97F4A7C15ull;
++    std::vector<ShaderPrewarmItem> batch;
++
++    if (cache_enabled_ && !cache_dir_.empty()) {
++        std::filesystem::path rpath = cache_dir_ / "shader_recipes.bin";
++        std::error_code ec;
++        auto fsize = std::filesystem::file_size(rpath, ec);
++        if (!ec && fsize >= sizeof(RecipeCacheHeader)) {
++            if (FILE* f = std::fopen(rpath.c_str(), "rb")) {
++                RecipeCacheHeader rh{};
++                bool ok = std::fread(&rh, sizeof(rh), 1, f) == 1 && rh.magic == kRecipeCacheMagic &&
++                          rh.version == kRecipeCacheVersion && rh.sizeof_fixed_vs == sizeof(FixedVsRecipe) &&
++                          rh.sizeof_pixel_ps == sizeof(PixelRecipe) && rh.fixed_vs_count <= 65536u &&
++                          rh.pixel_ps_count <= 65536u;
++                uint64_t expect = uint64_t(sizeof(rh)) + uint64_t(rh.fixed_vs_count) * sizeof(FixedVsRecipe) +
++                                  uint64_t(rh.pixel_ps_count) * sizeof(PixelRecipe);
++                if (ok && expect == fsize) {
++                    std::vector<FixedVsRecipe> fv(rh.fixed_vs_count);
++                    std::vector<PixelRecipe> pp(rh.pixel_ps_count);
++                    if (rh.fixed_vs_count &&
++                        std::fread(fv.data(), sizeof(FixedVsRecipe), rh.fixed_vs_count, f) != rh.fixed_vs_count)
++                        ok = false;
++                    if (ok && rh.pixel_ps_count &&
++                        std::fread(pp.data(), sizeof(PixelRecipe), rh.pixel_ps_count, f) != rh.pixel_ps_count)
++                        ok = false;
++                    if (ok) {
++                        for (const auto& r : fv) {
++                            if (known_fixed_vs_recipes_.insert(r.vkey).second) fixed_vs_recipes_.push_back(r);
++                            if (!shader_src_.count(r.vkey)) {
++                                std::string hlsl = ReversedDepthHlsl(
++                                    FixedVertexHlsl(r.regs, r.pretransformed != 0, r.decode, r.fk));
++                                batch.push_back(ShaderPrewarmItem{
++                                    r.vkey, false, r.quad ? QuadHlsl(std::move(hlsl)) : std::move(hlsl)});
++                            }
++                        }
++                        for (const auto& r : pp) {
++                            if (known_pixel_ps_recipes_.insert(r.key).second) pixel_ps_recipes_.push_back(r);
++                            if (!shader_src_.count(r.key)) {
++                                batch.push_back(ShaderPrewarmItem{r.key, true, PixelHlsl(r.pk)});
++                            }
++                        }
++                    }
++                }
++                std::fclose(f);
++            }
++        }
++    }
++
++    auto seeds = BuildCommonFixedShaderPrewarmBatch(kSalt);
++    for (auto& s : seeds) {
++        if (!shader_src_.count(s.src_key)) batch.push_back(std::move(s));
++    }
++    if (!batch.empty()) {
++        auto t0 = PerfClock::now();
++        size_t n = CompileBatchParallel(batch);
++        if (n > 0) {
++            LOGR("vulkan: pre-compiled %zu fixed/recipe shaders at startup in %.1f ms", n, PerfMs(t0));
++        }
++    }
++}
++
++size_t VulkanBackend::BuildDeferredPsos() {
++    if (deferred_pso_keys_.empty()) return 0;
++    std::vector<PsoKey> remaining;
++    uint64_t gh = 0;
++    VkShaderModule point_gs = Compile(PointHlsl(), "main", "gs_5_0", gh);
++    VkShaderModule sprite_gs = Compile(SpriteHlsl(), "main", "gs_5_0", gh);
++    struct DeferredItem {
++        uint64_t hash = 0;
++        PsoKey k{};
++        VkShaderModule vs = VK_NULL_HANDLE;
++        VkShaderModule ps = VK_NULL_HANDLE;
++        VkShaderModule gs = VK_NULL_HANDLE;
++        VkRenderPass rp = VK_NULL_HANDLE;
++    };
++    std::vector<DeferredItem> ready;
++    for (const auto& k : deferred_pso_keys_) {
++        uint64_t h = Hash(&k, sizeof(k));
++        if (psos_.count(h)) continue;
++        auto vit = shader_mods_.find(k.vs);
++        auto pit = shader_mods_.find(k.ps);
++        if (vit == shader_mods_.end() || vit->second == VK_NULL_HANDLE || pit == shader_mods_.end() ||
++            pit->second == VK_NULL_HANDLE) {
++            remaining.push_back(k);
++            continue;
++        }
++        VkShaderModule gs =
++            (k.topo == uint32_t(Topology::Points)) ? (k.sprite ? sprite_gs : point_gs) : VK_NULL_HANDLE;
++        VkRenderPass rp = GetRenderPass(k.has_rt ? VkFormat(k.rtfmt) : VK_FORMAT_UNDEFINED,
++                                        k.has_ds ? depth_fmt_ : VK_FORMAT_UNDEFINED);
++        if (rp == VK_NULL_HANDLE) continue;
++        ready.push_back(DeferredItem{h, k, vit->second, pit->second, gs, rp});
++    }
++    deferred_pso_keys_ = std::move(remaining);
++    if (ready.empty()) return 0;
++
++    std::vector<VkPipeline> out_pipes(ready.size(), VK_NULL_HANDLE);
++    std::atomic<size_t> cursor{0};
++    uint32_t max_jobs = std::max<uint32_t>(1u, app::RecommendedCompileJobs());
++    uint32_t n_threads = std::min<uint32_t>({12u, max_jobs, uint32_t(ready.size())});
++    auto worker = [&] {
++        for (;;) {
++            size_t idx = cursor.fetch_add(1, std::memory_order_relaxed);
++            if (idx >= ready.size()) break;
++            const auto& it = ready[idx];
++            const PsoKey& k = it.k;
++            VkPipelineShaderStageCreateInfo stages[3]{};
++            uint32_t stage_cnt = 0;
++            stages[stage_cnt++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
++                                   VK_SHADER_STAGE_VERTEX_BIT, it.vs, "main", nullptr};
++            bool expanded_points = false;
++            if (k.topo == uint32_t(Topology::Points) && it.gs != VK_NULL_HANDLE) {
++                stages[stage_cnt++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
++                                       VK_SHADER_STAGE_GEOMETRY_BIT, it.gs, "main", nullptr};
++                expanded_points = true;
++            }
++            stages[stage_cnt++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
++                                   VK_SHADER_STAGE_FRAGMENT_BIT, it.ps, "main", nullptr};
++            VkVertexInputBindingDescription vbinds[16]{};
++            for (uint32_t i = 0; i < k.buf_count && i < 16; ++i)
++                vbinds[i] = {i, k.strides[i], VK_VERTEX_INPUT_RATE_VERTEX};
++            VkVertexInputAttributeDescription vattrs[16]{};
++            uint32_t attr_cnt = 0;
++            for (uint32_t r = 0; r < 16; ++r) {
++                if (!((k.regs >> r) & 1)) continue;
++                uint32_t e = k.elements[r];
++                vattrs[attr_cnt++] = {r, (e >> 8) & 0xFF, DxgiToVkFormat(DXGI_FORMAT(e & 0xFF)), e >> 16};
++            }
++            VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++            vi.vertexBindingDescriptionCount = std::min<uint32_t>(k.buf_count, 16u);
++            vi.pVertexBindingDescriptions = vbinds;
++            vi.vertexAttributeDescriptionCount = attr_cnt;
++            vi.pVertexAttributeDescriptions = vattrs;
++            VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++            ia.topology = VkTopologyOf(k.topo, k.strip);
++            VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++            vp.viewportCount = 1;
++            vp.scissorCount = 1;
++            VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++            rs.polygonMode = (!expanded_points && k.fill == kFillWireframe) ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
++            rs.cullMode = (!expanded_points && k.cull) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
++            rs.frontFace = (!expanded_points && k.ccw) ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
++            rs.depthBiasEnable = (k.zbias != 0 || k.zslope != 0.0f) ? VK_TRUE : VK_FALSE;
++            rs.depthBiasConstantFactor = float(k.zbias);
++            rs.depthBiasSlopeFactor = k.zslope;
++            rs.lineWidth = 1.0f;
++            VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++            VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
++            ds.depthTestEnable = k.zen ? VK_TRUE : VK_FALSE;
++            ds.depthWriteEnable = k.zwrite ? VK_TRUE : VK_FALSE;
++            ds.depthCompareOp = ReversedCmpVk(k.zfunc);
++            ds.stencilTestEnable = k.sten ? VK_TRUE : VK_FALSE;
++            VkStencilOpState sop{};
++            sop.failOp = StencilOpVk(k.sfail);
++            sop.passOp = StencilOpVk(k.spass);
++            sop.depthFailOp = StencilOpVk(k.szfail);
++            sop.compareOp = CmpVk(k.sfunc);
++            sop.compareMask = k.smask;
++            sop.writeMask = k.swmask;
++            ds.front = ds.back = sop;
++            VkPipelineColorBlendAttachmentState ba{};
++            ba.blendEnable = k.blend ? VK_TRUE : VK_FALSE;
++            ba.srcColorBlendFactor = BlendFactor(k.src, false);
++            ba.dstColorBlendFactor = BlendFactor(k.dst, false);
++            ba.colorBlendOp = BlendOpVk(k.op);
++            ba.srcAlphaBlendFactor = BlendFactor(k.src, true);
++            ba.dstAlphaBlendFactor = BlendFactor(k.dst, true);
++            ba.alphaBlendOp = BlendOpVk(k.op);
++            ba.colorWriteMask = k.wmask & 0xF;
++            VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++            cb.attachmentCount = k.has_rt ? 1u : 0u;
++            cb.pAttachments = k.has_rt ? &ba : nullptr;
++            VkDynamicState dyn_states[4] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
++                                            VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE};
++            VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++            dyn.dynamicStateCount = 4;
++            dyn.pDynamicStates = dyn_states;
++            VkGraphicsPipelineCreateInfo gi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++            gi.stageCount = stage_cnt;
++            gi.pStages = stages;
++            gi.pVertexInputState = &vi;
++            gi.pInputAssemblyState = &ia;
++            gi.pViewportState = &vp;
++            gi.pRasterizationState = &rs;
++            gi.pMultisampleState = &ms;
++            gi.pDepthStencilState = &ds;
++            gi.pColorBlendState = &cb;
++            gi.pDynamicState = &dyn;
++            gi.layout = gfx_layout_;
++            gi.renderPass = it.rp;
++            gi.subpass = 0;
++            VkPipeline pipe = VK_NULL_HANDLE;
++            if (vk_.create_gfx_pipes(dev_, pipe_cache_, 1, &gi, nullptr, &pipe) == VK_SUCCESS) {
++                out_pipes[idx] = pipe;
++            }
++        }
++    };
++    std::vector<std::thread> pool;
++    pool.reserve(n_threads > 1 ? n_threads - 1 : 0);
++    for (uint32_t t = 1; t < n_threads; ++t) pool.emplace_back(worker);
++    worker();
++    for (auto& th : pool) th.join();
++
++    size_t deferred_built = 0;
++    for (size_t i = 0; i < ready.size(); ++i) {
++        if (out_pipes[i] == VK_NULL_HANDLE) continue;
++        psos_[ready[i].hash] = out_pipes[i];
++        if (known_pso_keys_.insert(ready[i].hash).second) pso_meta_entries_.push_back(ready[i].k);
++        pso_dirty_ = true;
++        ++deferred_built;
++    }
++    return deferred_built;
++}
++
++void VulkanBackend::DrainAsyncPrewarm(bool wait) {
++    if (!async_pw_running_.load(std::memory_order_acquire)) return;
++    if (wait && async_pw_thread_.joinable()) async_pw_thread_.join();
++
++    auto ingest = [&](std::vector<AsyncReadyShader>& list) {
++        for (auto& r : list) {
++            if (r.spv.empty()) continue;
++            bool new_mod = !shader_mods_.count(r.blob_hash) || shader_mods_[r.blob_hash] == VK_NULL_HANDLE;
++            if (new_mod) {
++                VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++                ci.codeSize = r.spv.size() * sizeof(uint32_t);
++                ci.pCode = r.spv.data();
++                VkShaderModule mod = VK_NULL_HANDLE;
++                if (vk_.create_shader(dev_, &ci, nullptr, &mod) != VK_SUCCESS || mod == VK_NULL_HANDLE) continue;
++                shader_mods_[r.blob_hash] = mod;
++                ++async_pw_compiled_;
++                g_warmup_compiled_new.fetch_add(1u, std::memory_order_relaxed);
++            }
++            shader_src_[r.src_key] = r.blob_hash;
++            if (cache_enabled_) {
++                std::lock_guard<std::mutex> lock(cache_lock_);
++                if (new_mod) {
++                    shader_cache_entries_.emplace_back(r.blob_hash, std::move(r.spv));
++                    shaders_dirty_ = true;
++                }
++                if (known_src_keys_.insert(r.src_key).second) {
++                    src_meta_entries_.push_back(SrcMetaEntry{r.src_key, r.blob_hash});
++                    meta_dirty_ = true;
++                }
++                cache_dirty_frame_ = presents_;
++            }
++        }
++    };
++
++    std::vector<AsyncReadyShader> ready;
++    {
++        std::lock_guard<std::mutex> lock(async_pw_mtx_);
++        ready.swap(async_pw_ready_);
++    }
++    ingest(ready);
++
++    if (wait || async_pw_done_flag_.load(std::memory_order_acquire)) {
++        if (async_pw_thread_.joinable()) async_pw_thread_.join();
++        std::vector<AsyncReadyShader> tail;
++        {
++            std::lock_guard<std::mutex> lock(async_pw_mtx_);
++            tail.swap(async_pw_ready_);
++        }
++        ingest(tail);
++        for (const auto& [skey, bhash] : async_pw_links_) {
++            auto bit = shader_mods_.find(bhash);
++            if (bit != shader_mods_.end() && bit->second != VK_NULL_HANDLE && !shader_src_.count(skey)) {
++                shader_src_[skey] = bhash;
++                if (cache_enabled_) {
++                    std::lock_guard<std::mutex> lock(cache_lock_);
++                    if (known_src_keys_.insert(skey).second) {
++                        src_meta_entries_.push_back(SrcMetaEntry{skey, bhash});
++                        meta_dirty_ = true;
++                    }
++                }
++            }
++        }
++        async_pw_links_.clear();
++        async_pw_running_.store(false, std::memory_order_release);
++        size_t deferred_built = BuildDeferredPsos();
++        double ms = PerfMs(async_pw_t0_);
++        g_warmup_elapsed_us.fetch_add(uint64_t(ms * 1000.0), std::memory_order_relaxed);
++        g_warmup_active.store(false, std::memory_order_release);
++        g_warmup_completed.store(true, std::memory_order_release);
++        g_warmup_completed_ms.store(NowMonoMs(), std::memory_order_release);
++        if (async_pw_compiled_ > 0 || deferred_built > 0) {
++            LOGR("vulkan: guest shader prewarm done in %.1f ms (async, vs_in=%zu, ps_in=%zu, compiled_new=%zu, deferred_psos=%zu, total_shaders=%zu)",
++                 ms, async_pw_vs_in_, async_pw_ps_in_, async_pw_compiled_, deferred_built,
++                 shader_cache_entries_.size());
++            SaveCaches(false, !frame_camera_.is_3d_gameplay);
++        }
++        PublishCacheStats();
++    }
++}
++
++void VulkanBackend::StopAsyncPrewarm() {
++    if (!async_pw_running_.load(std::memory_order_acquire) && !async_pw_thread_.joinable()) return;
++    async_pw_stop_.store(true, std::memory_order_release);
++    DrainAsyncPrewarm(true);
++    async_pw_stop_.store(false, std::memory_order_release);
++}
++
++void VulkanBackend::PrewarmGuestShaders(const std::vector<VertexShader>& vs_list,
++                                        const std::vector<PixelShader>& ps_list) {
++    if (vs_list.empty() && ps_list.empty()) return;
++    if (async_pw_running_.load(std::memory_order_acquire)) DrainAsyncPrewarm(true);
++    constexpr uint64_t kSalt = 0x9E3779B97F4A7C15ull;
++    auto t0 = PerfClock::now();
++    auto batch = BuildGuestShaderPrewarmBatch(vs_list, ps_list, kSalt);
++
++    struct AsyncWorkItem {
++        uint64_t src_key = 0;
++        uint64_t blob_hash = 0;
++        bool is_pixel = false;
++        std::string hlsl;
++    };
++    std::vector<AsyncWorkItem> work;
++    std::unordered_set<uint64_t> queued_blobs;
++    std::vector<std::pair<uint64_t, uint64_t>> cached_links;
++    std::vector<std::pair<uint64_t, uint64_t>> secondary_links;
++
++    for (auto& item : batch) {
++        if (shader_src_.count(item.src_key)) continue;
++        const char* profile = item.is_pixel ? "ps_5_0" : "vs_5_0";
++        uint64_t pseed = Hash(profile, std::strlen(profile));
++        uint64_t eseed = Hash("main", 4, pseed);
++        uint64_t bhash = Hash(item.hlsl.data(), item.hlsl.size(), eseed);
++        auto bit = shader_mods_.find(bhash);
++        if (bit != shader_mods_.end() && bit->second != VK_NULL_HANDLE) {
++            cached_links.emplace_back(item.src_key, bhash);
++            continue;
++        }
++        if (queued_blobs.insert(bhash).second) {
++            work.push_back(AsyncWorkItem{item.src_key, bhash, item.is_pixel, std::move(item.hlsl)});
++        } else {
++            secondary_links.emplace_back(item.src_key, bhash);
++        }
++    }
++
++    for (const auto& [skey, bhash] : cached_links) {
++        shader_src_[skey] = bhash;
++        if (cache_enabled_) {
++            std::lock_guard<std::mutex> lock(cache_lock_);
++            if (known_src_keys_.insert(skey).second) {
++                src_meta_entries_.push_back(SrcMetaEntry{skey, bhash});
++                meta_dirty_ = true;
++                cache_dirty_frame_ = presents_;
++            }
++        }
++    }
++
++    bool sync_mode = !cli_cap_bmp_.empty() || app::IsReplayOrAutotestActive() || work.size() <= 32;
++    if (!work.empty() && !sync_mode) {
++        {
++            std::vector<uint32_t> dummy_spv;
++            std::string dummy_err;
++            CompileHlslToSpirv("float4 main() : SV_Target { return 0; }", "main", "ps_5_0", dummy_spv, dummy_err);
++        }
++        g_warmup_active.store(true, std::memory_order_release);
++        g_warmup_total.fetch_add(uint32_t(work.size()), std::memory_order_relaxed);
++        async_pw_t0_ = t0;
++        async_pw_vs_in_ = vs_list.size();
++        async_pw_ps_in_ = ps_list.size();
++        async_pw_compiled_ = 0;
++        async_pw_links_ = std::move(secondary_links);
++        async_pw_done_flag_.store(false, std::memory_order_release);
++        async_pw_stop_.store(false, std::memory_order_release);
++        async_pw_running_.store(true, std::memory_order_release);
++
++        uint32_t max_jobs = std::max<uint32_t>(1u, app::RecommendedCompileJobs());
++        uint32_t n_threads = std::min<uint32_t>({10u, max_jobs, uint32_t(work.size())});
++        async_pw_thread_ = std::thread([this, wlist = std::move(work), n_threads]() {
++            std::atomic<size_t> cursor{0};
++            auto worker = [&] {
++                for (;;) {
++                    if (async_pw_stop_.load(std::memory_order_relaxed)) break;
++                    size_t idx = cursor.fetch_add(1, std::memory_order_relaxed);
++                    if (idx >= wlist.size()) break;
++                    const auto& w = wlist[idx];
++                    const char* profile = w.is_pixel ? "ps_5_0" : "vs_5_0";
++                    std::vector<uint32_t> spv;
++                    std::string err;
++                    if (CompileHlslToSpirv(w.hlsl, "main", profile, spv, err) && !spv.empty()) {
++                        std::lock_guard<std::mutex> lock(async_pw_mtx_);
++                        async_pw_ready_.push_back(AsyncReadyShader{w.src_key, w.blob_hash, std::move(spv)});
++                    }
++                    g_warmup_done.fetch_add(1u, std::memory_order_relaxed);
++                }
++            };
++            std::vector<std::thread> pool;
++            pool.reserve(n_threads > 1 ? n_threads - 1 : 0);
++            for (uint32_t t = 1; t < n_threads; ++t) pool.emplace_back(worker);
++            worker();
++            for (auto& th : pool) th.join();
++            async_pw_done_flag_.store(true, std::memory_order_release);
++        });
++        return;
++    }
++
++    size_t compiled = 0;
++    if (!work.empty()) {
++        g_warmup_active.store(true, std::memory_order_release);
++        std::vector<ShaderPrewarmItem> sync_batch;
++        sync_batch.reserve(work.size());
++        for (auto& w : work) sync_batch.push_back(ShaderPrewarmItem{w.src_key, w.is_pixel, std::move(w.hlsl)});
++        compiled = CompileBatchParallel(sync_batch);
++        for (const auto& [skey, bhash] : secondary_links) {
++            auto bit = shader_mods_.find(bhash);
++            if (bit != shader_mods_.end() && bit->second != VK_NULL_HANDLE && !shader_src_.count(skey)) {
++                shader_src_[skey] = bhash;
++                if (cache_enabled_) {
++                    std::lock_guard<std::mutex> lock(cache_lock_);
++                    if (known_src_keys_.insert(skey).second) {
++                        src_meta_entries_.push_back(SrcMetaEntry{skey, bhash});
++                        meta_dirty_ = true;
++                    }
++                }
++            }
++        }
++    }
++
++    size_t deferred_built = BuildDeferredPsos();
++    double ms = PerfMs(t0);
++    g_warmup_elapsed_us.fetch_add(uint64_t(ms * 1000.0), std::memory_order_relaxed);
++    g_warmup_active.store(false, std::memory_order_release);
++    g_warmup_completed.store(true, std::memory_order_release);
++    g_warmup_completed_ms.store(NowMonoMs(), std::memory_order_release);
++
++    if (compiled > 0 || deferred_built > 0) {
++        LOGR("vulkan: guest shader prewarm done in %.1f ms (vs_in=%zu, ps_in=%zu, compiled_new=%zu, deferred_psos=%zu, total_shaders=%zu)",
++             ms, vs_list.size(), ps_list.size(), compiled, deferred_built, shader_cache_entries_.size());
++        SaveCaches(false, presents_ == 0 || !frame_camera_.is_3d_gameplay);
++    }
++    PublishCacheStats();
++}
++
 +void VulkanBackend::PrewarmCachedPsos() {
 +    if (!cache_enabled_ || cache_dir_.empty()) return;
 +    std::filesystem::path meta_path = PsoMetaPath();
@@ -15413,12 +17153,10 @@ index 0000000..ea449b5
 +    FILE* f = std::fopen(meta_path.c_str(), "rb");
 +    if (!f) return;
 +    VkPsoMetaHeader hdr{};
++    // Note: PsoKey & SrcMetaEntry are driver-version/UUID independent, so we keep prewarming PSOs across Mesa/driver updates!
 +    bool ok = std::fread(&hdr, sizeof(hdr), 1, f) == 1 && hdr.magic == kVkPsoMetaMagic &&
 +              hdr.version == kVkPsoMetaVersion && hdr.sizeof_pso_key == sizeof(PsoKey) &&
-+              hdr.vendor_id == phys_props_.vendorID && hdr.device_id == phys_props_.deviceID &&
-+              hdr.driver_version == phys_props_.driverVersion &&
-+              std::memcmp(hdr.uuid, phys_props_.pipelineCacheUUID, VK_UUID_SIZE) == 0 && hdr.src_count <= 65536u &&
-+              hdr.pso_count <= 65536u;
++              hdr.src_count <= 65536u && hdr.pso_count <= 65536u;
 +    uint64_t expect = uint64_t(sizeof(VkPsoMetaHeader)) + uint64_t(hdr.src_count) * sizeof(SrcMetaEntry) +
 +                      uint64_t(hdr.pso_count) * sizeof(PsoKey);
 +    if (!ok || expect != fsize) {
@@ -15482,6 +17220,7 @@ index 0000000..ea449b5
 +        auto pit = shader_mods_.find(k.ps);
 +        if (vit == shader_mods_.end() || vit->second == VK_NULL_HANDLE || pit == shader_mods_.end() ||
 +            pit->second == VK_NULL_HANDLE) {
++            deferred_pso_keys_.push_back(k);
 +            continue;
 +        }
 +        VkShaderModule gs = VK_NULL_HANDLE;
@@ -15501,7 +17240,7 @@ index 0000000..ea449b5
 +    std::vector<VkPipeline> results(items.size(), VK_NULL_HANDLE);
 +    std::atomic<size_t> cursor{0};
 +    uint32_t max_jobs = std::max<uint32_t>(1u, app::RecommendedCompileJobs());
-+    uint32_t n_threads = std::min<uint32_t>({4u, max_jobs, uint32_t(items.size())});
++    uint32_t n_threads = std::min<uint32_t>({12u, max_jobs, uint32_t(items.size())});
 +    auto worker = [&] {
 +        for (;;) {
 +            size_t idx = cursor.fetch_add(1, std::memory_order_relaxed);
@@ -15628,6 +17367,10 @@ index 0000000..ea449b5
 +        if (known_pso_keys_.insert(items[i].hash).second) pso_meta_entries_.push_back(items[i].k);
 +        if (perf::Enabled()) perf::RecordPsoCacheHit();
 +        built++;
++    }
++    if (built > 0 && !pso_cache_loaded_) {
++        pso_dirty_ = true;
++        cache_dirty_frame_ = presents_;
 +    }
 +    LOGR("vulkan: startup prewarm done in %.1f ms (src=%zu, psos=%zu/%zu, threads=%u)", PerfMs(t0), restored_src, built,
 +         items.size(), n_threads);
@@ -16529,6 +18272,10 @@ index 0000000..ea449b5
 +
 +void VulkanBackend::EnsureVertexShader(const State& s, const Assembled& a, DrawShaders& sh) {
 +    auto vit = shader_src_.find(sh.vkey);
++    if (vit == shader_src_.end() && async_pw_running_.load(std::memory_order_acquire)) {
++        DrainAsyncPrewarm(false);
++        vit = shader_src_.find(sh.vkey);
++    }
 +    if (vit != shader_src_.end()) {
 +        sh.vs_mod = shader_mods_[vit->second];
 +        sh.vh = vit->second;
@@ -16545,12 +18292,22 @@ index 0000000..ea449b5
 +            meta_dirty_ = true;
 +            cache_dirty_frame_ = presents_;
 +        }
++        if (!sh.prog && known_fixed_vs_recipes_.insert(sh.vkey).second) {
++            fixed_vs_recipes_.push_back(FixedVsRecipe{sh.vkey, a.decode, sh.fk, a.regs, uint8_t(a.pretransformed),
++                                                      uint8_t(sh.quad), 0u});
++            recipes_dirty_ = true;
++            cache_dirty_frame_ = presents_;
++        }
 +    }
 +}
 +
 +void VulkanBackend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
 +    uint64_t key = sh.pkey ^ kPixelKeySalt;
 +    auto pit = shader_src_.find(key);
++    if (pit == shader_src_.end() && async_pw_running_.load(std::memory_order_acquire)) {
++        DrainAsyncPrewarm(false);
++        pit = shader_src_.find(key);
++    }
 +    if (pit != shader_src_.end()) {
 +        sh.ps_mod = shader_mods_[pit->second];
 +        sh.ph = pit->second;
@@ -16564,6 +18321,11 @@ index 0000000..ea449b5
 +        if (known_src_keys_.insert(key).second) {
 +            src_meta_entries_.push_back(SrcMetaEntry{key, sh.ph});
 +            meta_dirty_ = true;
++            cache_dirty_frame_ = presents_;
++        }
++        if (known_pixel_ps_recipes_.insert(key).second) {
++            pixel_ps_recipes_.push_back(PixelRecipe{key, pk});
++            recipes_dirty_ = true;
 +            cache_dirty_frame_ = presents_;
 +        }
 +    }
@@ -17622,18 +19384,27 @@ index 0000000..ea449b5
 +                       (cap == 0 || (hz > 0 && std::fabs(double(hz) - double(cap)) <= 1.5));
 +    app::SetVsyncPacingActive(vsync_paces);
 +
++    bool in_3d = frame_camera_.is_3d_gameplay;
 +    frame_jitter_latched_ = false;
 +    has_queued_camera_ = false;
 +    presents_++;
 +    presents_seen_.store(presents_);
 +    frame_++;
++    if (async_pw_running_.load(std::memory_order_acquire)) DrainAsyncPrewarm(false);
 +
-+    if (cache_enabled_ && (shaders_dirty_ || pso_dirty_ || meta_dirty_) && presents_ >= cache_dirty_frame_ + 120) {
-+        SaveCaches(false);
-+        PublishCacheStats();
-+    } else if ((presents_ % 60) == 0) {
-+        g_cache_shaders_stat.store(uint32_t(shader_cache_entries_.size()), std::memory_order_relaxed);
-+        g_cache_psos_stat.store(uint32_t(psos_.size() + blit_psos_.size()), std::memory_order_relaxed);
++    if (cache_enabled_) {
++        if (!in_3d && (shaders_dirty_ || pso_dirty_ || meta_dirty_ || recipes_dirty_) &&
++            presents_ >= cache_dirty_frame_ + 30) {
++            SaveCaches(false, true);
++            PublishCacheStats();
++        } else if (in_3d && (shaders_dirty_ || meta_dirty_ || recipes_dirty_) &&
++                   presents_ >= cache_dirty_frame_ + 300) {
++            SaveCaches(false, false);
++            PublishCacheStats();
++        } else if ((presents_ % 60) == 0) {
++            g_cache_shaders_stat.store(uint32_t(shader_cache_entries_.size()), std::memory_order_relaxed);
++            g_cache_psos_stat.store(uint32_t(psos_.size() + blit_psos_.size()), std::memory_order_relaxed);
++        }
 +    }
 +
 +    ReleaseOldTextures();
@@ -17730,6 +19501,20 @@ index 0000000..ea449b5
 +            g_cache_shaders_stat.load(std::memory_order_relaxed),
 +            g_cache_psos_stat.load(std::memory_order_relaxed),
 +            g_cache_bytes_stat.load(std::memory_order_relaxed)};
++}
++
++ShaderWarmupStatus GetShaderWarmupStatus() {
++    ShaderWarmupStatus s{};
++    s.active = g_warmup_active.load(std::memory_order_acquire);
++    s.completed = g_warmup_completed.load(std::memory_order_acquire);
++    s.done = g_warmup_done.load(std::memory_order_relaxed);
++    s.total = g_warmup_total.load(std::memory_order_relaxed);
++    s.compiled_new = g_warmup_compiled_new.load(std::memory_order_relaxed);
++    s.cached_shaders = g_cache_shaders_stat.load(std::memory_order_relaxed);
++    s.cached_psos = g_cache_psos_stat.load(std::memory_order_relaxed);
++    s.elapsed_ms = double(g_warmup_elapsed_us.load(std::memory_order_relaxed)) / 1000.0;
++    s.completed_ms = g_warmup_completed_ms.load(std::memory_order_acquire);
++    return s;
 +}
 +
 +void RequestCacheReset() { g_cache_reset_requested.store(true, std::memory_order_release); }
@@ -19562,7 +21347,7 @@ index 3bdfad2..ed139e2 100644
  #include <cstring>
  #include <string>
 diff --git a/runtime/xdk/d3d8.cpp b/runtime/xdk/d3d8.cpp
-index caf6cc5..e657184 100644
+index caf6cc5..b7df729 100644
 --- a/runtime/xdk/d3d8.cpp
 +++ b/runtime/xdk/d3d8.cpp
 @@ -1,5 +1,6 @@
@@ -19605,7 +21390,31 @@ index caf6cc5..e657184 100644
  #include "gpu/backend.h"
  #include "gpu/shaders.h"
  #include "gpu/simple_dirty.h"
-@@ -143,6 +159,17 @@ std::unordered_map<uint32_t, std::shared_ptr<gpu::PixelShader>> g_ps;
+@@ -140,9 +156,41 @@ void SetSimple(uint32_t method, uint32_t v) {
+ 
+ std::unordered_map<uint32_t, std::shared_ptr<gpu::VertexShader>> g_vs;
+ std::unordered_map<uint32_t, std::shared_ptr<gpu::PixelShader>> g_ps;
++std::unordered_set<uint64_t> g_prewarmed_vs_keys;
++std::unordered_set<uint64_t> g_prewarmed_ps_keys;
++std::vector<gpu::VertexShader> g_pending_prewarm_vs;
++std::vector<gpu::PixelShader> g_pending_prewarm_ps;
++
++void QueuePrewarmVs(const gpu::VertexShader& vs) {
++    if (vs.program.empty()) return;
++    uint64_t key = gpu::Hash(vs.program.data(), vs.program.size() * 4);
++    key = gpu::Hash(vs.inputs.data(), sizeof(vs.inputs), key);
++    key = gpu::Hash(vs.stream_stride.data(), sizeof(vs.stream_stride), key);
++    if (g_prewarmed_vs_keys.insert(key).second) {
++        g_pending_prewarm_vs.push_back(vs);
++    }
++}
++
++void QueuePrewarmPs(const gpu::PixelShader& ps) {
++    uint64_t key = gpu::Hash(ps.def, sizeof(ps.def));
++    if (g_prewarmed_ps_keys.insert(key).second) {
++        g_pending_prewarm_ps.push_back(ps);
++    }
++}
  std::array<uint32_t, 3> g_buffers{};  // front, back surfaces
  uint32_t g_buffer_count = 2;
  uint32_t g_depth = 0;
@@ -19623,7 +21432,7 @@ index caf6cc5..e657184 100644
  // the console's frame buffers are the multisample factor times the asked size, and after SetBackBufferScale it draws
  // to only their top-left part; CopyRects blits those pixels as they lie
  uint32_t g_ms_x = 1, g_ms_y = 1;
-@@ -211,9 +238,9 @@ gpu::Surface SurfaceOf(uint32_t header) {
+@@ -211,9 +259,9 @@ gpu::Surface SurfaceOf(uint32_t header) {
      return s;
  }
  
@@ -19635,7 +21444,7 @@ index caf6cc5..e657184 100644
      uint32_t hdr = mem::AllocSystem(24);
      W32(hdr + 0, 0x000D0001);  // surface, one reference, one internal reference held by the device
      W32(hdr + 4, mem::PhysicalFromVirtual(data));
-@@ -224,6 +251,42 @@ uint32_t NewSurface(uint32_t w, uint32_t h, uint32_t fmt, uint32_t bpp) {
+@@ -224,6 +272,42 @@ uint32_t NewSurface(uint32_t w, uint32_t h, uint32_t fmt, uint32_t bpp) {
      return hdr;
  }
  
@@ -19678,7 +21487,7 @@ index caf6cc5..e657184 100644
  void SyncDeferred() {
      // deferred states live in the title's memory, the inline SetRenderState and SetTextureStageState write them
      for (uint32_t i = gpu::kRsDeferredFirst; i < gpu::kRsComplexFirst; i++) g_state.rs[i] = R32(kRenderState + i * 4);
-@@ -278,30 +341,49 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
+@@ -278,30 +362,49 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
      if (!w) w = 640;
      if (!h) h = 480;
      uint32_t ms = R32(pp + 0x10);  // D3DMULTISAMPLE_TYPE: samples across in bits 4-7, down in bits 0-3
@@ -19734,7 +21543,7 @@ index caf6cc5..e657184 100644
              kernel::Shutdown(1);
          }
          g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
-@@ -310,7 +392,7 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
+@@ -310,7 +413,7 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
      SetDev(kDevRenderTarget, g_buffers[1]);
      SetDev(kDevDepth, g_depth);
      SetDev(kDevBackBuffer, g_buffers[1]);
@@ -19743,7 +21552,7 @@ index caf6cc5..e657184 100644
      float one = 1.0f, zs = g_depth && (R32(g_depth + 12) >> 8 & 0xFF) == 0x30 ? 65535.0f : 16777215.0f;
      std::memcpy(HostPtr(kDevice + kDevSuperX), &one, 4);
      std::memcpy(HostPtr(kDevice + kDevSuperY), &one, 4);
-@@ -329,18 +411,85 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
+@@ -329,18 +432,85 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
  constexpr bool kVBlank = XDK_CDevice_VBlankCount != xdk::kUnknown && XDK_CDevice_VBlankEvent != xdk::kUnknown &&
                           XDK_CDevice_VBlankCallback != xdk::kUnknown;
  
@@ -19835,7 +21644,7 @@ index caf6cc5..e657184 100644
          if (uint32_t callback = Dev(XDK_CDevice_VBlankCallback)) {
              // blank count, swaps shown, 1 when this blank showed one
              W32(info, count);
-@@ -349,9 +498,12 @@ void VerticalBlank(X86Context& ctx) {
+@@ -349,9 +519,12 @@ void VerticalBlank(X86Context& ctx) {
              CallGuest(ctx, callback, {info});
          }
          shown = swaps;
@@ -19851,7 +21660,7 @@ index caf6cc5..e657184 100644
      }
  }
  
-@@ -359,6 +511,31 @@ void VerticalBlank(X86Context& ctx) {
+@@ -359,6 +532,31 @@ void VerticalBlank(X86Context& ctx) {
  
  gpu::State& State() { return g_state; }
  std::recursive_mutex& Lock() { return g_lock; }
@@ -19883,7 +21692,18 @@ index caf6cc5..e657184 100644
  
  }  // namespace d3d
  
-@@ -410,10 +587,26 @@ HLE_STDCALL(D3DDevice_Release, 0) { return 1; }
+@@ -382,6 +580,10 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
+     W32(kDevicePtr, kDevice);
+     ScratchPush();
+     g_state = gpu::State{};
++    g_prewarmed_vs_keys.clear();
++    g_prewarmed_ps_keys.clear();
++    g_pending_prewarm_vs.clear();
++    g_pending_prewarm_ps.clear();
+     gpu::MarkAllSimple();
+     gpu::g_simple_tracked = true;
+     SetFrameBuffers("CreateDevice", a[4]);
+@@ -410,10 +612,26 @@ HLE_STDCALL(D3DDevice_Release, 0) { return 1; }
  
  // synchronisation, the renderer never runs behind
  
@@ -19910,7 +21730,7 @@ index caf6cc5..e657184 100644
          uint32_t type = R32(res) & 0x70000;  // 0x40000 texture, 0x50000 surface
          if (type == 0x40000 || type == 0x50000) {
              uint32_t data = mem::VirtualFromPhysical(R32(res + 4));
-@@ -440,7 +633,13 @@ HLE_STDCALL(D3D_BlockOnResource, 1) {
+@@ -440,7 +658,13 @@ HLE_STDCALL(D3D_BlockOnResource, 1) {
  HLE_WRAP(Lock2DSurface, 6) {
      uint32_t res = a[0];
      if ((a[5] & 0x20) && res && g_backend) {  // D3DLOCK_NOOVERWRITE
@@ -19924,7 +21744,7 @@ index caf6cc5..e657184 100644
          g_backend->SyncLate(mem::VirtualFromPhysical(R32(res + 4)));
      }
  }
-@@ -508,7 +707,7 @@ HLE_STDCALL(D3D_MakeRequestedSpace, 2) {
+@@ -508,7 +732,7 @@ HLE_STDCALL(D3D_MakeRequestedSpace, 2) {
  }
  
  HLE_STDCALL(D3DDevice_BlockUntilVerticalBlank, 0) {
@@ -19933,7 +21753,7 @@ index caf6cc5..e657184 100644
      return 0;
  }
  // (status): D3DRASTER_STATUS {InVBlank, ScanLine} on a 60 Hz frame clock. The library reads the GPU's scanline,
-@@ -624,6 +823,61 @@ std::atomic<uint32_t> g_presents{0};
+@@ -624,6 +848,61 @@ std::atomic<uint32_t> g_presents{0};
  }  // namespace
  
  HLE_STDCALL(D3DDevice_Swap, 1) {
@@ -19995,7 +21815,7 @@ index caf6cc5..e657184 100644
      app::SplashFirstFrame();
      // handed over from the previous instance: the window opens on the second frame, the first picture with
      // anything drawn over it right after
-@@ -634,32 +888,51 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
+@@ -634,32 +913,58 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
          }
          app::FinishHandover();
      }
@@ -20025,6 +21845,13 @@ index caf6cc5..e657184 100644
 +            }
 +        }
 +        Walk(Dev(kDevPush));  // reports asked for at the end of the frame
++        if (g_backend && (!g_pending_prewarm_vs.empty() || !g_pending_prewarm_ps.empty())) {
++            std::vector<gpu::VertexShader> pvs = std::move(g_pending_prewarm_vs);
++            std::vector<gpu::PixelShader> pps = std::move(g_pending_prewarm_ps);
++            g_pending_prewarm_vs.clear();
++            g_pending_prewarm_ps.clear();
++            g_backend->PrewarmGuestShaders(pvs, pps);
++        }
 +        uint32_t present_buf = g_copy_mode ? g_buffers[0] : g_buffers[1];
 +        if (g_backend) g_backend->Present(SurfaceOf(present_buf));
 +
@@ -20070,7 +21897,7 @@ index caf6cc5..e657184 100644
      return n;
  }
  
-@@ -675,6 +948,7 @@ HLE_STDCALL(D3DDevice_Clear, 6) {
+@@ -675,6 +980,7 @@ HLE_STDCALL(D3DDevice_Clear, 6) {
  HLE_STDCALL(D3DDevice_Reset, 1) {
      constexpr uint32_t kClearTargetAndZ = 3;
      std::lock_guard<std::recursive_mutex> lock(g_lock);
@@ -20078,6 +21905,42 @@ index caf6cc5..e657184 100644
      ApplyRenderTarget(ctx, g_buffers[1], g_depth);
      SetFrameBuffers("Reset", a[0]);
      if (g_backend) g_backend->Clear(g_state, 0, nullptr, kClearTargetAndZ, 0, 1.0f, 0);
+@@ -924,6 +1230,7 @@ HLE_STDCALL(D3DDevice_CreateVertexShader, 4) {
+     uint32_t rec = mem::AllocSystem(16, 16);
+     vs->handle = rec | 1;
+     g_vs[vs->handle] = vs;
++    QueuePrewarmVs(*vs);
+     W32(out, vs->handle);
+     LOG_FIRST(64, "d3d: vertex shader %08X, %zu decl tokens, %zu instructions, type %X", vs->handle, vs->decl.size(),
+               vs->program.size() / 4, vs->program_type);
+@@ -1089,7 +1396,10 @@ std::shared_ptr<gpu::VertexShader> SelectedShader(uint32_t handle, uint32_t slot
+     key = gpu::Hash(vs.inputs.data(), sizeof(vs.inputs), key);
+     key = gpu::Hash(vs.stream_stride.data(), sizeof(vs.stream_stride), key);
+     auto& kept = g_selected[key];
+-    if (!kept) kept = std::make_shared<gpu::VertexShader>(std::move(vs));
++    if (!kept) {
++        kept = std::make_shared<gpu::VertexShader>(std::move(vs));
++        QueuePrewarmVs(*kept);
++    }
+     return kept;
+ }
+ }  // namespace
+@@ -1140,6 +1450,7 @@ HLE_STDCALL(D3DDevice_CreatePixelShader, 2) {
+     uint32_t rec = mem::AllocSystem(16, 16);
+     ps->handle = rec;
+     g_ps[rec] = ps;
++    QueuePrewarmPs(*ps);
+     W32(a[1], rec);
+     return 0;
+ }
+@@ -1166,6 +1477,7 @@ HLE_STDCALL(D3DDevice_SetPixelShader, 1) {
+             ps = std::make_shared<gpu::PixelShader>();
+             ps->handle = a[0];
+             std::memcpy(ps->def, def, sizeof(ps->def));
++            QueuePrewarmPs(*ps);
+         }
+         g_state.ps = ps;
+     } else {
 diff --git a/runtime/xdk/d3d8.h b/runtime/xdk/d3d8.h
 index 977d028..bf9036d 100644
 --- a/runtime/xdk/d3d8.h

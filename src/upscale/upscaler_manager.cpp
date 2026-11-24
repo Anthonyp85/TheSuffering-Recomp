@@ -160,6 +160,8 @@ public:
         dlss_.reset();
         fsr3_.reset();
         xess_.reset();
+        chk_valid_ = false;
+        chk_ok_ = false;
         ReleaseTargets();
         spatial_ = SpatialPipelines{};
         heap_.Reset();
@@ -212,6 +214,7 @@ public:
         app::UpscalerMode active = requested;
         bool fallback = false;
         bool temporal_ran = false;
+        bool temporal_2d_bypass = false;
         std::string detail;
 
         // SSAA (>100% custom scale) routes cleanly through Catmull-Rom 5-Tap Bicubic
@@ -228,9 +231,15 @@ public:
                 fallback = true;
                 detail = vendor ? (vendor->StatusMessage() + " -> FSR 1.0") : "Plugin unavailable -> FSR 1.0";
                 active = app::UpscalerMode::Fsr1;
+            } else if (!EnsureVendorReady(cl, vendor, active, f.render_w, f.render_h, f.vp_w, f.vp_h,
+                                          s.upscale_quality, s.dlss_preset)) {
+                fallback = true;
+                detail = "Vendor CreateFeature fallback -> FSR 1.0";
+                active = app::UpscalerMode::Fsr1;
             } else if (!f.camera.valid || !f.camera.is_3d_gameplay || !f.scene_depth_res) {
                 need_reset_ = true;
-                detail = "2D/Menu/FMV Spatial Bypass (FSR 1.0)";
+                temporal_2d_bypass = true;
+                detail = std::string(UpscalerShortName(active)) + " Ready (2D/Menu/FMV Spatial Pass)";
                 active = app::UpscalerMode::Fsr1;
             } else {
                 if (RunTemporalVendor(cl, f, vendor, active, sharpness, detail)) {
@@ -250,11 +259,30 @@ public:
             RunSpatialMode(cl, f, active, sharpness);
         }
 
+        bool native_aa = (s.upscale_quality == app::UpscaleQuality::NativeAA) ||
+                         (f.render_w + 1u >= f.vp_w && f.render_h + 1u >= f.vp_h && !is_ssaa);
+        std::string hud_label;
+        if (temporal_ran) {
+            if (requested == app::UpscalerMode::Dlss) hud_label = native_aa ? "DLSS (DLAA)" : "DLSS";
+            else if (requested == app::UpscalerMode::Fsr3) hud_label = native_aa ? "FSR 3.1 (Native AA)" : "FSR 3.1";
+            else if (requested == app::UpscalerMode::Xess) hud_label = native_aa ? "XeSS (Native AA)" : "XeSS";
+            else hud_label = UpscalerShortName(active);
+        } else if (temporal_2d_bypass) {
+            if (requested == app::UpscalerMode::Dlss) hud_label = native_aa ? "DLSS (DLAA - 2D)" : "DLSS (2D)";
+            else if (requested == app::UpscalerMode::Fsr3) hud_label = native_aa ? "FSR 3.1 (Native AA - 2D)" : "FSR 3.1 (2D)";
+            else if (requested == app::UpscalerMode::Xess) hud_label = native_aa ? "XeSS (Native AA - 2D)" : "XeSS (2D)";
+            else hud_label = UpscalerShortName(requested);
+        } else if (fallback) {
+            hud_label = "FSR 1.0 (Fallback)";
+        } else {
+            hud_label = UpscalerShortName(active);
+        }
+
         // Publish live status snapshot
         {
             std::lock_guard<std::mutex> lock(status_lock_);
             status_.requested_mode = uint32_t(requested);
-            status_.active_mode = uint32_t(active);
+            status_.active_mode = uint32_t(temporal_2d_bypass ? requested : active);
             status_.render_w = f.render_w;
             status_.render_h = f.render_h;
             status_.vp_w = f.vp_w;
@@ -266,7 +294,7 @@ public:
             status_.dlss_available = dlss_ && dlss_->IsAvailable();
             status_.fsr3_available = fsr3_ && fsr3_->IsAvailable();
             status_.xess_available = xess_ && xess_->IsAvailable();
-            status_.active_label = UpscalerShortName(active);
+            status_.active_label = std::move(hud_label);
             status_.status_detail = detail;
         }
         return true;
@@ -290,8 +318,8 @@ public:
                 EnsureOutputTargets(vp_w, vp_h, need_tmp);
                 EnsureTemporalTargets(render_w, render_h);
                 if (cmd_list) {
-                    vendor->EnsureFeature(static_cast<ID3D12GraphicsCommandList*>(cmd_list), render_w, render_h, vp_w,
-                                          vp_h, s.upscale_quality, s.dlss_preset);
+                    EnsureVendorReady(static_cast<ID3D12GraphicsCommandList*>(cmd_list), vendor, mode, render_w,
+                                      render_h, vp_w, vp_h, s.upscale_quality, s.dlss_preset);
                 }
                 return;
             }
@@ -321,6 +349,26 @@ public:
 private:
     static bool IsTemporalMode(app::UpscalerMode m) {
         return m == app::UpscalerMode::Dlss || m == app::UpscalerMode::Fsr3 || m == app::UpscalerMode::Xess;
+    }
+
+    bool EnsureVendorReady(ID3D12GraphicsCommandList* cl, VendorUpscaler* vendor, app::UpscalerMode mode,
+                           uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, app::UpscaleQuality q,
+                           app::DlssPreset p) {
+        if (!vendor || !vendor->IsAvailable()) return false;
+        if (chk_valid_ && chk_mode_ == mode && chk_rw_ == rw && chk_rh_ == rh && chk_ow_ == ow && chk_oh_ == oh &&
+            chk_quality_ == q && chk_preset_ == p) {
+            return chk_ok_;
+        }
+        chk_ok_ = vendor->EnsureFeature(cl, rw, rh, ow, oh, q, p);
+        chk_valid_ = true;
+        chk_mode_ = mode;
+        chk_rw_ = rw;
+        chk_rh_ = rh;
+        chk_ow_ = ow;
+        chk_oh_ = oh;
+        chk_quality_ = q;
+        chk_preset_ = p;
+        return chk_ok_;
     }
 
     VendorUpscaler* ActiveVendor(app::UpscalerMode m) const {
@@ -600,7 +648,8 @@ private:
         TransitionRes(upscale_out_.Get(), upscale_out_state_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
         const app::Settings& s = app::Get();
-        if (!vendor->EnsureFeature(cl, f.render_w, f.render_h, f.vp_w, f.vp_h, s.upscale_quality, s.dlss_preset)) {
+        if (!EnsureVendorReady(cl, vendor, mode, f.render_w, f.render_h, f.vp_w, f.vp_h, s.upscale_quality,
+                               s.dlss_preset)) {
             return false;
         }
 
@@ -825,6 +874,13 @@ private:
     std::unique_ptr<VendorUpscaler> dlss_;
     std::unique_ptr<VendorUpscaler> fsr3_;
     std::unique_ptr<VendorUpscaler> xess_;
+
+    bool chk_valid_ = false;
+    bool chk_ok_ = false;
+    app::UpscalerMode chk_mode_ = app::UpscalerMode::Fsr1;
+    uint32_t chk_rw_ = 0, chk_rh_ = 0, chk_ow_ = 0, chk_oh_ = 0;
+    app::UpscaleQuality chk_quality_ = app::UpscaleQuality::Quality;
+    app::DlssPreset chk_preset_ = app::DlssPreset::PresetK;
 
     bool need_reset_ = true;
     bool has_prev_cam_ = false;

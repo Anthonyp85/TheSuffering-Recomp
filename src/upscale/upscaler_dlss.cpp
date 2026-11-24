@@ -18,15 +18,28 @@ namespace {
 
 namespace fs = std::filesystem;
 
-ngx::PerfQuality MapDlssQuality(app::UpscaleQuality q) {
+ngx::PerfQuality MapDlssQuality(app::UpscaleQuality q, uint32_t render_w, uint32_t render_h, uint32_t output_w,
+                                uint32_t output_h) {
+    if (output_w > 0 && output_h > 0 && render_w + 1u >= output_w && render_h + 1u >= output_h) {
+        return ngx::kDlaa;
+    }
     switch (q) {
         case app::UpscaleQuality::NativeAA: return ngx::kDlaa;
-        case app::UpscaleQuality::UltraQuality: return ngx::kUltraQuality;
+        // NVIDIA reserved NVSDK_NGX_PerfQuality_Value_UltraQuality (4) as unimplemented in nvngx_dlss.dll
+        // (returns 0xBAD00010 InvalidParameter); Ultra Quality (77%) uses kMaxQuality with 77% input dimensions.
+        case app::UpscaleQuality::UltraQuality: return ngx::kMaxQuality;
         case app::UpscaleQuality::Quality: return ngx::kMaxQuality;
         case app::UpscaleQuality::Balanced: return ngx::kBalanced;
         case app::UpscaleQuality::Performance: return ngx::kMaxPerf;
         case app::UpscaleQuality::UltraPerformance: return ngx::kUltraPerformance;
-        case app::UpscaleQuality::Custom: return ngx::kMaxQuality;
+        case app::UpscaleQuality::Custom: {
+            float ratio = float(output_w) / float(std::max(render_w, 1u));
+            if (ratio <= 1.03f) return ngx::kDlaa;
+            if (ratio <= 1.58f) return ngx::kMaxQuality;
+            if (ratio <= 1.85f) return ngx::kBalanced;
+            if (ratio <= 2.35f) return ngx::kMaxPerf;
+            return ngx::kUltraPerformance;
+        }
     }
     return ngx::kMaxQuality;
 }
@@ -129,7 +142,7 @@ public:
         static constexpr uint32_t kApiVersions[] = {0x0000015u, 0x0000014u, 0x0000013u};
         uint32_t init_res = ngx::kFailBase;
         for (uint32_t ver : kApiVersions) {
-            init_res = pfn_init_("4d570015-5788-4b02-9a3e-535546464552", ngx::kEngineCustom, "1.4.0", app_data.c_str(),
+            init_res = pfn_init_("4d570015-5788-4b02-9a3e-535546464552", ngx::kEngineCustom, "1.4.1", app_data.c_str(),
                                  dev_, ver, &info);
             if (ngx::Succeeded(init_res)) break;
         }
@@ -198,45 +211,60 @@ public:
     bool EnsureFeature(ID3D12GraphicsCommandList* cl, uint32_t render_w, uint32_t render_h, uint32_t output_w,
                        uint32_t output_h, app::UpscaleQuality quality, app::DlssPreset dlss_preset) override {
         if (!available_ || !params_) return false;
-        if (handle_ && cur_rw_ == render_w && cur_rh_ == render_h && cur_ow_ == output_w && cur_oh_ == output_h &&
+        if (cur_rw_ == render_w && cur_rh_ == render_h && cur_ow_ == output_w && cur_oh_ == output_h &&
             cur_quality_ == quality && cur_preset_ == dlss_preset) {
-            return true;
+            if (handle_) return true;
+            if (feature_failed_) return false;
         }
         ReleaseFeature();
+        feature_failed_ = false;
 
-        params_->Reset();
-        params_->Set("Width", render_w);
-        params_->Set("Height", render_h);
-        params_->Set("OutWidth", output_w);
-        params_->Set("OutHeight", output_h);
-        params_->Set("PerfQualityValue", int(MapDlssQuality(quality)));
-        uint32_t flags = ngx::kFlagMvLowRes | ngx::kFlagDepthInverted | ngx::kFlagAutoExposure;
-        params_->Set("DLSS.Feature.Create.Flags", int(flags));
-        params_->Set("CreationNodeMask", 1u);
-        params_->Set("VisibilityNodeMask", 1u);
+        auto try_create = [&](ngx::PerfQuality pq) -> uint32_t {
+            params_->Reset();
+            params_->Set("Width", render_w);
+            params_->Set("Height", render_h);
+            params_->Set("OutWidth", output_w);
+            params_->Set("OutHeight", output_h);
+            params_->Set("PerfQualityValue", int(pq));
+            uint32_t flags = ngx::kFlagMvLowRes | ngx::kFlagDepthInverted | ngx::kFlagAutoExposure;
+            params_->Set("DLSS.Feature.Create.Flags", int(flags));
+            params_->Set("CreationNodeMask", 1u);
+            params_->Set("VisibilityNodeMask", 1u);
 
-        uint32_t preset = MapDlssPreset(dlss_preset);
-        params_->Set("DLSS.Hint.Render.Preset.DLAA", preset);
-        params_->Set("DLSS.Hint.Render.Preset.UltraQuality", preset);
-        params_->Set("DLSS.Hint.Render.Preset.Quality", preset);
-        params_->Set("DLSS.Hint.Render.Preset.Balanced", preset);
-        params_->Set("DLSS.Hint.Render.Preset.Performance", preset);
-        params_->Set("DLSS.Hint.Render.Preset.UltraPerformance", preset);
+            uint32_t preset = MapDlssPreset(dlss_preset);
+            params_->Set("DLSS.Hint.Render.Preset.DLAA", preset);
+            params_->Set("DLSS.Hint.Render.Preset.UltraQuality", preset);
+            params_->Set("DLSS.Hint.Render.Preset.Quality", preset);
+            params_->Set("DLSS.Hint.Render.Preset.Balanced", preset);
+            params_->Set("DLSS.Hint.Render.Preset.Performance", preset);
+            params_->Set("DLSS.Hint.Render.Preset.UltraPerformance", preset);
+            return pfn_create_(cl, ngx::kFeatureSuperSampling, params_, &handle_);
+        };
 
-        uint32_t r = pfn_create_(cl, ngx::kFeatureSuperSampling, params_, &handle_);
-        if (!ngx::Succeeded(r) || !handle_) {
-            LOGW("upscale/dlss: CreateFeature(%ux%u -> %ux%u) failed (0x%08X)", render_w, render_h, output_w, output_h, r);
+        ngx::PerfQuality mapped_pq = MapDlssQuality(quality, render_w, render_h, output_w, output_h);
+        uint32_t r = try_create(mapped_pq);
+        if ((!ngx::Succeeded(r) || !handle_) && mapped_pq != ngx::kMaxQuality) {
             handle_ = nullptr;
-            return false;
+            ngx::PerfQuality fb_pq =
+                (render_w >= output_w && render_h >= output_h) ? ngx::kDlaa : ngx::kMaxQuality;
+            if (fb_pq != mapped_pq) r = try_create(fb_pq);
         }
-        // Flush CreateFeature upload commands once so DLSS weights are resident before frame 1
-        if (host_.flush) host_.flush(host_.ctx);
+
         cur_rw_ = render_w;
         cur_rh_ = render_h;
         cur_ow_ = output_w;
         cur_oh_ = output_h;
         cur_quality_ = quality;
         cur_preset_ = dlss_preset;
+
+        if (!ngx::Succeeded(r) || !handle_) {
+            LOGW("upscale/dlss: CreateFeature(%ux%u -> %ux%u) failed (0x%08X)", render_w, render_h, output_w, output_h, r);
+            handle_ = nullptr;
+            feature_failed_ = true;
+            return false;
+        }
+        // Flush CreateFeature upload commands once so DLSS weights are resident before frame 1
+        if (host_.flush) host_.flush(host_.ctx);
         LOGR("upscale/dlss: feature ready (%ux%u -> %ux%u, quality=%s, preset=%s)", render_w, render_h, output_w,
              output_h, UpscaleQualityName(quality), DlssPresetName(dlss_preset));
         return true;
@@ -298,6 +326,7 @@ private:
     ngx::Handle* handle_ = nullptr;
     uint32_t cur_rw_ = 0, cur_rh_ = 0, cur_ow_ = 0, cur_oh_ = 0;
     uint64_t eval_frames_ = 0;
+    bool feature_failed_ = false;
     app::UpscaleQuality cur_quality_ = app::UpscaleQuality::Quality;
     app::DlssPreset cur_preset_ = app::DlssPreset::PresetK;
 };

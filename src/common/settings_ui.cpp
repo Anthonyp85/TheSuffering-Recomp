@@ -84,6 +84,7 @@ bool g_status_is_error = false;
 // Automated UI screenshot capture CLI/env support (--open-settings, --settings-tab N, --capture-ui-bmp, --capture-ui-exit)
 fs::path g_capture_ui_path;
 bool g_capture_ui_exit = false;
+bool g_suppress_warmup_toast = false;
 uint32_t g_ui_frames_drawn = 0;
 bool g_capture_ui_requested = false;
 bool g_capture_ui_exit_posted = false;
@@ -235,6 +236,63 @@ void DrawFpsHud(double fps, float ui_scale) {
     ImGui::End();
 }
 
+bool ShouldShowShaderWarmupToast(gpu::ShaderWarmupStatus& out_ws, float& out_alpha) {
+    if (g_suppress_warmup_toast || !g_capture_ui_path.empty() || app::IsReplayOrAutotestActive()) return false;
+    out_ws = gpu::GetShaderWarmupStatus();
+    if (out_ws.active) {
+        out_alpha = 1.0f;
+        return true;
+    }
+    if (!out_ws.completed || out_ws.completed_ms == 0 || (out_ws.cached_shaders == 0 && out_ws.compiled_new == 0)) {
+        return false;
+    }
+    uint64_t now_ms = uint64_t(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    if (now_ms < out_ws.completed_ms) return false;
+    uint64_t age_ms = now_ms - out_ws.completed_ms;
+    constexpr uint64_t kShowDurationMs = 3500;
+    constexpr uint64_t kFadeStartMs = 2750;
+    if (age_ms >= kShowDurationMs) return false;
+    out_alpha = (age_ms <= kFadeStartMs)
+                    ? 1.0f
+                    : std::clamp(float(kShowDurationMs - age_ms) / float(kShowDurationMs - kFadeStartMs), 0.0f, 1.0f);
+    return out_alpha > 0.02f;
+}
+
+void DrawShaderWarmupToast(const gpu::ShaderWarmupStatus& ws, float alpha, float ui_scale) {
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 16.0f * ui_scale, io.DisplaySize.y - 16.0f * ui_scale),
+                            ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.82f * alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    constexpr ImGuiWindowFlags kToastFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
+    if (ImGui::Begin("##SufferingShaderWarmupToast", nullptr, kToastFlags)) {
+        if (ws.active) {
+            uint32_t total = std::max(ws.total, 1u);
+            uint32_t done = std::min(ws.done, total);
+            ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.35f, 1.0f), "Compiling & Caching Shaders... (%u / %u)", done,
+                               total);
+            float frac = float(done) / float(total);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.76f, 0.20f, 0.22f, 1.0f));
+            ImGui::ProgressBar(frac, ImVec2(230.0f * ui_scale, 5.0f * ui_scale), "");
+            ImGui::PopStyleColor();
+        } else if (ws.compiled_new > 0) {
+            ImGui::TextColored(ImVec4(0.52f, 0.92f, 0.60f, 1.0f),
+                               "Shader Cache Ready: %u compiled | %u Shaders, %u PSOs (%.0f ms)", ws.compiled_new,
+                               ws.cached_shaders, ws.cached_psos, ws.elapsed_ms);
+        } else {
+            ImGui::TextColored(ImVec4(0.52f, 0.92f, 0.60f, 1.0f),
+                               "Shader Cache Loaded: %u Shaders | %u PSOs (%.0f ms)", ws.cached_shaders,
+                               ws.cached_psos, ws.elapsed_ms);
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 void DrawSettingsWindow(double fps, float ui_scale) {
     app::Settings& s = app::Get();
     if (!g_lists_inited) {
@@ -282,7 +340,7 @@ void DrawSettingsWindow(double fps, float ui_scale) {
     bool open = true;
     constexpr ImGuiWindowFlags kFlags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
                                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings;
-    if (ImGui::Begin("The Suffering v1.4.0 - Settings (F1 or Back + L3 to Close)", &open, kFlags)) {
+    if (ImGui::Begin("The Suffering v1.4.1 - Settings (F1 or Back + L3 to Close)", &open, kFlags)) {
         if (ImGui::BeginTabBar("##SettingsTabs")) {
             // 1. Upscaling & Graphics Tab
             if (ImGui::BeginTabItem("Upscaling & Graphics", nullptr, tab_flags(0))) {
@@ -353,9 +411,12 @@ void DrawSettingsWindow(double fps, float ui_scale) {
                             (unsigned long long)(caps.upload_ring_bytes >> 20));
 #endif
                 d3d::CacheStats cs = d3d::GetCacheStats();
+                gpu::ShaderWarmupStatus ws = gpu::GetShaderWarmupStatus();
                 ImGui::Text("Shader / PSO Disk Cache: %s (%u shaders, %u PSOs, %.2f MB on disk)",
                             cs.enabled ? "Enabled" : "Disabled", cs.shaders, cs.psos,
                             double(cs.disk_bytes) / (1024.0 * 1024.0));
+                ImGui::TextDisabled("Startup Pre-Compilation: %s (%u new compiled at boot, %.1f ms warmup)",
+                                    ws.active ? "Running..." : "Ready", ws.compiled_new, ws.elapsed_ms);
                 if (ImGui::Button("Reset Shader & PSO Cache")) {
                     d3d::RequestCacheReset();
                     SetStatus("Shader & PSO cache cleared; shaders will rebuild on demand.");
@@ -486,6 +547,8 @@ void UiInit() {
             g_capture_ui_path = fs::path(args[i].substr(17));
         } else if (args[i] == L"--capture-ui-exit") {
             g_capture_ui_exit = true;
+        } else if (args[i].rfind(L"--capture-", 0) == 0 || args[i].rfind(L"--replay-input", 0) == 0) {
+            g_suppress_warmup_toast = true;
         }
     }
     if (const wchar_t* v = _wgetenv(L"XBE_OPEN_SETTINGS"); v && *v && _wtoi(v) != 0) {
@@ -514,6 +577,8 @@ void UiInit() {
             g_capture_ui_path = fs::path(args[i].substr(17));
         } else if (args[i] == "--capture-ui-exit") {
             g_capture_ui_exit = true;
+        } else if (args[i].rfind("--capture-", 0) == 0 || args[i].rfind("--replay-input", 0) == 0) {
+            g_suppress_warmup_toast = true;
         }
     }
     if (const char* v = std::getenv("XBE_OPEN_SETTINGS"); v && *v && std::atoi(v) != 0) {
@@ -726,10 +791,14 @@ void OnUi(double fps) {
     FeedPadToImGui(p, open, g_was_pad_active);
 
     SharedUiOptions& o = GetSharedUiOptions();
-    if (o.show_fps_hud || open) {
+    gpu::ShaderWarmupStatus warmup_ws{};
+    float warmup_alpha = 0.0f;
+    bool show_warmup = ShouldShowShaderWarmupToast(warmup_ws, warmup_alpha);
+    if (o.show_fps_hud || open || show_warmup) {
         float ui_scale = ComputeInGameUiScale();
         EnsureInGameStyle(ui_scale);
         if (o.show_fps_hud) DrawFpsHud(fps, ui_scale);
+        if (show_warmup) DrawShaderWarmupToast(warmup_ws, warmup_alpha, ui_scale);
         if (open) DrawSettingsWindow(fps, ui_scale);
     }
 

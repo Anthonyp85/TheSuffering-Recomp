@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# Stages and packages TheSuffering-Recomp-v1.4.0-linux-x86_64.tar.gz for Native Linux x86_64 & Steam Deck.
+# Stages and packages TheSuffering-Recomp-v1.4.1-linux-x86_64.tar.gz for Native Linux x86_64 & Steam Deck.
 # Bundles stripped non-LSB shared library dependencies for compiler/{clang,ld.lld,xbe_recomp} inside
 # compiler/lib/ with $ORIGIN:$ORIGIN/lib RPATH so stock read-only SteamOS 3.x requires ZERO system LLVM packages.
 # Strictly excludes libsuffering.so, *.dll, *.exe, *.xbe, *.iso, compiler/work/, and runtime state.
@@ -8,7 +8,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="1.4.0"
+VERSION="1.4.1"
 BUILD_DIR="$REPO_ROOT/out/build/linux-release"
 OUT_TAR=""
 
@@ -18,8 +18,8 @@ Usage: ./release_linux.sh [options]
 
 Options:
   --build-dir <dir>   CMake Linux build output directory (default: out/build/linux-release)
-  --out-tar <path>    Output .tar.gz path (default: .local/dist/TheSuffering-Recomp-v1.4.0-linux-x86_64.tar.gz)
-  --version <ver>     Release version tag without 'v' (default: 1.4.0)
+  --out-tar <path>    Output .tar.gz path (default: .local/dist/TheSuffering-Recomp-v1.4.1-linux-x86_64.tar.gz)
+  --version <ver>     Release version tag without 'v' (default: 1.4.1)
   -h, --help          Show this help text
 EOF
 }

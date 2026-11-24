@@ -15,12 +15,12 @@
 
 ## System Requirements (End Users)
 
-### Windows (`v1.4.0` — Native Win64 D3D12)
+### Windows (`v1.4.1` — Native Win64 D3D12)
 - **OS:** Windows 11 x64 or Windows 10 1809+ x64
 - **GPU:** Direct3D 12-capable GPU (Feature Level `11_0` or newer — supports NVIDIA, AMD, Intel Arc/Iris, and Handheld/iGPU UMA systems)
 - **Storage:** ~400 MB free writable disk space beside `suffering.exe` (for locally compiled `suffering.dll`, per-adapter shader/PSO cache `cache\`, virtual Xbox HDD `hdd\`, and logs)
 
-### Native Linux `x86_64` & Steam Deck (`v1.4.0` — Native Vulkan 1.2 + SDL3 + ELF64)
+### Native Linux `x86_64` & Steam Deck (`v1.4.1` — Native Vulkan 1.2 + SDL3 + ELF64)
 - **OS:** Any `x86_64` Linux distribution with **`glibc 2.35+`** and `libstdc++.so.6` (`GLIBCXX_3.4.30+`): **SteamOS 3.x (Steam Deck LCD & OLED)**, Ubuntu 22.04+, Debian 12+, Fedora 36+, Arch Linux, Bazzite, CachyOS — **zero Proton or Wine required**, and **zero system LLVM/Clang dev packages required** on stock read-only SteamOS!
 - **GPU:** Vulkan 1.2-capable GPU (AMD RADV on Steam Deck / Radeon, NVIDIA proprietary Vulkan, Intel ANV, or Mesa `lavapipe` software fallback)
 - **Audio / Display / Input:** PipeWire, PulseAudio, or ALSA; Wayland, Gamescope (Steam Deck Gaming Mode), or X11; SDL3 `evdev` + `HIDAPI` (Steam Deck integrated controls, DualSense 5, Xbox, Switch) + SDL3 Relative Mouse
@@ -46,7 +46,7 @@
 
 ## Quick Start (End-User Release Packages)
 
-### Windows (`TheSuffering-Recomp-v1.4.0-win64-launcher.zip`)
+### Windows (`TheSuffering-Recomp-v1.4.1-win64-launcher.zip`)
 You do **not** need Visual Studio, CMake, Python, or manual file extraction to play from a packaged Win64 launcher release:
 
 1. **Unpack** the archive into any writable folder (for example, `C:\Games\TheSuffering\`).
@@ -59,14 +59,14 @@ You do **not** need Visual Studio, CMake, Python, or manual file extraction to p
    - Enable **"Skip launcher on future starts"** inside the launcher to boot straight into gameplay on future runs.
    - To reopen the Pre-Game Launcher anytime while skipping is enabled, **hold `Shift`** while starting `suffering.exe`, pass `--launcher`, or re-enable **"Show Pre-Game Launcher on Startup"** inside the in-game **`F1`** overlay (**Launcher & Diagnostics**).
 
-### Native Linux `x86_64` & Steam Deck (`TheSuffering-Recomp-v1.4.0-linux-x86_64.tar.gz`)
+### Native Linux `x86_64` & Steam Deck (`TheSuffering-Recomp-v1.4.1-linux-x86_64.tar.gz`)
 
 Runs **100% natively on Linux Vulkan 1.2 + SDL3** with zero Proton overhead and zero system LLVM dependencies on stock read-only SteamOS:
 
 1. **Extract** the tarball into a writable directory (for example, `~/Games/TheSuffering/`):
    ```bash
    mkdir -p ~/Games/TheSuffering
-   tar -xzf TheSuffering-Recomp-v1.4.0-linux-x86_64.tar.gz -C ~/Games/TheSuffering
+   tar -xzf TheSuffering-Recomp-v1.4.1-linux-x86_64.tar.gz -C ~/Games/TheSuffering
    cd ~/Games/TheSuffering
    ```
 2. **Optional — Register in Steam Deck Gaming Mode & Desktop Menu:**
@@ -94,7 +94,7 @@ Runs **100% natively on Linux Vulkan 1.2 + SDL3** with zero Proton overhead and 
 
 ---
 
-## Modern Upscaling Suite (`v1.4.0`)
+## Modern Upscaling Suite (`v1.4.1`)
 
 Both Windows (Direct3D 12) and Native Linux / Steam Deck (Vulkan 1.2) decouple the internal 3D rendering resolution (`render_w x render_h`) from the native display resolution (`bb_w x bb_h`), apply square-pixel aspect-locked upscaling before compositing crisp native-resolution Dear ImGui overlays, and bypass temporal upscaling cleanly on 2D menus, loading screens, and FMVs.
 
@@ -232,8 +232,8 @@ Controller input is handled statically via **SDL3 `3.4.16` (HIDAPI + WGI)** with
 
 ## Known Compatibility & Performance Notes
 
-- **60 FPS Native Target & Physics Safety Ceiling:** Original Xbox *The Suffering* requests `D3DPRESENT_INTERVAL_ONE` (60 Hz VSync-1 at `0x001A26A0`), and its cloth solver (`0x001A6480`) clamps `dt` to `[0.016s, 0.030s]` (`62.5–33.3 FPS`). Both `60 FPS` (default) and `30 FPS` run at exact `1.00x` simulation speed (`gtime/wall = 1.001–1.002`). Rates above 60 FPS are intentionally disabled to prevent physics or timing drift.
-- **One-Time Cold Cache Warm-Up:** On the very first launch (or after a GPU driver upgrade invalidates `cache\psos.bin`), DXBC shaders and D3D12 PSOs compile once and are persisted to `cache\{shaders.bin,psos.bin}` (`~4.5 MB` total). Every subsequent launch hits 0 shader compiles (~100% reduction in shader hitching). Similarly, the game caches level assets into `hdd\Z\` once per level.
+- **60 FPS Default + Unlocked High-Refresh (`90 / 120 / 165+ FPS`) Support:** Original Xbox *The Suffering* targeted `D3DPRESENT_INTERVAL_ONE` (60 Hz VSync-1 at `0x001A26A0`), and its cloth solver (`0x001A6480`) clamped `dt` to `[0.016s, 0.030s]`. A monotonic high-precision `CClock` accumulator (`0x002DC724`) and a 60 Hz fixed-step cloth accumulator hook keep `1.00x` simulation & physics stability across `30 FPS`, `60 FPS`, `90 FPS` (Steam Deck OLED), `120 FPS`, `165 FPS`, and `Uncapped` modes.
+- **Startup Shader & PSO Pre-Compilation + Persistent Disk Cache:** At boot (before Frame 1), both D3D12 (Windows) and Vulkan (Linux / Steam Deck) pre-compile all built-in blit/clear/depth/particle pipelines, common fixed-function UI/3D FVF & combiner permutations, any previously recorded `cache/shader_recipes.bin` recipes, and every guest programmable vertex/pixel shader loaded from `ShaderLibrary.bin` & `xpsBW.xpu` in parallel across up to 12 worker threads — then pre-build all cached graphics PSOs (`pso_meta_*` / `vk_pso_meta_*`) across GPU driver updates and defer heavy pipeline-library serialization away from active 3D gameplay.
 - **Single-Core Guest Scheduling (`single_core_guest = true`):** Guest Xbox threads are pinned to one logical CPU core with authentic guest thread priorities while host D3D12 rendering, XAudio2 audio, SDL3 input, and Dear ImGui remain multi-core. This prevents Original Xbox single-core race conditions (`0x00176712` bitfield RMW and `0x2E1444 <-> 0x2E1A90` AB-BA lock order) with zero performance penalty.
 - **Hardware Audit Note:** DualSense 5 HIDAPI driver detection, mapping, and sustained rumble code paths are verified statically and at runtime; live physical USB/Bluetooth DualSense 5 touch-testing awaits plugging in a physical controller.
 
@@ -248,7 +248,7 @@ All runtime data is portable and stored beside `suffering.exe`:
 | Settings | `settings.toml` | Delete to reset all display/audio/input settings and re-open the first-launch XISO picker. |
 | Xbox Save Data (`U:\`) | `hdd\E\UDATA\4d570015\` | Back up or restore this folder directly to transfer save games. |
 | Xbox Scratch Cache (`Z:\`) | `hdd\Z\` | Safe to delete anytime; the game rebuilds cached level archives automatically from the XISO. |
-| Shader & PSO Disk Cache | `cache\shaders.bin`, `cache\psos_<VID>_<DID>.bin` | Click **F1 -> Launcher & Diagnostics -> Reset Shader & PSO Cache** (or delete `cache\`) after a GPU driver update or visual artifact. |
+| Shader & PSO Disk Cache | `cache\shaders.bin`, `cache\shader_recipes.bin`, `cache\psos_<VID>_<DID>.bin` | Click **F1 -> Launcher & Diagnostics -> Reset Shader & PSO Cache** (or delete `cache\`) after a GPU driver update or visual artifact. |
 | Bundled Upscaler Plugins | `plugins\` | Contains the verified official `nvngx_dlss.dll`, `amd_fidelityfx_loader_dx12.dll` + `amd_fidelityfx_upscaler_dx12.dll`, and `libxess.dll` plus their vendor licenses (see `plugins\README.txt`). Safe to update or delete anytime. |
 | Compiled Game Code | `suffering.dll`, `compiler\work\` | Delete `suffering.dll` and `compiler\work\` to force a clean local recompilation on next launch. |
 | Logs & Crash Dumps | `logs\suffering.log`, `logs\compile.log`, `CrashDumps\*.dmp` | Inspect or attach these files when diagnosing startup, compilation, or runtime issues. |
@@ -290,7 +290,7 @@ All runtime data is portable and stored beside `suffering.exe`:
   cmake --build out/build/linux-release --parallel
   # Package self-contained Linux & Steam Deck tarball:
   bash release_linux.sh --build-dir out/build/linux-release \
-    --out-tar .local/dist/TheSuffering-Recomp-v1.4.0-linux-x86_64.tar.gz
+    --out-tar .local/dist/TheSuffering-Recomp-v1.4.1-linux-x86_64.tar.gz
   ```
 - **Automated 6-Gate Release & Copyright Audit (Windows + Linux ELF64):**
   ```bash
