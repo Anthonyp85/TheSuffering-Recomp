@@ -31,6 +31,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +39,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -301,38 +303,62 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Minimal RFC 8259 Recursive-Descent JSON Parser (depth-bounded, zero deps)
+// Minimal RFC 8259 Recursive-Descent JSON Parser (flat arena, zero incomplete types)
 // ---------------------------------------------------------------------------
-struct JsonVal {
+struct JsonMember {
+    std::string key;
+    uint32_t val_idx = 0;
+};
+
+struct JsonNode {
     enum class Type : uint8_t { Null, Bool, Number, String, Array, Object };
     Type type = Type::Null;
     bool bval = false;
     uint64_t uval = 0;
     std::string sval;
-    std::vector<JsonVal> arr;
-    std::vector<std::pair<std::string, JsonVal>> obj;
+    std::vector<uint32_t> arr;
+    std::vector<JsonMember> obj;
+};
 
-    const JsonVal* Find(std::string_view key) const {
-        if (type != Type::Object) return nullptr;
-        for (const auto& kv : obj) {
-            if (kv.first == key) return &kv.second;
+struct JsonDoc {
+    std::vector<JsonNode> nodes;
+    uint32_t root = 0;
+
+    uint32_t Alloc(JsonNode::Type t = JsonNode::Type::Null) {
+        uint32_t idx = static_cast<uint32_t>(nodes.size());
+        JsonNode n{};
+        n.type = t;
+        nodes.push_back(std::move(n));
+        return idx;
+    }
+
+    const JsonNode* At(uint32_t idx) const {
+        return idx < nodes.size() ? &nodes[idx] : nullptr;
+    }
+
+    const JsonNode* Root() const { return At(root); }
+
+    const JsonNode* Find(const JsonNode& obj_node, std::string_view key) const {
+        if (obj_node.type != JsonNode::Type::Object) return nullptr;
+        for (const JsonMember& kv : obj_node.obj) {
+            if (kv.key == key) return At(kv.val_idx);
         }
         return nullptr;
     }
 
-    std::string GetString(std::string_view key, std::string_view def = "") const {
-        const JsonVal* v = Find(key);
-        return (v && v->type == Type::String) ? v->sval : std::string(def);
+    std::string GetString(const JsonNode& obj_node, std::string_view key, std::string_view def = "") const {
+        const JsonNode* v = Find(obj_node, key);
+        return (v && v->type == JsonNode::Type::String) ? v->sval : std::string(def);
     }
 
-    bool GetBool(std::string_view key, bool def = false) const {
-        const JsonVal* v = Find(key);
-        return (v && v->type == Type::Bool) ? v->bval : def;
+    bool GetBool(const JsonNode& obj_node, std::string_view key, bool def = false) const {
+        const JsonNode* v = Find(obj_node, key);
+        return (v && v->type == JsonNode::Type::Bool) ? v->bval : def;
     }
 
-    uint64_t GetUint64(std::string_view key, uint64_t def = 0) const {
-        const JsonVal* v = Find(key);
-        return (v && v->type == Type::Number) ? v->uval : def;
+    uint64_t GetUint64(const JsonNode& obj_node, std::string_view key, uint64_t def = 0) const {
+        const JsonNode* v = Find(obj_node, key);
+        return (v && v->type == JsonNode::Type::Number) ? v->uval : def;
     }
 };
 
@@ -345,15 +371,21 @@ public:
         }
     }
 
-    bool Parse(JsonVal& out) {
+    bool Parse(JsonDoc& out) {
+        out.nodes.clear();
+        out.root = 0;
         SkipWs();
-        if (!ParseValue(out, 0)) return false;
+        uint32_t root_idx = 0;
+        if (!ParseValue(out, root_idx, 0)) return false;
         SkipWs();
-        return pos_ == src_.size();
+        if (pos_ != src_.size()) return false;
+        out.root = root_idx;
+        return !out.nodes.empty();
     }
 
 private:
     static constexpr int kMaxDepth = 32;
+    static constexpr size_t kMaxNodes = 65536;
     std::string_view src_;
     size_t pos_ = 0;
 
@@ -450,8 +482,7 @@ private:
         return true;
     }
 
-    bool ParseNumber(JsonVal& out) {
-        size_t start = pos_;
+    bool ParseNumber(JsonDoc& doc, uint32_t& out_idx) {
         bool neg = false;
         if (pos_ < src_.size() && src_[pos_] == '-') {
             neg = true;
@@ -459,9 +490,10 @@ private:
         }
         if (pos_ >= src_.size() || !std::isdigit(static_cast<unsigned char>(src_[pos_]))) return false;
         uint64_t int_part = 0;
+        constexpr uint64_t kMaxU64 = std::numeric_limits<uint64_t>::max();
         while (pos_ < src_.size() && std::isdigit(static_cast<unsigned char>(src_[pos_]))) {
             uint64_t digit = uint64_t(src_[pos_] - '0');
-            if (int_part <= (UINT64_MAX - digit) / 10u) {
+            if (int_part <= (kMaxU64 - digit) / 10u) {
                 int_part = int_part * 10u + digit;
             }
             ++pos_;
@@ -477,55 +509,64 @@ private:
             if (pos_ >= src_.size() || !std::isdigit(static_cast<unsigned char>(src_[pos_]))) return false;
             while (pos_ < src_.size() && std::isdigit(static_cast<unsigned char>(src_[pos_]))) ++pos_;
         }
-        (void)start;
-        out.type = JsonVal::Type::Number;
-        out.uval = neg ? 0 : int_part;
+        uint32_t idx = doc.Alloc(JsonNode::Type::Number);
+        doc.nodes[idx].uval = neg ? 0 : int_part;
+        out_idx = idx;
         return true;
     }
 
-    bool ParseValue(JsonVal& out, int depth) {
-        if (depth > kMaxDepth || pos_ >= src_.size()) return false;
+    bool ParseValue(JsonDoc& doc, uint32_t& out_idx, int depth) {
+        if (depth > kMaxDepth || doc.nodes.size() >= kMaxNodes || pos_ >= src_.size()) return false;
         SkipWs();
         if (pos_ >= src_.size()) return false;
         char c = src_[pos_];
         if (c == 'n') {
             if (!MatchLiteral("null")) return false;
-            out.type = JsonVal::Type::Null;
+            out_idx = doc.Alloc(JsonNode::Type::Null);
             return true;
         }
         if (c == 't') {
             if (!MatchLiteral("true")) return false;
-            out.type = JsonVal::Type::Bool;
-            out.bval = true;
+            uint32_t idx = doc.Alloc(JsonNode::Type::Bool);
+            doc.nodes[idx].bval = true;
+            out_idx = idx;
             return true;
         }
         if (c == 'f') {
             if (!MatchLiteral("false")) return false;
-            out.type = JsonVal::Type::Bool;
-            out.bval = false;
+            uint32_t idx = doc.Alloc(JsonNode::Type::Bool);
+            doc.nodes[idx].bval = false;
+            out_idx = idx;
             return true;
         }
         if (c == '"') {
-            out.type = JsonVal::Type::String;
-            return ParseStringRaw(out.sval);
+            std::string s;
+            if (!ParseStringRaw(s)) return false;
+            uint32_t idx = doc.Alloc(JsonNode::Type::String);
+            doc.nodes[idx].sval = std::move(s);
+            out_idx = idx;
+            return true;
         }
         if (c == '[') {
             ++pos_;
-            out.type = JsonVal::Type::Array;
-            out.arr.clear();
+            std::vector<uint32_t> elems;
             SkipWs();
             if (pos_ < src_.size() && src_[pos_] == ']') {
                 ++pos_;
+                out_idx = doc.Alloc(JsonNode::Type::Array);
                 return true;
             }
             while (pos_ < src_.size()) {
-                JsonVal elem;
-                if (!ParseValue(elem, depth + 1)) return false;
-                out.arr.push_back(std::move(elem));
+                uint32_t elem_idx = 0;
+                if (!ParseValue(doc, elem_idx, depth + 1)) return false;
+                elems.push_back(elem_idx);
                 SkipWs();
                 if (pos_ >= src_.size()) return false;
                 if (src_[pos_] == ']') {
                     ++pos_;
+                    uint32_t idx = doc.Alloc(JsonNode::Type::Array);
+                    doc.nodes[idx].arr = std::move(elems);
+                    out_idx = idx;
                     return true;
                 }
                 if (src_[pos_] != ',') return false;
@@ -536,11 +577,11 @@ private:
         }
         if (c == '{') {
             ++pos_;
-            out.type = JsonVal::Type::Object;
-            out.obj.clear();
+            std::vector<JsonMember> members;
             SkipWs();
             if (pos_ < src_.size() && src_[pos_] == '}') {
                 ++pos_;
+                out_idx = doc.Alloc(JsonNode::Type::Object);
                 return true;
             }
             while (pos_ < src_.size()) {
@@ -550,13 +591,16 @@ private:
                 SkipWs();
                 if (pos_ >= src_.size() || src_[pos_] != ':') return false;
                 ++pos_;
-                JsonVal val;
-                if (!ParseValue(val, depth + 1)) return false;
-                out.obj.emplace_back(std::move(key), std::move(val));
+                uint32_t val_idx = 0;
+                if (!ParseValue(doc, val_idx, depth + 1)) return false;
+                members.push_back(JsonMember{std::move(key), val_idx});
                 SkipWs();
                 if (pos_ >= src_.size()) return false;
                 if (src_[pos_] == '}') {
                     ++pos_;
+                    uint32_t idx = doc.Alloc(JsonNode::Type::Object);
+                    doc.nodes[idx].obj = std::move(members);
+                    out_idx = idx;
                     return true;
                 }
                 if (src_[pos_] != ',') return false;
@@ -565,7 +609,7 @@ private:
             return false;
         }
         if (c == '-' || std::isdigit(static_cast<unsigned char>(c))) {
-            return ParseNumber(out);
+            return ParseNumber(doc, out_idx);
         }
         return false;
     }
@@ -760,9 +804,9 @@ UpdateStatusSnapshot MakeErrorSnapshot(bool manual, std::string msg) {
     return snap;
 }
 
-UpdateStatusSnapshot EvaluateReleaseObject(const JsonVal& rel, bool manual) {
-    std::string tag = TrimAscii(rel.GetString("tag_name"));
-    if (tag.empty()) tag = TrimAscii(rel.GetString("name"));
+UpdateStatusSnapshot EvaluateReleaseObject(const JsonDoc& doc, const JsonNode& rel, bool manual) {
+    std::string tag = TrimAscii(doc.GetString(rel, "tag_name"));
+    if (tag.empty()) tag = TrimAscii(doc.GetString(rel, "name"));
     if (tag.empty()) {
         return MakeUpToDateSnapshot(manual);
     }
@@ -780,10 +824,10 @@ UpdateStatusSnapshot EvaluateReleaseObject(const JsonVal& rel, bool manual) {
     snap.current_version = SUFFERING_VERSION_STR;
     snap.latest_version = FormatSemVer(remote_sv);
     snap.latest_tag = tag;
-    snap.release_title = TrimAscii(rel.GetString("name", tag));
+    snap.release_title = TrimAscii(doc.GetString(rel, "name", tag));
     if (snap.release_title.empty()) snap.release_title = tag;
 
-    std::string html = TrimAscii(rel.GetString("html_url"));
+    std::string html = TrimAscii(doc.GetString(rel, "html_url"));
     if (IsAllowedReleasePageUrl(html)) {
         snap.html_url = html;
     } else {
@@ -791,23 +835,24 @@ UpdateStatusSnapshot EvaluateReleaseObject(const JsonVal& rel, bool manual) {
         if (!IsAllowedReleasePageUrl(snap.html_url)) snap.html_url = SUFFERING_RELEASES_URL;
     }
 
-    std::string body = rel.GetString("body");
+    std::string body = doc.GetString(rel, "body");
     snap.release_notes_summary = SummarizeReleaseNotes(body, snap.release_title, tag);
 
-    const JsonVal* assets = rel.Find("assets");
-    if (assets && assets->type == JsonVal::Type::Array) {
+    const JsonNode* assets = doc.Find(rel, "assets");
+    if (assets && assets->type == JsonNode::Type::Array) {
         int best_score = 0;
-        for (const JsonVal& a : assets->arr) {
-            if (a.type != JsonVal::Type::Object) continue;
-            std::string aname = TrimAscii(a.GetString("name"));
-            std::string aurl = TrimAscii(a.GetString("browser_download_url"));
+        for (uint32_t a_idx : assets->arr) {
+            const JsonNode* a = doc.At(a_idx);
+            if (!a || a->type != JsonNode::Type::Object) continue;
+            std::string aname = TrimAscii(doc.GetString(*a, "name"));
+            std::string aurl = TrimAscii(doc.GetString(*a, "browser_download_url"));
             int score = ScorePlatformAsset(aname);
             if (score > best_score && IsAllowedAssetDownloadUrl(aurl)) {
                 best_score = score;
                 snap.asset_name = aname;
                 snap.asset_url = aurl;
-                snap.asset_size = a.GetUint64("size", 0);
-                snap.asset_sha256 = ParseSha256DigestField(a.GetString("digest"));
+                snap.asset_size = doc.GetUint64(*a, "size", 0);
+                snap.asset_sha256 = ParseSha256DigestField(doc.GetString(*a, "digest"));
                 snap.can_self_update = true;
             }
         }
@@ -824,16 +869,17 @@ UpdateStatusSnapshot EvaluateReleaseObject(const JsonVal& rel, bool manual) {
     return snap;
 }
 
-UpdateStatusSnapshot EvaluateTagsArray(const JsonVal& arr, bool manual) {
-    if (arr.type != JsonVal::Type::Array || arr.arr.empty()) {
+UpdateStatusSnapshot EvaluateTagsArray(const JsonDoc& doc, const JsonNode& arr, bool manual) {
+    if (arr.type != JsonNode::Type::Array || arr.arr.empty()) {
         return MakeUpToDateSnapshot(manual);
     }
 
     SemVer best_sv{};
     std::string best_tag;
-    for (const JsonVal& item : arr.arr) {
-        if (item.type != JsonVal::Type::Object) continue;
-        std::string t = TrimAscii(item.GetString("name"));
+    for (uint32_t item_idx : arr.arr) {
+        const JsonNode* item = doc.At(item_idx);
+        if (!item || item->type != JsonNode::Type::Object) continue;
+        std::string t = TrimAscii(doc.GetString(*item, "name"));
         SemVer sv{};
         if (!ParseSemVer(t, sv)) continue;
         if (!best_sv.valid || CompareSemVer(sv, best_sv) > 0) {
@@ -1711,20 +1757,23 @@ UpdateStatusSnapshot PerformNetworkUpdateCheck(bool manual) {
         // Repository has no 'latest' non-prerelease published yet; check /releases then /tags.
         HttpTextResponse rels = HttpGetTextPlatform(kGitHubApiReleasesUrl);
         if (rels.network_ok && rels.status_code == 200) {
-            JsonVal parsed;
-            if (JsonParser(rels.body).Parse(parsed) && parsed.type == JsonVal::Type::Array) {
-                for (const JsonVal& item : parsed.arr) {
-                    if (item.type == JsonVal::Type::Object && !item.GetBool("draft", false)) {
-                        return EvaluateReleaseObject(item, manual);
+            JsonDoc parsed;
+            const JsonNode* root = JsonParser(rels.body).Parse(parsed) ? parsed.Root() : nullptr;
+            if (root && root->type == JsonNode::Type::Array) {
+                for (uint32_t idx : root->arr) {
+                    const JsonNode* item = parsed.At(idx);
+                    if (item && item->type == JsonNode::Type::Object && !parsed.GetBool(*item, "draft", false)) {
+                        return EvaluateReleaseObject(parsed, *item, manual);
                     }
                 }
             }
         }
         HttpTextResponse tags = HttpGetTextPlatform(kGitHubApiTagsUrl);
         if (tags.network_ok && tags.status_code == 200) {
-            JsonVal parsed;
-            if (JsonParser(tags.body).Parse(parsed) && parsed.type == JsonVal::Type::Array) {
-                return EvaluateTagsArray(parsed, manual);
+            JsonDoc parsed;
+            const JsonNode* root = JsonParser(tags.body).Parse(parsed) ? parsed.Root() : nullptr;
+            if (root && root->type == JsonNode::Type::Array) {
+                return EvaluateTagsArray(parsed, *root, manual);
             }
         }
         if (tags.network_ok && (tags.status_code == 200 || tags.status_code == 404)) {
@@ -1897,37 +1946,43 @@ std::string ComputeSha256Hex(const void* data, size_t size) {
 }
 
 UpdateStatusSnapshot EvaluateReleaseJson(const std::string& json_text, bool manual_check) {
-    JsonVal root;
-    if (!JsonParser(json_text).Parse(root)) {
+    JsonDoc doc;
+    if (!JsonParser(json_text).Parse(doc)) {
+        return MakeErrorSnapshot(manual_check, "Invalid JSON payload from release server.");
+    }
+    const JsonNode* root = doc.Root();
+    if (!root) {
         return MakeErrorSnapshot(manual_check, "Invalid JSON payload from release server.");
     }
 
-    if (root.type == JsonVal::Type::Object) {
-        if (const JsonVal* msg = root.Find("message");
-            msg && msg->type == JsonVal::Type::String && !root.Find("tag_name")) {
+    if (root->type == JsonNode::Type::Object) {
+        if (const JsonNode* msg = doc.Find(*root, "message");
+            msg && msg->type == JsonNode::Type::String && !doc.Find(*root, "tag_name")) {
             std::string low = LowerAscii(msg->sval);
             if (low.find("not found") != std::string::npos) {
                 return MakeUpToDateSnapshot(manual_check);
             }
             return MakeErrorSnapshot(manual_check, "GitHub API: " + msg->sval);
         }
-        if (root.GetBool("draft", false)) {
+        if (doc.GetBool(*root, "draft", false)) {
             return MakeUpToDateSnapshot(manual_check);
         }
-        return EvaluateReleaseObject(root, manual_check);
+        return EvaluateReleaseObject(doc, *root, manual_check);
     }
 
-    if (root.type == JsonVal::Type::Array) {
-        if (root.arr.empty()) {
+    if (root->type == JsonNode::Type::Array) {
+        if (root->arr.empty()) {
             return MakeUpToDateSnapshot(manual_check);
         }
         // Array of releases (contains tag_name) vs array of tags (contains name + commit)
-        for (const JsonVal& item : root.arr) {
-            if (item.type == JsonVal::Type::Object && item.Find("tag_name") && !item.GetBool("draft", false)) {
-                return EvaluateReleaseObject(item, manual_check);
+        for (uint32_t item_idx : root->arr) {
+            const JsonNode* item = doc.At(item_idx);
+            if (item && item->type == JsonNode::Type::Object && doc.Find(*item, "tag_name") &&
+                !doc.GetBool(*item, "draft", false)) {
+                return EvaluateReleaseObject(doc, *item, manual_check);
             }
         }
-        return EvaluateTagsArray(root, manual_check);
+        return EvaluateTagsArray(doc, *root, manual_check);
     }
 
     return MakeErrorSnapshot(manual_check, "Unexpected release response format.");
