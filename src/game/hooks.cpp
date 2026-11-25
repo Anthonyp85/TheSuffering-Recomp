@@ -5,6 +5,10 @@
 //    zero-coasting yaw slew bypass, decoupled PC pitch polarity, Scheme 1 dedicated R3 flashlight)
 //  - Full native-PC point-and-click, hover, drag, wheel, and right-click-back menu mouse engine
 //    inside CUIMgr::Update (sub_0005F9A0) across all Riot Engine UI screens
+//  - Native "Quit Game" Main Menu option below "Bonus Material" (CMainMenuGui, 0x0029B4F8) across
+//    controller, keyboard, and mouse with clean cross-platform host shutdown (bypassed in replay/autotest)
+//  - Host-persisted CUserSettings (0x002DB218) synchronization across cold restarts, in-game Options
+//    sub-screens (Controller, Gameplay, Audio, Screen Adjust), and live Launcher / F1 UI toggles
 //  - Sub-microsecond CClock (0x002DC724) timing hooks eliminating 1ms KeTickCount quantization,
 //    Unpause dt snowballs, pause/streaming-pause total_s drift, and SaveState wall-clock drift
 //  - 60 Hz Cloth::Update accumulator (sub_001A6480) for safe native >60 FPS gameplay
@@ -20,11 +24,26 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <mutex>
 #include <thread>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <SDL3/SDL.h>
+#endif
 
 #include "app/app.h"
 #include "common/mkb_input.h"
 #include "common/settings_ui.h"
+#include "core/log.h"
+#include "game/guest_settings.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 #include "xdk/d3d8.h"
@@ -34,6 +53,10 @@ namespace kernel {
 void SleepHighResUs(int64_t us);
 }
 
+X86_EXTERN_FUNC(__imp__sub_00016B60);
+X86_EXTERN_FUNC(__imp__sub_00016CA0);
+X86_EXTERN_FUNC(__imp__sub_00016D00);
+X86_EXTERN_FUNC(__imp__sub_00016F10);
 X86_EXTERN_FUNC(__imp__sub_0014E1F0);
 X86_EXTERN_FUNC(__imp__sub_001B09A0);
 X86_EXTERN_FUNC(__imp__sub_000576A0);
@@ -41,6 +64,10 @@ X86_EXTERN_FUNC(__imp__sub_000505D0);
 X86_EXTERN_FUNC(__imp__sub_000465F0);
 X86_EXTERN_FUNC(__imp__sub_00265C7B);
 X86_EXTERN_FUNC(__imp__sub_0005F9A0);
+X86_EXTERN_FUNC(__imp__sub_0006F2A0);
+X86_EXTERN_FUNC(__imp__sub_0006F450);
+X86_EXTERN_FUNC(__imp__sub_00071B00);
+X86_EXTERN_FUNC(__imp__sub_00072120);
 X86_EXTERN_FUNC(__imp__sub_000D9AE0);
 X86_EXTERN_FUNC(__imp__sub_001414C0);
 X86_EXTERN_FUNC(__imp__sub_00156CA0);
@@ -61,6 +88,7 @@ namespace {
 constexpr uint32_t kVaLevelMgrPtr = 0x002D0D88u;
 constexpr uint32_t kVaWorldPtr = 0x002D0DC0u;
 constexpr uint32_t kVaUiMgrPtr = 0x002DAD78u;
+constexpr uint32_t kVaMainMenuPtr = 0x002DADACu;
 constexpr uint32_t kVaRendererPtr = 0x002DC75Cu;
 constexpr uint32_t kVaUserSettings = 0x002DB218u;
 constexpr uint32_t kVaSensMax = 0x002DADA0u;
@@ -88,6 +116,17 @@ constexpr uint32_t kFnPlayUiSound = 0x0005DDB0u;
 constexpr uint32_t kFnUserSettingsApply = 0x00016B60u;
 constexpr uint32_t kFnUserSettingsCopyFrom = 0x00016D00u;
 constexpr uint32_t kFnMapEntryLookup = 0x000356E0u;
+constexpr uint32_t kFnGuiSetAlphaRec = 0x0003E3E0u;
+constexpr uint32_t kFnGuiSetState = 0x0005D450u;
+constexpr uint32_t kFnGuiAddChild = 0x0005E200u;
+constexpr uint32_t kFnGuiInsertBefore = 0x0005E240u;
+constexpr uint32_t kFnGuiEnsureInit = 0x00060170u;
+constexpr uint32_t kFnRadioSelectOption = 0x00078810u;
+constexpr uint32_t kFnSimpleTextSetWide = 0x00078930u;
+constexpr uint32_t kFnSimpleButtonCtor = 0x00079880u;
+constexpr uint32_t kFnGuiEffectsCtor = 0x0007A710u;
+constexpr uint32_t kFnGuiEffectsEnable = 0x0007A800u;
+constexpr uint32_t kFnOperatorNew = 0x001E0860u;
 
 // Verified UI sound property IDs for CGUI::PlayUISound (0x0005DDB0)
 constexpr uint32_t kSndUiHover = 0x2Au;
@@ -445,6 +484,13 @@ struct MenuDragState {
 
 MenuDragState g_menu_drag{};
 
+void FlushPendingDragSettingsSave();
+
+void ClearMenuDragAndFlush() {
+    g_menu_drag.Clear();
+    FlushPendingDragSettingsSave();
+}
+
 void ApplyContinuousAudioSlider(X86Context& ctx, uint8_t* base, uint32_t ui_mgr, uint32_t top_va, uint32_t meter_va,
                                 uint32_t val_off, float t, bool play_sound) {
     if (!ValidGuest(meter_va, 0xB0u) || !ValidGuest(top_va, 0xD0u)) return;
@@ -586,16 +632,265 @@ uint32_t LookupMapDisplayEntry(X86Context& ctx, uint8_t* base, uint32_t map_disp
     return ValidGuest(entry, 0x1Cu) ? entry : 0u;
 }
 
+// Native Main Menu "Quit Game" button state (injected directly below "Bonus Material" on CMainMenuGui).
+// Strictly disabled when app::IsReplayOrAutotestActive() is true to preserve 0.0 replay drift.
+struct MainMenuQuitState {
+    uint32_t menu_va = 0u;
+    uint32_t btn_va = 0u;
+    uint32_t effect_va = 0u;
+
+    void Clear() {
+        menu_va = 0u;
+        btn_va = 0u;
+        effect_va = 0u;
+    }
+};
+
+MainMenuQuitState g_main_menu_quit{};
+std::atomic<bool> g_host_quit_requested{false};
+
+void RequestCleanHostQuit() {
+    if (app::IsReplayOrAutotestActive()) return;
+    if (g_host_quit_requested.exchange(true, std::memory_order_acq_rel)) return;
+    LOGR("ui: Main Menu Quit Game activated; requesting clean host window close");
+#ifdef _WIN32
+    if (void* w = app::Window()) {
+        PostMessageW(static_cast<HWND>(w), WM_CLOSE, 0, 0);
+    }
+#else
+    SDL_Event ev{};
+    ev.type = SDL_EVENT_QUIT;
+    SDL_PushEvent(&ev);
+#endif
+}
+
+bool SetWidgetWideTextAscii(X86Context& ctx, uint8_t* base, uint32_t widget_va, const char* ascii) {
+    if (!ValidGuest(widget_va, 0x84u) || !ascii) return false;
+    const uint32_t saved_esp = ctx.esp;
+    const uint32_t scratch_esp = (saved_esp - 96u) & ~15u;
+    if (!ValidGuest(scratch_esp, 64u)) return false;
+    const uint32_t str_va = scratch_esp + 16u;
+    size_t len = 0u;
+    while (ascii[len] != '\0' && len < 22u) {
+        X86_MEM16(str_va + uint32_t(len) * 2u) = uint16_t(static_cast<unsigned char>(ascii[len]));
+        ++len;
+    }
+    X86_MEM16(str_va + uint32_t(len) * 2u) = 0u;
+    ctx.esp = scratch_esp;
+    CallThiscall(ctx, kFnSimpleTextSetWide, widget_va, {str_va});
+    ctx.esp = saved_esp;
+    return X86_MEM32(widget_va + 0x60u) != 0u;
+}
+
+void LayoutMainMenuQuitButton(uint8_t* base, uint32_t menu_va, uint32_t quit_btn_va) {
+    if (!ValidGuest(menu_va, 0x160u) || !ValidGuest(quit_btn_va, 0xB0u)) return;
+    const uint32_t bonus_va = X86_MEM32(menu_va + 0x7Cu);
+    const uint32_t archives_va = X86_MEM32(menu_va + 0x78u);
+    if (!ValidGuest(bonus_va, 0xB0u) || !ValidGuest(archives_va, 0xB0u)) return;
+
+    float bx = X86_MEMF32(bonus_va + 0x38u);
+    float by = X86_MEMF32(bonus_va + 0x3Cu);
+    const float bw = X86_MEMF32(bonus_va + 0x40u);
+    const float bh = X86_MEMF32(bonus_va + 0x44u);
+    float ay = X86_MEMF32(archives_va + 0x3Cu);
+
+    const uint32_t bonus_fx = X86_MEM32(menu_va + 0xC0u);
+    if (ValidGuest(bonus_fx, 0x98u) && X86_MEM32(bonus_fx) == kVtGuiEffects &&
+        X86_MEM32(bonus_fx + 0x80u) != 0xBF800000u) {
+        bx = X86_MEMF32(bonus_fx + 0x70u);
+        by = X86_MEMF32(bonus_fx + 0x74u);
+    }
+    const uint32_t archives_fx = X86_MEM32(menu_va + 0xBCu);
+    if (ValidGuest(archives_fx, 0x98u) && X86_MEM32(archives_fx) == kVtGuiEffects &&
+        X86_MEM32(archives_fx + 0x80u) != 0xBF800000u) {
+        ay = X86_MEMF32(archives_fx + 0x74u);
+    }
+
+    if (!std::isfinite(bx) || !std::isfinite(by) || !std::isfinite(bw) || !std::isfinite(bh) || bw <= 0.5f ||
+        bh <= 0.5f) {
+        return;
+    }
+
+    float step_y = by - ay;
+    if (!std::isfinite(step_y) || step_y < 16.0f || step_y > 120.0f) {
+        step_y = std::max(bh + 12.0f, 45.0f);
+    }
+
+    float guest_h = 480.0f;
+    if (ValidGuest(kVaRendererPtr, 4u)) {
+        const uint32_t rptr = X86_MEM32(kVaRendererPtr);
+        if (ValidGuest(rptr + 0xA0u, 4u)) {
+            const uint32_t gh = X86_MEM32(rptr + 0xA0u);
+            if (gh >= 240u && gh <= 1080u) guest_h = float(gh);
+        }
+    }
+
+    const float qx = bx;
+    float qy = by + step_y;
+    const float max_bottom = guest_h - 8.0f;
+    if (qy + bh > max_bottom) {
+        const float shift_up = std::min((qy + bh) - max_bottom, 48.0f);
+        const uint32_t new_game_va = X86_MEM32(menu_va + 0x68u);
+        if (shift_up > 0.0f && ValidGuest(new_game_va, 0x48u) && X86_MEMF32(new_game_va + 0x3Cu) - shift_up >= 16.0f) {
+            static constexpr uint32_t kMenuBtnOffsets[6] = {0x68u, 0x6Cu, 0x70u, 0x74u, 0x78u, 0x7Cu};
+            for (uint32_t off : kMenuBtnOffsets) {
+                const uint32_t bva = X86_MEM32(menu_va + off);
+                if (ValidGuest(bva, 0x48u)) {
+                    X86_MEMF32(bva + 0x3Cu) -= shift_up;
+                }
+            }
+            qy -= shift_up;
+        } else {
+            qy = std::max(by + bh + 4.0f, max_bottom - bh);
+        }
+    }
+
+    // Clear template h_align / v_align (+0x30 / +0x34) so CGUI::Align (0x0005EE90) preserves explicit screen coords.
+    X86_MEM32(quit_btn_va + 0x30u) = 0u;
+    X86_MEM32(quit_btn_va + 0x34u) = 0u;
+    X86_MEMF32(quit_btn_va + 0x38u) = qx;
+    X86_MEMF32(quit_btn_va + 0x3Cu) = qy;
+    X86_MEMF32(quit_btn_va + 0x40u) = bw;
+    X86_MEMF32(quit_btn_va + 0x44u) = bh;
+}
+
+void SyncMainMenuQuitButtonState(X86Context& ctx, uint8_t* base, uint32_t menu_va) {
+    if (g_main_menu_quit.menu_va != menu_va || !ValidGuest(menu_va, 0x160u) || X86_MEM32(menu_va) != kVtMainMenu) {
+        return;
+    }
+    const uint32_t quit_btn = g_main_menu_quit.btn_va;
+    const uint32_t bonus_va = X86_MEM32(menu_va + 0x7Cu);
+    if (!ValidGuest(quit_btn, 0xB0u) || X86_MEM32(quit_btn) != kVtSimpleButton || !ValidGuest(bonus_va, 0xB0u)) {
+        return;
+    }
+
+    const uint32_t bonus_state = X86_MEM32(bonus_va + 0x24u);
+    const uint32_t quit_state = X86_MEM32(quit_btn + 0x24u);
+    uint32_t want_state = quit_state;
+    if (bonus_state == 1u || bonus_state == 2u || bonus_state == 3u) {
+        want_state = bonus_state;
+    } else if (bonus_state == 4u || bonus_state == 5u) {
+        const int32_t quit_idx = FindChildIndex(base, menu_va, quit_btn);
+        const int32_t focused_idx = int32_t(X86_MEM32(menu_va + 0x08u));
+        want_state = (quit_idx >= 0 && quit_idx == focused_idx) ? 5u : 4u;
+    }
+
+    if (bonus_state == 3u) {
+        const uint32_t bonus_alpha_bits = X86_MEM32(bonus_va + 0x14u);
+        if (X86_MEM32(quit_btn + 0x14u) != bonus_alpha_bits) {
+            CallThiscall(ctx, kFnGuiSetAlphaRec, quit_btn, {bonus_alpha_bits});
+        }
+    } else if ((want_state == 4u || want_state == 5u) && quit_state < 4u) {
+        CallThiscall(ctx, kFnGuiSetAlphaRec, quit_btn, {0x3F800000u});
+    }
+
+    if (quit_state != want_state) {
+        CallThiscall(ctx, kFnGuiSetState, quit_btn, {want_state});
+    }
+
+    const uint32_t quit_fx = g_main_menu_quit.effect_va;
+    const uint32_t bonus_fx = X86_MEM32(menu_va + 0xC0u);
+    if (ValidGuest(quit_fx, 0x98u) && X86_MEM32(quit_fx) == kVtGuiEffects && ValidGuest(bonus_fx, 0x98u) &&
+        X86_MEM32(bonus_fx) == kVtGuiEffects) {
+        const bool bonus_fx_on =
+            (X86_MEM32(bonus_fx + 0x64u) | X86_MEM32(bonus_fx + 0x68u) | X86_MEM32(bonus_fx + 0x6Cu)) != 0u;
+        const bool quit_fx_on =
+            (X86_MEM32(quit_fx + 0x64u) | X86_MEM32(quit_fx + 0x68u) | X86_MEM32(quit_fx + 0x6Cu)) != 0u;
+        if (bonus_fx_on != quit_fx_on) {
+            CallThiscall(ctx, kFnGuiEffectsEnable, quit_fx, {bonus_fx_on ? 1u : 0u});
+        }
+    }
+}
+
+void EnsureAndSyncMainMenuQuitButton(X86Context& ctx, uint8_t* base, uint32_t menu_va, bool from_layout) {
+    if (app::IsReplayOrAutotestActive()) return;
+    if (!ValidGuest(menu_va, 0x160u) || X86_MEM32(menu_va) != kVtMainMenu) return;
+    if (!from_layout && (X86_MEM32(menu_va + 0x04u) & 0x01u) == 0u) return;
+
+    if (g_main_menu_quit.menu_va == menu_va && ValidGuest(g_main_menu_quit.btn_va, 0xB0u) &&
+        X86_MEM32(g_main_menu_quit.btn_va) == kVtSimpleButton &&
+        FindChildIndex(base, menu_va, g_main_menu_quit.btn_va) >= 0) {
+        if (from_layout) {
+            LayoutMainMenuQuitButton(base, menu_va, g_main_menu_quit.btn_va);
+        }
+        SyncMainMenuQuitButtonState(ctx, base, menu_va);
+        return;
+    }
+
+    const uint32_t bonus_va = X86_MEM32(menu_va + 0x7Cu);
+    const uint32_t archives_va = X86_MEM32(menu_va + 0x78u);
+    if (!ValidGuest(bonus_va, 0xB0u) || !ValidGuest(archives_va, 0xB0u)) return;
+    if (!ReadRawRect(base, bonus_va).valid || !ReadRawRect(base, archives_va).valid) return;
+
+    const uint32_t bonus_tmpl_id = X86_MEM32(bonus_va + 0x0Cu);
+    const uint32_t btn_alloc = kernel::CallGuest(ctx, kFnOperatorNew, {0x40u, 0xB0u});
+    if (!ValidGuest(btn_alloc, 0xB0u)) return;
+
+    const uint32_t quit_btn = CallThiscall(ctx, kFnSimpleButtonCtor, btn_alloc, {bonus_tmpl_id});
+    if (!ValidGuest(quit_btn, 0xB0u) || X86_MEM32(quit_btn) != kVtSimpleButton) return;
+
+    X86_MEM32(quit_btn + 0x58u) = menu_va + 0x60u;
+    if (!SetWidgetWideTextAscii(ctx, base, quit_btn, "Quit Game")) return;
+    LayoutMainMenuQuitButton(base, menu_va, quit_btn);
+
+    const int32_t bonus_idx = FindChildIndex(base, menu_va, bonus_va);
+    const int32_t cnt = int32_t(X86_MEM32(menu_va + 0x50u));
+    const uint32_t arr = X86_MEM32(menu_va + 0x48u);
+    int32_t cur_focus = int32_t(X86_MEM32(menu_va + 0x08u));
+    if (bonus_idx >= 0 && bonus_idx + 1 < cnt && ValidGuest(arr, uint32_t(cnt) * 4u)) {
+        const uint32_t before_child = X86_MEM32(arr + uint32_t(bonus_idx + 1) * 4u);
+        X86_MEM32(quit_btn + 0x5Cu) = menu_va;
+        CallThiscall(ctx, kFnGuiInsertBefore, menu_va, {quit_btn, before_child});
+        if (cur_focus >= bonus_idx + 1) {
+            ++cur_focus;
+            X86_MEM32(menu_va + 0x08u) = uint32_t(cur_focus);
+        }
+    } else {
+        CallThiscall(ctx, kFnGuiAddChild, menu_va, {quit_btn});
+    }
+
+    uint32_t quit_fx = 0u;
+    const uint32_t bonus_fx = X86_MEM32(menu_va + 0xC0u);
+    if (ValidGuest(bonus_fx, 0x98u) && X86_MEM32(bonus_fx) == kVtGuiEffects) {
+        const uint32_t fx_tmpl_id = X86_MEM32(bonus_fx + 0x0Cu);
+        const uint32_t fx_alloc = kernel::CallGuest(ctx, kFnOperatorNew, {0x40u, 0xF4u});
+        if (ValidGuest(fx_alloc, 0xF4u)) {
+            const int32_t quit_idx_before = FindChildIndex(base, menu_va, quit_btn);
+            quit_fx = CallThiscall(ctx, kFnGuiEffectsCtor, fx_alloc, {fx_tmpl_id, quit_btn});
+            if (!ValidGuest(quit_fx, 0xF4u) || X86_MEM32(quit_fx) != kVtGuiEffects) {
+                quit_fx = 0u;
+            } else if (quit_idx_before >= 0 && cur_focus >= quit_idx_before) {
+                ++cur_focus;
+                X86_MEM32(menu_va + 0x08u) = uint32_t(cur_focus);
+            }
+        }
+    }
+
+    g_main_menu_quit.menu_va = menu_va;
+    g_main_menu_quit.btn_va = quit_btn;
+    g_main_menu_quit.effect_va = quit_fx;
+
+    SyncMainMenuQuitButtonState(ctx, base, menu_va);
+    if (quit_fx != 0u) {
+        CallThiscall(ctx, kFnGuiEnsureInit, quit_fx, {});
+    }
+    CallThiscall(ctx, kFnGuiEnsureInit, quit_btn, {});
+
+    LOGI("ui: injected Main Menu Quit Game button (menu=%08X btn=%08X fx=%08X rect=%.1f,%.1f %.1fx%.1f)", menu_va,
+         quit_btn, quit_fx, X86_MEMF32(quit_btn + 0x38u), X86_MEMF32(quit_btn + 0x3Cu),
+         X86_MEMF32(quit_btn + 0x40u), X86_MEMF32(quit_btn + 0x44u));
+}
+
 void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) {
     if (app::IsReplayOrAutotestActive() ||
         suffering::MkbGetConfig().input_mode == suffering::InputMode::ControllerOnly ||
         suffering::UiIsOverlayOpen() || suffering::MkbIsInActive3DGameplay()) {
-        g_menu_drag.Clear();
+        ClearMenuDragAndFlush();
         return;
     }
 
     if (!ValidGuest(kVaUiMgrPtr, 4u) || ui_mgr != X86_MEM32(kVaUiMgrPtr) || !ValidGuest(ui_mgr, 0x90u)) {
-        g_menu_drag.Clear();
+        ClearMenuDragAndFlush();
         return;
     }
 
@@ -615,14 +910,14 @@ void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) 
 
     suffering::MenuMouseFrame mf = suffering::MkbConsumeMenuMouse(guest_w, guest_h);
     if (!mf.active) {
-        g_menu_drag.Clear();
+        ClearMenuDragAndFlush();
         return;
     }
 
     int32_t count = int32_t(X86_MEM32(ui_mgr + 0x50u));
     uint32_t arr = X86_MEM32(ui_mgr + 0x48u);
     if (count <= 0 || count > 64 || !ValidGuest(arr, uint32_t(count) * 4u)) {
-        g_menu_drag.Clear();
+        ClearMenuDragAndFlush();
         suffering::MkbSetLastMenuDebugState(0u, -1, mf.pt.gx, mf.pt.gy, mf.pt.in_viewport);
         return;
     }
@@ -630,7 +925,7 @@ void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) 
     const int32_t top_idx = count - 1;
     const uint32_t top = X86_MEM32(arr + uint32_t(top_idx) * 4u);
     if (!ValidGuest(top, 0x60u)) {
-        g_menu_drag.Clear();
+        ClearMenuDragAndFlush();
         return;
     }
 
@@ -647,14 +942,14 @@ void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) 
 
     if (IsNonInteractiveScreenVt(top_vt) || top_state != 4u || (top_flags & 0x01u) == 0u ||
         (top_flags & 0x10u) != 0u) {
-        g_menu_drag.Clear();
+        ClearMenuDragAndFlush();
         return;
     }
 
     // 1. Continue or terminate active continuous drag (slider drag / map pan)
     if (g_menu_drag.kind != DragKind::None) {
         if (!mf.lmb_down || mf.lmb_released || g_menu_drag.top_va != top) {
-            g_menu_drag.Clear();
+            ClearMenuDragAndFlush();
         } else if (mf.has_pos) {
             if (g_menu_drag.kind == DragKind::AudioSlider || g_menu_drag.kind == DragKind::GameplaySlider) {
                 UiRect mr = ReadRawRect(base, g_menu_drag.meter_va);
@@ -692,7 +987,7 @@ void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) 
 
     // 2. Right-Click (RMB) -> Universal Back / Cancel (exact replica of CUIMgr::Update 0x0005FAE6..0x0005FB32)
     if (mf.rmb_pressed) {
-        g_menu_drag.Clear();
+        ClearMenuDragAndFlush();
         if (top_vt == kVtOpeningMovies) {
             CallOnAction(ctx, base, top, kActAnyButton);
             return;
@@ -847,18 +1142,17 @@ void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) 
             FocusChainToWidget(ctx, base, ui_mgr, top, meter_hit.slider_va, false);
             UiRect mr = ReadRawRect(base, meter_hit.meter_va);
             float t = std::clamp((mf.pt.gx_clamped - mr.l) / std::max(mr.r - mr.l, 1.0f), 0.0f, 1.0f);
-            if (meter_hit.is_audio) {
-                ApplyContinuousAudioSlider(ctx, base, ui_mgr, top, meter_hit.meter_va, meter_hit.val_off, t, true);
-                g_menu_drag.kind = DragKind::AudioSlider;
-            } else {
-                ApplyContinuousGameplaySlider(ctx, base, ui_mgr, top, meter_hit.meter_va, meter_hit.val_off, t, true);
-                g_menu_drag.kind = DragKind::GameplaySlider;
-            }
+            g_menu_drag.kind = meter_hit.is_audio ? DragKind::AudioSlider : DragKind::GameplaySlider;
             g_menu_drag.top_va = top;
             g_menu_drag.slider_va = meter_hit.slider_va;
             g_menu_drag.meter_va = meter_hit.meter_va;
             g_menu_drag.val_off = meter_hit.val_off;
             g_menu_drag.last_sound_t = t;
+            if (meter_hit.is_audio) {
+                ApplyContinuousAudioSlider(ctx, base, ui_mgr, top, meter_hit.meter_va, meter_hit.val_off, t, true);
+            } else {
+                ApplyContinuousGameplaySlider(ctx, base, ui_mgr, top, meter_hit.meter_va, meter_hit.val_off, t, true);
+            }
             return;
         }
 
@@ -873,6 +1167,10 @@ void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) 
         if (hit.kind == HitKind::Button || hit.kind == HitKind::ListboxRow) {
             FocusChainToWidget(ctx, base, ui_mgr, top, hit.widget, false);
             CallOnAction(ctx, base, top, kActGuiSelect);
+            if (!app::IsReplayOrAutotestActive() && g_main_menu_quit.menu_va == top &&
+                hit.widget == g_main_menu_quit.btn_va) {
+                RequestCleanHostQuit();
+            }
             return;
         }
         if (hit.kind == HitKind::RadioSlider && ValidGuest(hit.widget, 0xD0u)) {
@@ -895,18 +1193,17 @@ void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) 
                         UiRect mr = ReadRawRect(base, sp.meter_va);
                         if (mr.valid) {
                             float t = std::clamp((mf.pt.gx_clamped - mr.l) / std::max(mr.r - mr.l, 1.0f), 0.0f, 1.0f);
-                            if (sp.is_audio) {
-                                ApplyContinuousAudioSlider(ctx, base, ui_mgr, top, sp.meter_va, sp.val_off, t, true);
-                                g_menu_drag.kind = DragKind::AudioSlider;
-                            } else {
-                                ApplyContinuousGameplaySlider(ctx, base, ui_mgr, top, sp.meter_va, sp.val_off, t, true);
-                                g_menu_drag.kind = DragKind::GameplaySlider;
-                            }
+                            g_menu_drag.kind = sp.is_audio ? DragKind::AudioSlider : DragKind::GameplaySlider;
                             g_menu_drag.top_va = top;
                             g_menu_drag.slider_va = sp.slider_va;
                             g_menu_drag.meter_va = sp.meter_va;
                             g_menu_drag.val_off = sp.val_off;
                             g_menu_drag.last_sound_t = t;
+                            if (sp.is_audio) {
+                                ApplyContinuousAudioSlider(ctx, base, ui_mgr, top, sp.meter_va, sp.val_off, t, true);
+                            } else {
+                                ApplyContinuousGameplaySlider(ctx, base, ui_mgr, top, sp.meter_va, sp.val_off, t, true);
+                            }
                         }
                     }
                 }
@@ -1194,7 +1491,376 @@ bool IsDallasAlive(uint8_t* base) {
     return std::isfinite(hp) && hp > 0.0f;
 }
 
+// Host-persisted CUserSettings (0x002DB218) runtime state & bidirectional sync helpers.
+// Strictly bypassed whenever app::IsReplayOrAutotestActive() is true so recorded traces keep 0.0 drift.
+struct GuestSettingsRuntimeState {
+    std::mutex mtx;
+    suffering::guest_settings::GuestUserSettings current{};
+    suffering::guest_settings::GuestUserSettings last_saved{};
+    std::atomic<bool> host_to_guest_dirty{false};
+    std::atomic<bool> pending_host_save{false};
+};
+
+GuestSettingsRuntimeState& GuestSettingsRt() {
+    static GuestSettingsRuntimeState s_rt{};
+    return s_rt;
+}
+
+// Guest-main-thread-only lifecycle flags (single_core_guest = true, CUserSettings runs on main UI/init thread)
+bool g_boot_settings_initialized = false;
+bool g_applying_host_to_guest = false;
+bool g_save_pending_after_drag = false;
+
+bool SettingsValuesEqual(const suffering::guest_settings::GuestUserSettings& a,
+                         const suffering::guest_settings::GuestUserSettings& b) {
+    auto feq = [](float x, float y) { return std::fabs(x - y) <= 1.0e-5f; };
+    return a.control_scheme == b.control_scheme && a.invert_pitch == b.invert_pitch && a.vibration == b.vibration &&
+           feq(a.turn_sensitivity, b.turn_sensitivity) && feq(a.pitch_sensitivity, b.pitch_sensitivity) &&
+           a.auto_targeting == b.auto_targeting && a.auto_pitch_correction == b.auto_pitch_correction &&
+           a.checkpoints == b.checkpoints && a.help_text == b.help_text &&
+           a.screen_offset_x == b.screen_offset_x && a.screen_offset_y == b.screen_offset_y &&
+           feq(a.effects_volume, b.effects_volume) && feq(a.dialog_volume, b.dialog_volume) &&
+           feq(a.music_volume, b.music_volume) && a.stereo == b.stereo && a.surround == b.surround &&
+           a.subtitles == b.subtitles;
+}
+
+suffering::guest_settings::GuestUserSettings ReadSettingsFromGuestRam(uint8_t* base, uint32_t va) {
+    suffering::guest_settings::GuestUserSettings s = suffering::guest_settings::MakeDefaultSettings();
+    if (!ValidGuest(va, 0x44u)) return s;
+    s.control_scheme = X86_MEM32(va + 0x00u);
+    s.screen_offset_x = int32_t(X86_MEM32(va + 0x04u));
+    s.screen_offset_y = int32_t(X86_MEM32(va + 0x08u));
+    s.effects_volume = X86_MEMF32(va + 0x0Cu);
+    s.dialog_volume = X86_MEMF32(va + 0x10u);
+    s.music_volume = X86_MEMF32(va + 0x14u);
+    s.stereo = X86_MEM32(va + 0x18u) != 0u;
+    s.surround = X86_MEM32(va + 0x1Cu) != 0u;
+    s.subtitles = X86_MEM32(va + 0x20u) != 0u;
+    s.turn_sensitivity = X86_MEMF32(va + 0x24u);
+    s.pitch_sensitivity = X86_MEMF32(va + 0x28u);
+    s.auto_targeting = X86_MEM32(va + 0x2Cu) != 0u;
+    s.invert_pitch = X86_MEM32(va + 0x30u) != 0u;
+    s.vibration = X86_MEM32(va + 0x34u) != 0u;
+    s.help_text = X86_MEM32(va + 0x38u) != 0u;
+    s.auto_pitch_correction = X86_MEM32(va + 0x3Cu) != 0u;
+    s.checkpoints = X86_MEM32(va + 0x40u);
+    return suffering::guest_settings::SanitizeSettings(s);
+}
+
+// Writes user preference fields (+0x00..+0x40) into a guest CUserSettings struct while leaving
+// unlocked Archive bitfields (+0x44, +0x48), runtime loaded flag (+0x4C), and Prelude flag (+0x50) untouched.
+void WriteSettingsToGuestRam(uint8_t* base, uint32_t va, const suffering::guest_settings::GuestUserSettings& raw) {
+    if (!ValidGuest(va, 0x44u)) return;
+    const suffering::guest_settings::GuestUserSettings s = suffering::guest_settings::SanitizeSettings(raw);
+    X86_MEM32(va + 0x00u) = s.control_scheme;
+    X86_MEM32(va + 0x04u) = uint32_t(s.screen_offset_x);
+    X86_MEM32(va + 0x08u) = uint32_t(s.screen_offset_y);
+    X86_MEMF32(va + 0x0Cu) = s.effects_volume;
+    X86_MEMF32(va + 0x10u) = s.dialog_volume;
+    X86_MEMF32(va + 0x14u) = s.music_volume;
+    X86_MEM32(va + 0x18u) = s.stereo ? 1u : 0u;
+    X86_MEM32(va + 0x1Cu) = s.surround ? 1u : 0u;
+    X86_MEM32(va + 0x20u) = s.subtitles ? 1u : 0u;
+    X86_MEMF32(va + 0x24u) = s.turn_sensitivity;
+    X86_MEMF32(va + 0x28u) = s.pitch_sensitivity;
+    X86_MEM32(va + 0x2Cu) = s.auto_targeting ? 1u : 0u;
+    X86_MEM32(va + 0x30u) = s.invert_pitch ? 1u : 0u;
+    X86_MEM32(va + 0x34u) = s.vibration ? 1u : 0u;
+    X86_MEM32(va + 0x38u) = s.help_text ? 1u : 0u;
+    X86_MEM32(va + 0x3Cu) = s.auto_pitch_correction ? 1u : 0u;
+    X86_MEM32(va + 0x40u) = s.checkpoints;
+}
+
+void TriggerOrQueueGuestSettingsSave() {
+    if (app::IsReplayOrAutotestActive()) return;
+    GuestSettingsRuntimeState& rt = GuestSettingsRt();
+    if (!suffering::UiIsOverlayOpen()) {
+        rt.pending_host_save.store(false, std::memory_order_release);
+        app::Save();
+    } else {
+        rt.pending_host_save.store(true, std::memory_order_release);
+    }
+}
+
+void FlushPendingDragSettingsSave() {
+    if (!g_save_pending_after_drag) return;
+    g_save_pending_after_drag = false;
+    if (app::IsReplayOrAutotestActive()) return;
+
+    bool should_save = false;
+    {
+        GuestSettingsRuntimeState& rt = GuestSettingsRt();
+        std::lock_guard<std::mutex> lock(rt.mtx);
+        if (!SettingsValuesEqual(rt.current, rt.last_saved)) {
+            rt.current.has_saved_values = true;
+            rt.last_saved = rt.current;
+            should_save = true;
+        }
+    }
+    if (should_save) {
+        TriggerOrQueueGuestSettingsSave();
+    }
+}
+
+void OnGuestSettingsCommittedFromMenu(uint8_t* base) {
+    if (app::IsReplayOrAutotestActive() || !ValidGuest(kVaUserSettings, 0x44u)) return;
+    suffering::guest_settings::GuestUserSettings snap = ReadSettingsFromGuestRam(base, kVaUserSettings);
+    snap.has_saved_values = true;
+
+    bool should_save_now = false;
+    {
+        GuestSettingsRuntimeState& rt = GuestSettingsRt();
+        std::lock_guard<std::mutex> lock(rt.mtx);
+        if (!SettingsValuesEqual(snap, rt.last_saved) || !rt.current.has_saved_values) {
+            const bool values_changed = !SettingsValuesEqual(snap, rt.last_saved);
+            rt.current = snap;
+            if (values_changed) {
+                if (g_menu_drag.kind == DragKind::AudioSlider || g_menu_drag.kind == DragKind::GameplaySlider) {
+                    g_save_pending_after_drag = true;
+                } else {
+                    rt.last_saved = snap;
+                    g_save_pending_after_drag = false;
+                    should_save_now = true;
+                }
+            }
+        }
+    }
+    if (should_save_now) {
+        TriggerOrQueueGuestSettingsSave();
+    }
+}
+
+void SelectRadioOptionIfValid(X86Context& ctx, uint8_t* base, uint32_t slider_va, uint32_t option_va) {
+    if (ValidGuest(slider_va, 0xD0u) && X86_MEM32(slider_va) == kVtRadioSlider && ValidGuest(option_va, 0xACu)) {
+        CallThiscall(ctx, kFnRadioSelectOption, slider_va, {option_va});
+    }
+}
+
+// If an Xbox Options sub-screen is currently open on the UI stack when the player edits an option
+// via the F1 host overlay, keep that screen's staged CUserSettings copy and widgets synchronized too.
+void SyncOpenOptionsScreenFromSettings(X86Context& ctx, uint8_t* base,
+                                       const suffering::guest_settings::GuestUserSettings& s) {
+    if (!ValidGuest(kVaUiMgrPtr, 4u)) return;
+    const uint32_t ui_mgr = X86_MEM32(kVaUiMgrPtr);
+    if (!ValidGuest(ui_mgr, 0x60u)) return;
+    const int32_t count = int32_t(X86_MEM32(ui_mgr + 0x50u));
+    const uint32_t arr = X86_MEM32(ui_mgr + 0x48u);
+    if (count <= 0 || count > 64 || !ValidGuest(arr, uint32_t(count) * 4u)) return;
+    const uint32_t top = X86_MEM32(arr + uint32_t(count - 1) * 4u);
+    if (!ValidGuest(top, 0x60u)) return;
+
+    const uint32_t top_vt = X86_MEM32(top);
+    if (top_vt == kVtController && ValidGuest(top, 0x1DCu)) {
+        WriteSettingsToGuestRam(base, top + 0x184u, s);
+        if (s.control_scheme <= 4u) {
+            SelectRadioOptionIfValid(ctx, base, X86_MEM32(top + 0x68u),
+                                     X86_MEM32(top + 0x78u + s.control_scheme * 4u));
+        }
+        SelectRadioOptionIfValid(ctx, base, X86_MEM32(top + 0x6Cu),
+                                 X86_MEM32(top + (s.invert_pitch ? 0x74u : 0x70u)));
+    } else if (top_vt == kVtGameplay && ValidGuest(top, 0x140u)) {
+        WriteSettingsToGuestRam(base, top + 0xE8u, s);
+        if (s.checkpoints <= 2u) {
+            SelectRadioOptionIfValid(ctx, base, X86_MEM32(top + 0x70u),
+                                     X86_MEM32(top + 0x90u + s.checkpoints * 4u));
+        }
+        SelectRadioOptionIfValid(ctx, base, X86_MEM32(top + 0x74u),
+                                 X86_MEM32(top + (s.auto_targeting ? 0xA0u : 0x9Cu)));
+        SelectRadioOptionIfValid(ctx, base, X86_MEM32(top + 0x80u),
+                                 X86_MEM32(top + (s.invert_pitch ? 0xA8u : 0xA4u)));
+        SelectRadioOptionIfValid(ctx, base, X86_MEM32(top + 0x84u),
+                                 X86_MEM32(top + (s.vibration ? 0xB0u : 0xACu)));
+        SelectRadioOptionIfValid(ctx, base, X86_MEM32(top + 0x88u),
+                                 X86_MEM32(top + (s.help_text ? 0xB8u : 0xB4u)));
+        SelectRadioOptionIfValid(ctx, base, X86_MEM32(top + 0x8Cu),
+                                 X86_MEM32(top + (s.auto_pitch_correction ? 0xC0u : 0xBCu)));
+        const uint32_t m0 = X86_MEM32(top + 0x68u);
+        const uint32_t m1 = X86_MEM32(top + 0x6Cu);
+        if (ValidGuest(m0, 0xB0u)) {
+            const float t0 = std::clamp((std::log2(std::max(s.turn_sensitivity, 0.25f)) + 2.0f) * 0.25f, 0.0f, 1.0f);
+            X86_MEMF32(m0 + 0xA8u) = t0;
+            X86_MEMF32(m0 + 0xACu) = t0;
+        }
+        if (ValidGuest(m1, 0xB0u)) {
+            const float t1 = std::clamp((std::log2(std::max(s.pitch_sensitivity, 0.25f)) + 2.0f) * 0.25f, 0.0f, 1.0f);
+            X86_MEMF32(m1 + 0xA8u) = t1;
+            X86_MEMF32(m1 + 0xACu) = t1;
+        }
+    } else if (top_vt == kVtAudio && ValidGuest(top, 0x104u)) {
+        WriteSettingsToGuestRam(base, top + 0xB8u, s);
+        const uint32_t m0 = X86_MEM32(top + 0x68u);
+        const uint32_t m1 = X86_MEM32(top + 0x6Cu);
+        const uint32_t m2 = X86_MEM32(top + 0x70u);
+        if (ValidGuest(m0, 0xB0u)) X86_MEMF32(m0 + 0xA8u) = s.effects_volume;
+        if (ValidGuest(m1, 0xB0u)) X86_MEMF32(m1 + 0xA8u) = s.dialog_volume;
+        if (ValidGuest(m2, 0xB0u)) X86_MEMF32(m2 + 0xA8u) = s.music_volume;
+    } else if (top_vt == kVtScreenAdjust && ValidGuest(top, 0xBCu)) {
+        WriteSettingsToGuestRam(base, top + 0x64u, s);
+    }
+}
+
+void SyncHostSettingsToGuestIfDirty(X86Context& ctx, uint8_t* base) {
+    if (app::IsReplayOrAutotestActive() || !g_boot_settings_initialized) return;
+    GuestSettingsRuntimeState& rt = GuestSettingsRt();
+
+    if (!suffering::UiIsOverlayOpen() && rt.pending_host_save.exchange(false, std::memory_order_acq_rel)) {
+        app::Save();
+    }
+
+    if (!rt.host_to_guest_dirty.exchange(false, std::memory_order_acq_rel)) return;
+    if (!ValidGuest(kVaUserSettings, 0x44u)) return;
+
+    const suffering::guest_settings::GuestUserSettings s = suffering::guest_settings::GetSettings();
+    if (!s.has_saved_values) return;
+
+    g_applying_host_to_guest = true;
+    WriteSettingsToGuestRam(base, kVaUserSettings, s);
+    CallThiscall(ctx, kFnUserSettingsApply, kVaUserSettings, {1u});
+    SyncOpenOptionsScreenFromSettings(ctx, base, s);
+    g_applying_host_to_guest = false;
+}
+
 }  // namespace
+
+namespace suffering::guest_settings {
+
+GuestUserSettings MakeDefaultSettings() { return GuestUserSettings{}; }
+
+GuestUserSettings SanitizeSettings(const GuestUserSettings& in) {
+    GuestUserSettings s = in;
+    if (s.control_scheme > 4u) s.control_scheme = 0u;
+    if (s.checkpoints > 2u) s.checkpoints = 2u;
+    s.screen_offset_x = std::clamp(s.screen_offset_x, -64, 64);
+    s.screen_offset_y = std::clamp(s.screen_offset_y, -64, 64);
+    s.effects_volume = std::isfinite(s.effects_volume) ? std::clamp(s.effects_volume, 0.0f, 1.0f) : 1.0f;
+    s.dialog_volume = std::isfinite(s.dialog_volume) ? std::clamp(s.dialog_volume, 0.0f, 1.0f) : 1.0f;
+    s.music_volume = std::isfinite(s.music_volume) ? std::clamp(s.music_volume, 0.0f, 1.0f) : 1.0f;
+    s.turn_sensitivity = std::isfinite(s.turn_sensitivity) ? std::clamp(s.turn_sensitivity, 0.25f, 4.0f) : 1.0f;
+    s.pitch_sensitivity = std::isfinite(s.pitch_sensitivity) ? std::clamp(s.pitch_sensitivity, 0.25f, 4.0f) : 1.0f;
+    if (!s.stereo) s.surround = false;  // Mono is always (false, false)
+    return s;
+}
+
+GuestUserSettings GetSettings() {
+    GuestSettingsRuntimeState& rt = GuestSettingsRt();
+    std::lock_guard<std::mutex> lock(rt.mtx);
+    return rt.current;
+}
+
+void SetSettingsFromConfig(const GuestUserSettings& s) {
+    GuestSettingsRuntimeState& rt = GuestSettingsRt();
+    const GuestUserSettings clean = SanitizeSettings(s);
+    {
+        std::lock_guard<std::mutex> lock(rt.mtx);
+        rt.current = clean;
+        rt.last_saved = clean;
+    }
+    if (clean.has_saved_values) {
+        rt.host_to_guest_dirty.store(true, std::memory_order_release);
+    }
+}
+
+void ResetToDefaults(bool push_to_guest) {
+    GuestSettingsRuntimeState& rt = GuestSettingsRt();
+    GuestUserSettings def = MakeDefaultSettings();
+    def.has_saved_values = push_to_guest;
+    {
+        std::lock_guard<std::mutex> lock(rt.mtx);
+        rt.current = def;
+        rt.last_saved = def;
+    }
+    if (push_to_guest) {
+        rt.host_to_guest_dirty.store(true, std::memory_order_release);
+    }
+}
+
+bool ConsumePendingHostSaveRequest() {
+    if (app::IsReplayOrAutotestActive()) return false;
+    return GuestSettingsRt().pending_host_save.exchange(false, std::memory_order_acq_rel);
+}
+
+bool GetControllerInvertY() { return GetSettings().invert_pitch; }
+
+void SetControllerInvertY(bool inverted) {
+    GuestSettingsRuntimeState& rt = GuestSettingsRt();
+    {
+        std::lock_guard<std::mutex> lock(rt.mtx);
+        rt.current.invert_pitch = inverted;
+        rt.current.has_saved_values = true;
+        rt.last_saved = rt.current;
+    }
+    rt.host_to_guest_dirty.store(true, std::memory_order_release);
+}
+
+bool GetControllerVibration() { return GetSettings().vibration; }
+
+void SetControllerVibration(bool enabled) {
+    GuestSettingsRuntimeState& rt = GuestSettingsRt();
+    {
+        std::lock_guard<std::mutex> lock(rt.mtx);
+        rt.current.vibration = enabled;
+        rt.current.has_saved_values = true;
+        rt.last_saved = rt.current;
+    }
+    rt.host_to_guest_dirty.store(true, std::memory_order_release);
+}
+
+uint32_t GetControllerScheme() { return GetSettings().control_scheme; }
+
+void SetControllerScheme(uint32_t scheme) {
+    GuestSettingsRuntimeState& rt = GuestSettingsRt();
+    const uint32_t clamped = (scheme <= 4u) ? scheme : 0u;
+    {
+        std::lock_guard<std::mutex> lock(rt.mtx);
+        rt.current.control_scheme = clamped;
+        rt.current.has_saved_values = true;
+        rt.last_saved = rt.current;
+    }
+    rt.host_to_guest_dirty.store(true, std::memory_order_release);
+}
+
+float GetControllerTurnSensitivity() { return GetSettings().turn_sensitivity; }
+
+void SetControllerTurnSensitivity(float sens) {
+    GuestSettingsRuntimeState& rt = GuestSettingsRt();
+    const float clamped = std::isfinite(sens) ? std::clamp(sens, 0.25f, 4.0f) : 1.0f;
+    {
+        std::lock_guard<std::mutex> lock(rt.mtx);
+        rt.current.turn_sensitivity = clamped;
+        rt.current.has_saved_values = true;
+        rt.last_saved = rt.current;
+    }
+    rt.host_to_guest_dirty.store(true, std::memory_order_release);
+}
+
+float GetControllerPitchSensitivity() { return GetSettings().pitch_sensitivity; }
+
+void SetControllerPitchSensitivity(float sens) {
+    GuestSettingsRuntimeState& rt = GuestSettingsRt();
+    const float clamped = std::isfinite(sens) ? std::clamp(sens, 0.25f, 4.0f) : 1.0f;
+    {
+        std::lock_guard<std::mutex> lock(rt.mtx);
+        rt.current.pitch_sensitivity = clamped;
+        rt.current.has_saved_values = true;
+        rt.last_saved = rt.current;
+    }
+    rt.host_to_guest_dirty.store(true, std::memory_order_release);
+}
+
+bool GetSubtitles() { return GetSettings().subtitles; }
+
+void SetSubtitles(bool enabled) {
+    GuestSettingsRuntimeState& rt = GuestSettingsRt();
+    {
+        std::lock_guard<std::mutex> lock(rt.mtx);
+        rt.current.subtitles = enabled;
+        rt.current.has_saved_values = true;
+        rt.last_saved = rt.current;
+    }
+    rt.host_to_guest_dirty.store(true, std::memory_order_release);
+}
+
+}  // namespace suffering::guest_settings
 
 // 1. InputMgr::SetControlTable — upgrade Default Scheme 0 (0x002BE260, R3 unbound) to Scheme 1
 // (0x002BE8E0, 100% identical to Scheme 0 plus R3 -> action 1054 Flashlight Toggle) so the F key
@@ -1210,8 +1876,13 @@ X86_FUNC(sub_0014E1F0) {
     __imp__sub_0014E1F0(ctx, base);
 }
 
-// 2. CXboxInputDevice::Poll (__thiscall) — post-deadzone framerate-independent linear mouse injection.
+// 2. CXboxInputDevice::Poll (__thiscall) — post-deadzone framerate-independent linear mouse injection
+// and per-frame live host-to-guest CUserSettings synchronization (even in ControllerOnly mode).
 X86_FUNC(sub_001B09A0) {
+    if (!app::IsReplayOrAutotestActive()) {
+        SyncHostSettingsToGuestIfDirty(ctx, base);
+    }
+
     if (app::IsReplayOrAutotestActive() ||
         suffering::MkbGetConfig().input_mode == suffering::InputMode::ControllerOnly) {
         __imp__sub_001B09A0(ctx, base);
@@ -1323,9 +1994,145 @@ X86_FUNC(sub_00265C7B) {
 // Runs native PC menu mouse hover, click, slider drag/step, wheel scroll, and RMB cancel on the
 // guest thread immediately after CUIMgr flushes deferred pushes and aligns active screens.
 X86_FUNC(sub_0005F9A0) {
+    if (!app::IsReplayOrAutotestActive()) {
+        SyncHostSettingsToGuestIfDirty(ctx, base);
+    }
     const uint32_t ui_mgr = ctx.ecx;
     __imp__sub_0005F9A0(ctx, base);
     HandleMenuMousePostUpdate(ctx, base, ui_mgr);
+}
+
+// 7a. Host-persisted CUserSettings (0x002DB218) lifecycle & persistence hooks
+// (strictly bypassed when app::IsReplayOrAutotestActive() is true so replay traces keep 0.0 drift):
+//  - sub_00016CA0: CUserSettings::ResetDefaults (__thiscall, ret 0)
+//  - sub_00016B60: CUserSettings::Apply(int apply_audio) (__thiscall, ret 4)
+//  - sub_00016D00: CUserSettings::CopyFrom(const CUserSettings*) (__thiscall, ret 4)
+//  - sub_00016F10: CUserSettings::LoadFromXboxSaveContainer(int slot, int load_audio) (__thiscall, ret 8)
+X86_FUNC(sub_00016CA0) {
+    const uint32_t self_va = ctx.ecx;
+    __imp__sub_00016CA0(ctx, base);
+    if (!app::IsReplayOrAutotestActive() && !g_applying_host_to_guest && self_va == kVaUserSettings &&
+        ValidGuest(kVaUserSettings, 0x44u)) {
+        const suffering::guest_settings::GuestUserSettings s = suffering::guest_settings::GetSettings();
+        if (s.has_saved_values) {
+            WriteSettingsToGuestRam(base, kVaUserSettings, s);
+        }
+    }
+}
+
+X86_FUNC(sub_00016B60) {
+    const uint32_t self_va = ctx.ecx;
+    if (!app::IsReplayOrAutotestActive() && !g_applying_host_to_guest && self_va == kVaUserSettings &&
+        !g_boot_settings_initialized && ValidGuest(kVaUserSettings, 0x44u)) {
+        g_boot_settings_initialized = true;
+        GuestSettingsRuntimeState& rt = GuestSettingsRt();
+        rt.host_to_guest_dirty.store(false, std::memory_order_release);
+
+        bool applied_persisted = false;
+        suffering::guest_settings::GuestUserSettings persisted{};
+        {
+            std::lock_guard<std::mutex> lock(rt.mtx);
+            if (rt.current.has_saved_values) {
+                persisted = rt.current;
+                applied_persisted = true;
+            } else {
+                suffering::guest_settings::GuestUserSettings boot_snap =
+                    ReadSettingsFromGuestRam(base, kVaUserSettings);
+                boot_snap.has_saved_values = false;
+                rt.current = boot_snap;
+                rt.last_saved = boot_snap;
+            }
+        }
+        if (applied_persisted) {
+            WriteSettingsToGuestRam(base, kVaUserSettings, persisted);
+            if (ValidGuest(ctx.esp + 0x04u, 4u)) {
+                X86_MEM32(ctx.esp + 0x04u) = 1u;  // Ensure persisted audio bus volumes (+0x0C..+0x14) apply on boot
+            }
+            LOGI("settings: applied persisted [game_options] on boot (invert_pitch=%u, scheme=%u, vib=%u, sub=%u)",
+                 persisted.invert_pitch ? 1u : 0u, persisted.control_scheme, persisted.vibration ? 1u : 0u,
+                 persisted.subtitles ? 1u : 0u);
+        }
+    }
+
+    __imp__sub_00016B60(ctx, base);
+
+    if (!app::IsReplayOrAutotestActive() && !g_applying_host_to_guest && self_va == kVaUserSettings &&
+        g_save_pending_after_drag) {
+        FlushPendingDragSettingsSave();
+    }
+}
+
+X86_FUNC(sub_00016D00) {
+    const uint32_t dst_va = ctx.ecx;
+    __imp__sub_00016D00(ctx, base);
+    if (!app::IsReplayOrAutotestActive() && !g_applying_host_to_guest && dst_va == kVaUserSettings) {
+        OnGuestSettingsCommittedFromMenu(base);
+    }
+}
+
+X86_FUNC(sub_00016F10) {
+    const uint32_t dst_va = ctx.ecx;
+    const bool post_boot_explicit_load = g_boot_settings_initialized;
+    __imp__sub_00016F10(ctx, base);
+    if (!app::IsReplayOrAutotestActive() && !g_applying_host_to_guest && dst_va == kVaUserSettings &&
+        ValidGuest(kVaUserSettings, 0x44u)) {
+        if (!post_boot_explicit_load) {
+            // Cold-boot LoadFromXboxSaveContainer(1, 0) at 0x000BFD3C: keep unlocked Archive/Prelude flags
+            // (+0x44/+0x48/+0x50) from any Xbox container, while preserving host settings.toml preferences.
+            const suffering::guest_settings::GuestUserSettings s = suffering::guest_settings::GetSettings();
+            if (s.has_saved_values) {
+                WriteSettingsToGuestRam(base, kVaUserSettings, s);
+            }
+        } else if (ctx.eax == 0u) {
+            // Explicit user "Options -> Load Settings" in-game succeeded: mirror into settings.toml!
+            OnGuestSettingsCommittedFromMenu(base);
+        }
+    }
+}
+
+// 7b. CMainMenuGui "Quit Game" lifecycle, layout, state/cross-fade sync, and activation hooks
+// (strictly bypassed when app::IsReplayOrAutotestActive() is true so replay traces have 0.0 drift):
+//  - sub_0006F2A0: CMainMenuGui::~CMainMenuGui (__thiscall, ret 0)
+//  - sub_0006F450: CMainMenuGui::Layout (__thiscall, ret 0, returns 1 in eax once ready)
+//  - sub_00071B00: CMainMenuGui::Update (__thiscall, ret 0)
+//  - sub_00072120: CMainMenuGui::Notify (__thiscall, ret 4, ecx = menu + 0x60, [esp+4] = sender)
+X86_FUNC(sub_0006F2A0) {
+    const uint32_t menu_va = ctx.ecx;
+    if (menu_va != 0u && menu_va == g_main_menu_quit.menu_va) {
+        g_main_menu_quit.Clear();
+    }
+    __imp__sub_0006F2A0(ctx, base);
+}
+
+X86_FUNC(sub_0006F450) {
+    const uint32_t menu_va = ctx.ecx;
+    __imp__sub_0006F450(ctx, base);
+    if (!app::IsReplayOrAutotestActive() && ctx.eax != 0u) {
+        const uint32_t saved_eax = ctx.eax;
+        EnsureAndSyncMainMenuQuitButton(ctx, base, menu_va, true);
+        ctx.eax = saved_eax;
+    }
+}
+
+X86_FUNC(sub_00071B00) {
+    const uint32_t menu_va = ctx.ecx;
+    __imp__sub_00071B00(ctx, base);
+    if (!app::IsReplayOrAutotestActive()) {
+        const uint32_t saved_eax = ctx.eax;
+        EnsureAndSyncMainMenuQuitButton(ctx, base, menu_va, false);
+        ctx.eax = saved_eax;
+    }
+}
+
+X86_FUNC(sub_00072120) {
+    const uint32_t listener_va = ctx.ecx;
+    const uint32_t sender_va = ValidGuest(ctx.esp + 0x04u, 4u) ? X86_MEM32(ctx.esp + 0x04u) : 0u;
+    __imp__sub_00072120(ctx, base);
+    if (!app::IsReplayOrAutotestActive() && listener_va >= 0x60u &&
+        (listener_va - 0x60u) == g_main_menu_quit.menu_va && sender_va != 0u &&
+        sender_va == g_main_menu_quit.btn_va) {
+        RequestCleanHostQuit();
+    }
 }
 
 // 8. Sub-microsecond CClock (0x002DC724) lifecycle & tick hooks (NOT bypassed during replay/autotest):

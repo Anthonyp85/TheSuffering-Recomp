@@ -1893,7 +1893,7 @@ int CompareSemVer(const SemVer& a, const SemVer& b) {
     if (a.minor != b.minor) return a.minor < b.minor ? -1 : 1;
     if (a.patch != b.patch) return a.patch < b.patch ? -1 : 1;
     if (a.is_prerelease != b.is_prerelease) {
-        // Normal release outranks pre-release of the same major.minor.patch (e.g. 1.5.0 > 1.5.0-rc.1)
+        // Normal release outranks pre-release of the same major.minor.patch (e.g. 1.6.0 > 1.6.0-rc.1)
         return a.is_prerelease ? -1 : 1;
     }
     if (!a.is_prerelease) return 0;

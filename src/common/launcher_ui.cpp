@@ -346,6 +346,7 @@ bool DrawLauncherUpdateAlertIfNeeded(const UpdateStatusSnapshot& snap, float ui_
     };
     uctx.on_dismiss = [&](const std::string& tag) {
         GetSharedUiOptions().dismissed_update_tag = tag;
+        if (!HasMockUpdateEnv()) app::Save();
         set_status("Dismissed update alert for " + tag + " (click 'Check for Updates' to show again).", false);
     };
     DrawUpdateAlertCard(snap, uctx);
@@ -911,7 +912,10 @@ bool RunLauncher(void* hinstance) {
             ImGui::TextUnformatted("- PC Recompilation Launcher " SUFFERING_VERSION_TAG);
             if (lctx.fonts.heading) ImGui::PopFont();
             DrawLauncherHeaderUpdateButton(upd_snap, lctx.ui_scale, [&] {
-                GetSharedUiOptions().dismissed_update_tag.clear();
+                if (!GetSharedUiOptions().dismissed_update_tag.empty()) {
+                    GetSharedUiOptions().dismissed_update_tag.clear();
+                    if (!HasMockUpdateEnv()) app::Save();
+                }
                 upd_tracker.manual_pending = true;
                 set_status("Checking GitHub Releases for updates...", false);
                 StartUpdateCheck(true);
@@ -1100,6 +1104,10 @@ bool RunLauncher(void* hinstance) {
                         ImGui::Spacing();
                         SharedUiOptions& o = GetSharedUiOptions();
                         if (ImGui::Checkbox("Show Live FPS, Frame-Time & Upscaler HUD In-Game", &o.show_fps_hud)) {
+                            app::Save();
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Checkbox("Show Active Cheats Badge on HUD##LnchCheatsHud", &o.show_cheats_hud)) {
                             app::Save();
                         }
                         if (ImGui::Checkbox("Automatically Check for Updates on Startup", &o.check_updates_on_startup)) {
@@ -1486,7 +1494,10 @@ bool RunLauncher(void* /*hinstance*/) {
             ImGui::TextUnformatted("- PC Recompilation Launcher " SUFFERING_VERSION_TAG);
             if (fonts.heading) ImGui::PopFont();
             DrawLauncherHeaderUpdateButton(upd_snap, ui_scale, [&] {
-                GetSharedUiOptions().dismissed_update_tag.clear();
+                if (!GetSharedUiOptions().dismissed_update_tag.empty()) {
+                    GetSharedUiOptions().dismissed_update_tag.clear();
+                    if (!HasMockUpdateEnv()) app::Save();
+                }
                 upd_tracker.manual_pending = true;
                 set_status("Checking GitHub Releases for updates...", false);
                 StartUpdateCheck(true);
@@ -1657,6 +1668,10 @@ bool RunLauncher(void* /*hinstance*/) {
                         ImGui::Spacing();
                         SharedUiOptions& o = GetSharedUiOptions();
                         if (ImGui::Checkbox("Show Live FPS, Frame-Time & Upscaler HUD In-Game", &o.show_fps_hud)) {
+                            app::Save();
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Checkbox("Show Active Cheats Badge on HUD##LnchCheatsHud", &o.show_cheats_hud)) {
                             app::Save();
                         }
                         if (ImGui::Checkbox("Automatically Check for Updates on Startup", &o.check_updates_on_startup)) {

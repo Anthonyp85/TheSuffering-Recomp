@@ -26,6 +26,7 @@ struct SharedUiOptions {
     uint32_t stick_deadzone = 0;
     bool touchpad_as_back = true;
     bool show_fps_hud = false;
+    bool show_cheats_hud = true;
     bool check_updates_on_startup = true;
     std::string dismissed_update_tag;
 };
@@ -74,6 +75,7 @@ void DrawUpscalingGraphicsPanel(const UiPanelContext& ctx);
 void DrawDisplayGpuPanel(const UiPanelContext& ctx);
 void DrawAudioPanel(const UiPanelContext& ctx);
 void DrawControlsPanel(const UiPanelContext& ctx);
+void DrawCheatsPanel(float ui_scale, const std::function<void(const std::string&, bool)>& set_status);
 
 std::string WideToUtf8Str(const std::wstring& w);
 std::wstring Utf8ToWideStr(const std::string& s);

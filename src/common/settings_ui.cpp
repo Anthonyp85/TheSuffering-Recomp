@@ -17,10 +17,13 @@
 #include "common/ui_common.h"
 #include "common/update_checker.h"
 #include "common/version.h"
+#include "game/cheats.h"
+#include "game/guest_settings.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -64,9 +67,16 @@ enum class UiAction : uintptr_t {
     QuitForStagedUpdate = 9,
 };
 
+constexpr int kSettingsTabCount = 6;
+constexpr int kTabCheats = 5;
+
 std::atomic<bool> g_overlay_open{false};
 bool g_was_pad_active = false;
-int g_requested_tab = -1;
+bool g_was_overlay_open_ui = false;
+bool g_prev_pad_l1 = false;
+bool g_prev_pad_r1 = false;
+std::atomic<int> g_requested_tab{-1};
+std::atomic<int> g_selected_tab{0};
 #ifndef _WIN32
 XisoFileBrowser g_file_browser;
 #endif
@@ -101,6 +111,7 @@ struct UpdateCheckerProcessExitGuard {
 fs::path g_capture_ui_path;
 bool g_capture_ui_exit = false;
 bool g_suppress_warmup_toast = false;
+bool g_force_fps_hud_cli = false;
 uint32_t g_ui_frames_drawn = 0;
 bool g_capture_ui_requested = false;
 bool g_capture_ui_exit_posted = false;
@@ -358,6 +369,43 @@ void DrawUpdateAvailableToast(const UpdateStatusSnapshot& snap, float alpha, flo
     ImGui::PopStyleVar();
 }
 
+bool ShouldShowActiveCheatsHud(const SharedUiOptions& o, uint32_t& out_active_count) {
+    out_active_count = 0;
+    if (!o.show_cheats_hud) return false;
+    if (g_suppress_warmup_toast || !g_capture_ui_path.empty() || app::IsReplayOrAutotestActive()) return false;
+    uint32_t count = cheats::GetActiveToggleCount();
+    if (count == 0) return false;
+    out_active_count = count;
+    return true;
+}
+
+void DrawActiveCheatsHud(uint32_t active_count, float ui_scale) {
+    ImGuiIO& io = ImGui::GetIO();
+    float s = std::clamp(ui_scale, 1.0f, 2.5f);
+    ImGui::SetNextWindowPos(ImVec2(14.0f * s, io.DisplaySize.y - 14.0f * s), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.76f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * s, 4.5f * s));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.11f, 0.068f, 0.078f, 0.80f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.86f, 0.28f, 0.28f, 0.80f));
+    constexpr ImGuiWindowFlags kPillFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                            ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
+    if (ImGui::Begin("##SufferingActiveCheatsHud", nullptr, kPillFlags)) {
+        const float line_h = ImGui::GetTextLineHeight();
+        const float dot_r = std::max(3.0f, std::round(3.5f * s));
+        const ImVec2 cur = ImGui::GetCursorScreenPos();
+        ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(cur.x + dot_r, cur.y + line_h * 0.5f), dot_r,
+                                                    IM_COL32(246, 92, 84, 245));
+        ImGui::Dummy(ImVec2(dot_r * 2.0f + 2.0f * s, line_h));
+        ImGui::SameLine(0.0f, 4.0f * s);
+        ImGui::TextColored(ImVec4(0.98f, 0.84f, 0.58f, 0.96f), "CHEATS ACTIVE (%u)", active_count);
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+}
+
 void PollInGameUpdateTransitions(const UpdateStatusSnapshot& snap) {
     if (g_ingame_upd_manual_pending && snap.state != UpdateState::Checking && snap.state != UpdateState::Idle) {
         g_ingame_upd_manual_pending = false;
@@ -396,8 +444,8 @@ void DrawSettingsWindow(double fps, float ui_scale) {
     RefreshMonitorLists(g_monitors, g_resolutions, g_res_device, s.monitor);
 
     ImGuiIO& io = ImGui::GetIO();
-    ImVec2 win_size(std::min(820.0f * ui_scale, io.DisplaySize.x * 0.94f),
-                    std::min(580.0f * ui_scale, io.DisplaySize.y * 0.92f));
+    ImVec2 win_size(std::min(860.0f * ui_scale, io.DisplaySize.x * 0.94f),
+                    std::min(640.0f * ui_scale, io.DisplaySize.y * 0.94f));
     ImGui::SetNextWindowSize(win_size, ImGuiCond_Always);
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
                             ImVec2(0.5f, 0.5f));
@@ -422,8 +470,8 @@ void DrawSettingsWindow(double fps, float ui_scale) {
     };
 
     auto tab_flags = [](int idx) -> ImGuiTabItemFlags {
-        if (g_requested_tab == idx) {
-            g_requested_tab = -1;
+        int expected = idx;
+        if (g_requested_tab.compare_exchange_strong(expected, -1, std::memory_order_acq_rel)) {
             return ImGuiTabItemFlags_SetSelected;
         }
         return 0;
@@ -432,13 +480,21 @@ void DrawSettingsWindow(double fps, float ui_scale) {
     UpdateStatusSnapshot upd_snap = GetUpdateSnapshot();
     PollInGameUpdateTransitions(upd_snap);
 
+    bool has_banner_pre = false;
+    {
+        std::lock_guard<std::mutex> lock(g_status_lock);
+        has_banner_pre = !g_status_banner.empty();
+    }
+
     bool open = true;
     constexpr ImGuiWindowFlags kFlags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
                                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings;
-    if (ImGui::Begin("The Suffering " SUFFERING_VERSION_TAG " - Settings (F1 or Back + L3 to Close)", &open, kFlags)) {
+    if (ImGui::Begin("The Suffering " SUFFERING_VERSION_TAG " - Settings & Cheats (F1 / F2 or Back + L3 to Close)",
+                     &open, kFlags)) {
         if (ImGui::BeginTabBar("##SettingsTabs")) {
             // 1. Upscaling & Graphics Tab
             if (ImGui::BeginTabItem("Upscaling & Graphics", nullptr, tab_flags(0))) {
+                g_selected_tab.store(0, std::memory_order_release);
                 ImGui::Spacing();
                 DrawUpscalingGraphicsPanel(pctx);
                 gpu::UpscalerStatus us = gpu::GetUpscalerStatus();
@@ -452,6 +508,7 @@ void DrawSettingsWindow(double fps, float ui_scale) {
 
             // 2. Display & GPU Tab
             if (ImGui::BeginTabItem("Display & GPU", nullptr, tab_flags(1))) {
+                g_selected_tab.store(1, std::memory_order_release);
                 ImGui::Spacing();
                 DrawDisplayGpuPanel(pctx);
                 ImGui::SameLine();
@@ -465,6 +522,7 @@ void DrawSettingsWindow(double fps, float ui_scale) {
 
             // 3. Controls Tab (Mouse & Keyboard + Controller)
             if (ImGui::BeginTabItem("Controls", nullptr, tab_flags(2))) {
+                g_selected_tab.store(2, std::memory_order_release);
                 ImGui::Spacing();
                 DrawControlsPanel(pctx);
                 ImGui::EndTabItem();
@@ -472,6 +530,7 @@ void DrawSettingsWindow(double fps, float ui_scale) {
 
             // 4. Audio Tab
             if (ImGui::BeginTabItem("Audio", nullptr, tab_flags(3))) {
+                g_selected_tab.store(3, std::memory_order_release);
                 ImGui::Spacing();
                 DrawAudioPanel(pctx);
                 ImGui::EndTabItem();
@@ -479,6 +538,7 @@ void DrawSettingsWindow(double fps, float ui_scale) {
 
             // 5. Launcher & Diagnostics Tab
             if (ImGui::BeginTabItem("Launcher & Diagnostics", nullptr, tab_flags(4))) {
+                g_selected_tab.store(4, std::memory_order_release);
                 ImGui::Spacing();
                 SharedUiOptions& o = GetSharedUiOptions();
 
@@ -521,6 +581,7 @@ void DrawSettingsWindow(double fps, float ui_scale) {
                     };
                     uctx.on_dismiss = [&](const std::string& tag) {
                         o.dismissed_update_tag = tag;
+                        app::Save();
                         SetStatus("Dismissed update alert for " + tag + " (click 'Check for Updates' to show again).",
                                   false);
                     };
@@ -533,7 +594,10 @@ void DrawSettingsWindow(double fps, float ui_scale) {
                 if (upd_busy) ImGui::BeginDisabled(true);
                 if (ImGui::Button(upd_snap.state == UpdateState::Checking ? "Checking...##InGameUpdBtn"
                                                                           : "Check for Updates##InGameUpdBtn")) {
-                    o.dismissed_update_tag.clear();
+                    if (!o.dismissed_update_tag.empty()) {
+                        o.dismissed_update_tag.clear();
+                        app::Save();
+                    }
                     g_ingame_upd_manual_pending = true;
                     SetStatus("Checking GitHub Releases for updates...", false);
                     StartUpdateCheck(true);
@@ -675,6 +739,17 @@ void DrawSettingsWindow(double fps, float ui_scale) {
                 ImGui::EndTabItem();
             }
 
+            // 6. Cheats Tab (Quick-Toggle via F2)
+            if (ImGui::BeginTabItem("Cheats", nullptr, tab_flags(kTabCheats))) {
+                g_selected_tab.store(kTabCheats, std::memory_order_release);
+                float body_h = has_banner_pre ? -std::round(28.0f * ui_scale) : 0.0f;
+                if (ImGui::BeginChild("##CheatsTabBody", ImVec2(0.0f, body_h), ImGuiChildFlags_NavFlattened)) {
+                    DrawCheatsPanel(ui_scale, pctx.set_status);
+                }
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+
             ImGui::EndTabBar();
         }
 
@@ -728,9 +803,48 @@ std::vector<app::Option> UiOptions() {
         {"stick_deadzone", nullptr, &o.stick_deadzone},
         {"touchpad_as_back", &o.touchpad_as_back, nullptr},
         {"show_fps_hud", &o.show_fps_hud, nullptr},
+        {"show_cheats_hud", &o.show_cheats_hud, nullptr},
         {"check_updates_on_startup", &o.check_updates_on_startup, nullptr},
     };
 }
+
+namespace {
+
+int ParseSettingsTabArg(const std::string& val) {
+    std::string low = val;
+    for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (low == "cheats" || low == "cheat") return kTabCheats;
+    return std::clamp(std::atoi(val.c_str()), 0, kSettingsTabCount - 1);
+}
+
+void ToggleOrSwitchCheatsOverlay(void* hwnd_ptr) {
+    bool was_open = g_overlay_open.load(std::memory_order_acquire);
+    int cur_tab = g_selected_tab.load(std::memory_order_acquire);
+    int req_tab = g_requested_tab.load(std::memory_order_acquire);
+    int effective_tab = (req_tab >= 0) ? req_tab : cur_tab;
+    if (!was_open) {
+        g_requested_tab.store(kTabCheats, std::memory_order_release);
+        g_selected_tab.store(kTabCheats, std::memory_order_release);
+        g_overlay_open.store(true, std::memory_order_release);
+        SyncImGuiCursorFlag(true);
+        MkbOnOverlayToggled(true, hwnd_ptr);
+    } else if (effective_tab == kTabCheats) {
+        g_overlay_open.store(false, std::memory_order_release);
+#ifndef _WIN32
+        g_file_browser.Close();
+#endif
+        SyncImGuiCursorFlag(false);
+        MkbOnOverlayToggled(false, hwnd_ptr);
+    } else {
+#ifndef _WIN32
+        g_file_browser.Close();
+#endif
+        g_requested_tab.store(kTabCheats, std::memory_order_release);
+        g_selected_tab.store(kTabCheats, std::memory_order_release);
+    }
+}
+
+}  // namespace
 
 void UiInit() {
     SharedUiOptions& o = GetSharedUiOptions();
@@ -743,12 +857,20 @@ void UiInit() {
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == L"--open-settings") {
             g_overlay_open.store(true, std::memory_order_release);
+        } else if (args[i] == L"--open-cheats") {
+            g_overlay_open.store(true, std::memory_order_release);
+            g_requested_tab.store(kTabCheats, std::memory_order_release);
+            g_selected_tab.store(kTabCheats, std::memory_order_release);
         } else if (args[i] == L"--settings-tab" && i + 1 < args.size()) {
-            g_requested_tab = std::clamp(_wtoi(args[++i].c_str()), 0, 4);
+            int t = ParseSettingsTabArg(WideToUtf8Str(args[++i]));
+            g_requested_tab.store(t, std::memory_order_release);
+            g_selected_tab.store(t, std::memory_order_release);
         } else if (args[i].rfind(L"--settings-tab=", 0) == 0) {
-            g_requested_tab = std::clamp(_wtoi(args[i].c_str() + 15), 0, 4);
+            int t = ParseSettingsTabArg(WideToUtf8Str(args[i].substr(15)));
+            g_requested_tab.store(t, std::memory_order_release);
+            g_selected_tab.store(t, std::memory_order_release);
         } else if (args[i] == L"--show-fps-hud") {
-            o.show_fps_hud = true;
+            g_force_fps_hud_cli = true;
         } else if (args[i] == L"--capture-ui-bmp" && i + 1 < args.size()) {
             g_capture_ui_path = fs::path(args[++i]);
         } else if (args[i].rfind(L"--capture-ui-bmp=", 0) == 0) {
@@ -762,6 +884,11 @@ void UiInit() {
     if (const wchar_t* v = _wgetenv(L"XBE_OPEN_SETTINGS"); v && *v && _wtoi(v) != 0) {
         g_overlay_open.store(true, std::memory_order_release);
     }
+    if (const wchar_t* v = _wgetenv(L"XBE_OPEN_CHEATS"); v && *v && _wtoi(v) != 0) {
+        g_overlay_open.store(true, std::memory_order_release);
+        g_requested_tab.store(kTabCheats, std::memory_order_release);
+        g_selected_tab.store(kTabCheats, std::memory_order_release);
+    }
     if (const wchar_t* v = _wgetenv(L"XBE_CAPTURE_UI_BMP"); v && *v && g_capture_ui_path.empty()) {
         g_capture_ui_path = fs::path(v);
     }
@@ -773,12 +900,20 @@ void UiInit() {
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "--open-settings") {
             g_overlay_open.store(true, std::memory_order_release);
+        } else if (args[i] == "--open-cheats") {
+            g_overlay_open.store(true, std::memory_order_release);
+            g_requested_tab.store(kTabCheats, std::memory_order_release);
+            g_selected_tab.store(kTabCheats, std::memory_order_release);
         } else if (args[i] == "--settings-tab" && i + 1 < args.size()) {
-            g_requested_tab = std::clamp(std::atoi(args[++i].c_str()), 0, 4);
+            int t = ParseSettingsTabArg(args[++i]);
+            g_requested_tab.store(t, std::memory_order_release);
+            g_selected_tab.store(t, std::memory_order_release);
         } else if (args[i].rfind("--settings-tab=", 0) == 0) {
-            g_requested_tab = std::clamp(std::atoi(args[i].c_str() + 15), 0, 4);
+            int t = ParseSettingsTabArg(args[i].substr(15));
+            g_requested_tab.store(t, std::memory_order_release);
+            g_selected_tab.store(t, std::memory_order_release);
         } else if (args[i] == "--show-fps-hud") {
-            o.show_fps_hud = true;
+            g_force_fps_hud_cli = true;
         } else if (args[i] == "--capture-ui-bmp" && i + 1 < args.size()) {
             g_capture_ui_path = fs::path(args[++i]);
         } else if (args[i].rfind("--capture-ui-bmp=", 0) == 0) {
@@ -791,6 +926,11 @@ void UiInit() {
     }
     if (const char* v = std::getenv("XBE_OPEN_SETTINGS"); v && *v && std::atoi(v) != 0) {
         g_overlay_open.store(true, std::memory_order_release);
+    }
+    if (const char* v = std::getenv("XBE_OPEN_CHEATS"); v && *v && std::atoi(v) != 0) {
+        g_overlay_open.store(true, std::memory_order_release);
+        g_requested_tab.store(kTabCheats, std::memory_order_release);
+        g_selected_tab.store(kTabCheats, std::memory_order_release);
     }
     if (const char* v = std::getenv("XBE_CAPTURE_UI_BMP"); v && *v && g_capture_ui_path.empty()) {
         g_capture_ui_path = fs::path(v);
@@ -848,6 +988,13 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
                 g_overlay_open.store(next, std::memory_order_release);
                 SyncImGuiCursorFlag(next);
                 MkbOnOverlayToggled(next, hwnd);
+                if (result) *result = 0;
+                return true;
+            }
+            if (wp == VK_F2 && !app::IsReplayOrAutotestActive()) {
+                if ((lp & (1ll << 30)) == 0) {
+                    ToggleOrSwitchCheatsOverlay(hwnd);
+                }
                 if (result) *result = 0;
                 return true;
             }
@@ -964,6 +1111,11 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
                 if (result) *result = 0;
                 return true;
             }
+            if (ev->key.key == SDLK_F2 && !app::IsReplayOrAutotestActive()) {
+                ToggleOrSwitchCheatsOverlay(hwnd_ptr);
+                if (result) *result = 0;
+                return true;
+            }
             if (ev->key.key == SDLK_ESCAPE && g_overlay_open.load(std::memory_order_relaxed)) {
                 if (g_file_browser.IsOpen()) return false;  // Let the modal handle Esc first
                 g_overlay_open.store(false, std::memory_order_release);
@@ -1039,6 +1191,10 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
 }
 
 void OnUi(double fps) {
+    if (guest_settings::ConsumePendingHostSaveRequest()) {
+        app::Save();
+    }
+
     if (g_rumble_test_active.load(std::memory_order_acquire) &&
         std::chrono::steady_clock::now() >= g_rumble_test_until) {
         g_rumble_test_active.store(false, std::memory_order_release);
@@ -1058,6 +1214,35 @@ void OnUi(double fps) {
     }
     FeedPadToImGui(p, open, g_was_pad_active);
 
+    if (open) {
+        bool modal_blocking = MkbIsRebinding();
+#ifndef _WIN32
+        if (g_file_browser.IsOpen()) modal_blocking = true;
+#endif
+        bool l1 = p.connected && !modal_blocking && p.analog[5] > 64;
+        bool r1 = p.connected && !modal_blocking && p.analog[4] > 64;
+        if (g_was_overlay_open_ui) {
+            int cur_tab = g_selected_tab.load(std::memory_order_acquire);
+            int req_tab = g_requested_tab.load(std::memory_order_acquire);
+            int base_tab = (req_tab >= 0) ? req_tab : cur_tab;
+            if (l1 && !g_prev_pad_l1) {
+                int next_tab = (base_tab + kSettingsTabCount - 1) % kSettingsTabCount;
+                g_requested_tab.store(next_tab, std::memory_order_release);
+                g_selected_tab.store(next_tab, std::memory_order_release);
+            } else if (r1 && !g_prev_pad_r1) {
+                int next_tab = (base_tab + 1) % kSettingsTabCount;
+                g_requested_tab.store(next_tab, std::memory_order_release);
+                g_selected_tab.store(next_tab, std::memory_order_release);
+            }
+        }
+        g_prev_pad_l1 = l1;
+        g_prev_pad_r1 = r1;
+    } else {
+        g_prev_pad_l1 = false;
+        g_prev_pad_r1 = false;
+    }
+    g_was_overlay_open_ui = open;
+
     SharedUiOptions& o = GetSharedUiOptions();
     gpu::ShaderWarmupStatus warmup_ws{};
     float warmup_alpha = 0.0f;
@@ -1070,10 +1255,14 @@ void OnUi(double fps) {
         show_update_toast =
             ShouldShowUpdateAvailableToast(toast_upd_snap, o.dismissed_update_tag, open, update_toast_alpha);
     }
-    if (o.show_fps_hud || open || show_warmup || show_update_toast) {
+    uint32_t active_cheats_count = 0;
+    bool show_cheats_hud = ShouldShowActiveCheatsHud(o, active_cheats_count);
+    bool show_fps = o.show_fps_hud || g_force_fps_hud_cli;
+    if (show_fps || open || show_warmup || show_update_toast || show_cheats_hud) {
         float ui_scale = ComputeInGameUiScale();
         EnsureInGameStyle(ui_scale);
-        if (o.show_fps_hud) DrawFpsHud(fps, ui_scale);
+        if (show_fps) DrawFpsHud(fps, ui_scale);
+        if (show_cheats_hud) DrawActiveCheatsHud(active_cheats_count, ui_scale);
         if (show_warmup) DrawShaderWarmupToast(warmup_ws, warmup_alpha, ui_scale);
         if (show_update_toast) DrawUpdateAvailableToast(toast_upd_snap, update_toast_alpha, ui_scale);
         if (open) DrawSettingsWindow(fps, ui_scale);

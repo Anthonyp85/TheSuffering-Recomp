@@ -16,8 +16,11 @@
 
 #include "common/mkb_input.h"
 #include "common/ui_common.h"
+#include "game/cheats.h"
+#include "game/guest_settings.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -500,6 +503,7 @@ void ResetAllSettingsToDefaults() {
     app::MarkUpscalerUserEdited();
     app::MarkGpuAdapterUserEdited();
     app::MarkHardwarePresetUserEdited();
+    guest_settings::ResetToDefaults(true);
     MkbResetDefaults();
     app::Save();
 }
@@ -704,6 +708,7 @@ void DrawUpscalingGraphicsPanel(const UiPanelContext& ctx) {
             std::snprintf(b, sizeof(b), "%u%%", p);
             if (ImGui::SmallButton(b)) {
                 s.render_percent = p;
+                s.hardware_preset = app::HardwarePreset::Custom;
                 app::MarkUpscalerUserEdited();
                 app::Save();
             }
@@ -963,6 +968,14 @@ void DrawAudioPanel(const UiPanelContext& /*ctx*/) {
         if (!s.mute_unfocused) audio::SetFocusMuted(false);
         app::Save();
     }
+    bool subtitles = guest_settings::GetSubtitles();
+    if (ImGui::Checkbox("Enable In-Game Subtitles", &subtitles)) {
+        guest_settings::SetSubtitles(subtitles);
+        app::Save();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Synced 1:1 with in-game Options -> Audio -> Subtitles and persisted in settings.toml.");
+    }
     ImGui::Separator();
 #ifdef _WIN32
     const char* spk_modes[] = {"Auto (Match Windows)", "Stereo (2.0)", "5.1 Surround", "Mono"};
@@ -1134,8 +1147,38 @@ void DrawControlsPanel(const UiPanelContext& ctx) {
             }
 
             ImGui::Separator();
+            bool pad_invert_y = guest_settings::GetControllerInvertY();
+            if (ImGui::Checkbox("Invert Controller Right-Stick Y-Axis (Thumbstick Pitch)", &pad_invert_y)) {
+                guest_settings::SetControllerInvertY(pad_invert_y);
+                app::Save();
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", pad_invert_y ? "(Inverted: Stick Up looks Down)"
+                                                   : "(Standard: Stick Up looks Up)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Synced 1:1 with in-game Options -> Controller -> Invert Pitch Axis and saved across restarts.");
+            }
+
+            float pad_turn_sens = guest_settings::GetControllerTurnSensitivity();
+            float pad_pitch_sens = guest_settings::GetControllerPitchSensitivity();
+            const float half_slider_w = std::min(210.0f, ImGui::GetContentRegionAvail().x * 0.28f);
+            ImGui::SetNextItemWidth(half_slider_w);
+            if (ImGui::SliderFloat("Right-Stick Turn Sens", &pad_turn_sens, 0.25f, 4.00f, "%.2fx")) {
+                guest_settings::SetControllerTurnSensitivity(pad_turn_sens);
+                app::Save();
+            }
+            ImGui::SameLine(0.0f, 18.0f);
+            ImGui::SetNextItemWidth(half_slider_w);
+            if (ImGui::SliderFloat("Right-Stick Pitch Sens", &pad_pitch_sens, 0.25f, 4.00f, "%.2fx")) {
+                guest_settings::SetControllerPitchSensitivity(pad_pitch_sens);
+                app::Save();
+            }
+
+            ImGui::Separator();
             if (ImGui::Checkbox("Enable Controller Rumble", &o.rumble_enabled)) {
                 if (!o.rumble_enabled) input::Rumble(0, 0, 0);
+                guest_settings::SetControllerVibration(o.rumble_enabled);
                 app::Save();
             }
             ImGui::BeginDisabled(!o.rumble_enabled);
@@ -1172,7 +1215,7 @@ void DrawControlsPanel(const UiPanelContext& ctx) {
                 }
             }
 #endif
-            ImGui::TextDisabled("In-Game Overlay Shortcut: Keyboard F1  |  Controller BACK + L3");
+            ImGui::TextDisabled("In-Game Overlay Shortcuts: F1 Settings  |  F2 Cheats  |  Controller BACK + L3");
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -1580,6 +1623,418 @@ void DrawUpdateAlertCard(const UpdateStatusSnapshot& snap, const UpdateCardConte
 
     ImGui::PopStyleVar(4);
     ImGui::PopStyleColor(2);
+}
+
+namespace {
+
+const char* ShortCheatToggleSubtitle(cheats::CheatToggle id) {
+    switch (id) {
+        case cheats::CheatToggle::GodMode:
+            return "Zero damage from hits, fire, falls & insanity";
+        case cheats::CheatToggle::InfiniteReserveAmmo:
+            return "Reserve ammo never drops and stays maxed";
+        case cheats::CheatToggle::BottomlessClip:
+            return "Active clip & flamethrower fuel stay 100% full";
+        case cheats::CheatToggle::InfiniteItems:
+            return "Xombium, Grenades, Molotovs, Dynamite & Flares";
+        case cheats::CheatToggle::InfiniteFlashlight:
+            return "Full-beam flashlight stays at 100% intensity";
+        case cheats::CheatToggle::InfiniteInsanity:
+            return "Meter stays 100% ready; Beast form never drains";
+        case cheats::CheatToggle::OneHitKills:
+            return "Hostiles hit by Torque die instantly (allies safe)";
+        case cheats::CheatToggle::PsychedelicMode:
+            return "XBE rainbow trail post-FX (normal 1.0x speed)";
+        case cheats::CheatToggle::OldMovieMode:
+            return "XBE vintage B&W film grain & scratches filter";
+        case cheats::CheatToggle::Count:
+        default:
+            return "";
+    }
+}
+
+const cheats::CheatActionInfo* FindCheatActionInfo(cheats::CheatAction action) {
+    const auto& infos = cheats::GetActionInfos();
+    const size_t idx = static_cast<size_t>(action);
+    if (idx < infos.size() && infos[idx].id == action) return &infos[idx];
+    for (const auto& info : infos) {
+        if (info.id == action) return &info;
+    }
+    return nullptr;
+}
+
+void DrawCheatActionButton(cheats::CheatAction action, const char* fallback_label) {
+    const cheats::CheatActionInfo* info = FindCheatActionInfo(action);
+    const char* label = (info && info->label) ? info->label : fallback_label;
+    ImGui::PushID(static_cast<int>(action));
+    if (ImGui::Button(label, ImVec2(-1.0f, 0.0f))) {
+        cheats::EnqueueAction(action);
+    }
+    if (info && info->description && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("%s", info->description);
+    }
+    ImGui::PopID();
+}
+
+void DrawMoralitySpectrumWidget(const cheats::CheatRuntimeStatus& st, float s) {
+    const float bar_w = std::round(132.0f * s);
+    const float bar_h = std::round(10.0f * s);
+
+    std::string mor_txt;
+    ImVec4 txt_col(0.68f, 0.68f, 0.74f, 1.0f);
+    if (st.in_level) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "Morality: %s (%+.0f)", cheats::MoralityTierName(st.morality_tier),
+                      st.morality_value);
+        mor_txt = buf;
+        switch (st.morality_tier) {
+            case cheats::MoralityTier::Evil:
+                txt_col = ImVec4(0.96f, 0.36f, 0.36f, 1.0f);
+                break;
+            case cheats::MoralityTier::Good:
+                txt_col = ImVec4(0.46f, 0.86f, 0.98f, 1.0f);
+                break;
+            case cheats::MoralityTier::Neutral:
+            default:
+                txt_col = ImVec4(0.88f, 0.84f, 0.72f, 1.0f);
+                break;
+        }
+    } else {
+        mor_txt = "Morality: In-Level";
+    }
+
+    const float txt_w = ImGui::CalcTextSize(mor_txt.c_str()).x;
+    const float total_w = txt_w + 8.0f * s + bar_w;
+    ImGui::SameLine();
+    const float avail_x = ImGui::GetContentRegionAvail().x;
+    if (avail_x >= total_w + 10.0f * s) {
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail_x - total_w);
+    }
+    ImGui::TextColored(txt_col, "%s", mor_txt.c_str());
+    ImGui::SameLine(0.0f, 8.0f * s);
+
+    const float line_h = ImGui::GetTextLineHeight();
+    const ImVec2 cur = ImGui::GetCursorScreenPos();
+    const float y0 = cur.y + std::max(0.0f, (line_h - bar_h) * 0.5f);
+    const ImVec2 bmin(cur.x, y0);
+    const ImVec2 bmax(cur.x + bar_w, y0 + bar_h);
+    const float mid_x = (bmin.x + bmax.x) * 0.5f;
+
+    ImGui::Dummy(ImVec2(bar_w, line_h));
+    if (ImGui::IsItemHovered()) {
+        if (st.in_level) {
+            ImGui::SetTooltip("Live Reputation: %+.1f (Range %.0f Evil .. +%.0f Good, Tier: %s)", st.morality_value,
+                              st.morality_min, st.morality_max, cheats::MoralityTierName(st.morality_tier));
+        } else {
+            ImGui::SetTooltip("Load into a gameplay level to view and adjust Torque's live Morality score.");
+        }
+    }
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float rnd = 3.0f * s;
+    dl->AddRectFilled(bmin, ImVec2(mid_x, bmax.y), IM_COL32(118, 28, 32, st.in_level ? 225 : 110), rnd,
+                      ImDrawFlags_RoundCornersLeft);
+    dl->AddRectFilled(ImVec2(mid_x, bmin.y), bmax, IM_COL32(34, 96, 126, st.in_level ? 225 : 110), rnd,
+                      ImDrawFlags_RoundCornersRight);
+    dl->AddRect(bmin, bmax, IM_COL32(150, 128, 132, 185), rnd, 0, std::max(1.0f, s));
+    dl->AddLine(ImVec2(mid_x, bmin.y - 1.0f * s), ImVec2(mid_x, bmax.y + 1.0f * s), IM_COL32(225, 220, 210, 200),
+                std::max(1.0f, s));
+
+    if (st.in_level) {
+        const float t = std::clamp((st.morality_normalized + 1.0f) * 0.5f, 0.0f, 1.0f);
+        const float px = bmin.x + 3.0f * s + t * std::max(0.0f, (bar_w - 6.0f * s));
+        const float cy = (bmin.y + bmax.y) * 0.5f;
+        dl->AddCircleFilled(ImVec2(px, cy), std::max(3.5f, 4.0f * s), IM_COL32(255, 246, 214, 255));
+        dl->AddCircle(ImVec2(px, cy), std::max(3.5f, 4.0f * s), IM_COL32(24, 18, 20, 240), 0, std::max(1.0f, s));
+    }
+}
+
+}  // namespace
+
+void DrawCheatsPanel(float ui_scale, const std::function<void(const std::string&, bool)>& set_status) {
+    const float s = std::clamp(ui_scale, 1.0f, 2.5f);
+    SharedUiOptions& ui_opts = GetSharedUiOptions();
+    const cheats::CheatRuntimeStatus st = cheats::GetRuntimeStatus();
+    const bool replay_locked = st.replay_active;
+    const bool has_active_cheats = !replay_locked && st.active_toggle_count > 0;
+    const bool can_run_actions = !replay_locked && st.in_level && st.player_alive;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * s, 5.0f * s));
+
+    // ------------------------------------------------------------------------
+    // 1. Live Status Header Card
+    // ------------------------------------------------------------------------
+    ImVec4 card_bg(0.118f, 0.108f, 0.092f, 0.96f);
+    ImVec4 card_border(0.72f, 0.54f, 0.24f, 0.80f);
+    ImU32 accent_bar = IM_COL32(235, 178, 62, 230);
+    ImU32 accent_glow = IM_COL32(235, 178, 62, 46);
+    if (replay_locked) {
+        card_bg = ImVec4(0.145f, 0.090f, 0.092f, 0.96f);
+        card_border = ImVec4(0.78f, 0.30f, 0.30f, 0.88f);
+        accent_bar = IM_COL32(224, 82, 82, 235);
+        accent_glow = IM_COL32(224, 82, 82, 48);
+    } else if (has_active_cheats) {
+        card_bg = ImVec4(0.148f, 0.092f, 0.102f, 0.97f);
+        card_border = ImVec4(0.88f, 0.32f, 0.32f, 0.92f);
+        accent_bar = IM_COL32(242, 84, 84, 240);
+        accent_glow = IM_COL32(242, 84, 84, 54);
+    } else if (st.in_level) {
+        card_bg = ImVec4(0.092f, 0.122f, 0.132f, 0.96f);
+        card_border = ImVec4(0.34f, 0.68f, 0.52f, 0.84f);
+        accent_bar = IM_COL32(92, 218, 134, 230);
+        accent_glow = IM_COL32(92, 218, 134, 46);
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, card_bg);
+    ImGui::PushStyleColor(ImGuiCol_Border, card_border);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, std::max(1.5f, std::round(1.5f * s)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 5.0f * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(11.0f * s, 6.5f * s));
+
+    constexpr ImGuiChildFlags kStatusFlags =
+        ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_NavFlattened;
+    if (ImGui::BeginChild("##CheatLiveStatusCard", ImVec2(0.0f, 0.0f), kStatusFlags)) {
+        ImGui::AlignTextToFramePadding();
+        if (replay_locked) {
+            ImGui::TextColored(ImVec4(0.96f, 0.44f, 0.42f, 1.0f),
+                               "Deterministic Replay / Autotest Active - All cheats & actions are suppressed.");
+        } else if (st.in_level) {
+            if (!st.player_alive) {
+                ImGui::TextColored(ImVec4(0.96f, 0.38f, 0.38f, 1.0f), "[PLAYER DOWN]");
+            } else if (st.is_transformed) {
+                ImGui::TextColored(ImVec4(1.00f, 0.62f, 0.24f, 1.0f), "[BEAST FORM]");
+            } else {
+                ImGui::TextColored(ImVec4(0.45f, 0.94f, 0.58f, 1.0f), "[IN LEVEL]");
+            }
+            ImGui::SameLine(0.0f, 8.0f * s);
+            ImGui::Text("HP: %.0f/%.0f  |  Xombium: %d/%d  |  Insanity: %.0f%%  |  Morality: %s (%+.0f)", st.health,
+                        st.max_health, st.xombium_count, st.max_xombium, st.insanity_pct,
+                        cheats::MoralityTierName(st.morality_tier), st.morality_value);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Active Clip / Reserve: %d/%d + %d  |  Flashlight Battery: %.0f%%  |  Active Toggles: %u",
+                                  st.clip_ammo, st.max_clip_ammo, st.reserve_ammo, st.flashlight_pct,
+                                  st.active_toggle_count);
+            }
+        } else {
+            ImGui::TextColored(
+                ImVec4(0.98f, 0.78f, 0.30f, 1.0f),
+                "Load into a level to use instant loadout/player actions - persistent toggles can be armed anytime.");
+        }
+
+        if (has_active_cheats) {
+            char dis_vis[48];
+            std::snprintf(dis_vis, sizeof(dis_vis), "Disable All Cheats (%u)", st.active_toggle_count);
+            std::string dis_id = std::string(dis_vis) + "##DisableAllCheatsBtn";
+            const float dis_w = ImGui::CalcTextSize(dis_vis).x + ImGui::GetStyle().FramePadding.x * 2.0f + 10.0f * s;
+            ImGui::SameLine();
+            const float avail_x = ImGui::GetContentRegionAvail().x;
+            if (avail_x >= dis_w + 8.0f * s) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail_x - dis_w);
+            } else {
+                ImGui::NewLine();
+            }
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.60f, 0.15f, 0.17f, 0.98f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.78f, 0.20f, 0.22f, 1.00f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.90f, 0.24f, 0.26f, 1.00f));
+            if (ImGui::Button(dis_id.c_str(), ImVec2(dis_w, 0.0f))) {
+                cheats::DisableAllCheats();
+                if (set_status) set_status("Disabled all active persistent cheats.", false);
+            }
+            ImGui::PopStyleColor(3);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Turn off all armed persistent combat & visual cheat toggles immediately.");
+            }
+        }
+
+        if (!replay_locked && !st.last_action_feedback.empty()) {
+            const std::string clean_fb = SanitizeUiText(st.last_action_feedback, true, 118);
+            const ImVec4 fb_col = st.last_action_is_warning ? ImVec4(0.98f, 0.78f, 0.30f, 1.0f)
+                                                            : ImVec4(0.48f, 0.95f, 0.60f, 1.0f);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(fb_col, "> %s", clean_fb.c_str());
+
+            const char* clr_txt = "Dismiss";
+            const float clr_w = ImGui::CalcTextSize(clr_txt).x + ImGui::GetStyle().FramePadding.x * 2.0f + 6.0f * s;
+            ImGui::SameLine();
+            const float clr_avail = ImGui::GetContentRegionAvail().x;
+            if (clr_avail >= clr_w + 8.0f * s) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + clr_avail - clr_w);
+            }
+            if (ImGui::SmallButton("Dismiss##ClearCheatFeedback")) {
+                cheats::ClearActionFeedback();
+            }
+        }
+    }
+    ImGui::EndChild();
+
+    const ImVec2 c_min = ImGui::GetItemRectMin();
+    const ImVec2 c_max = ImGui::GetItemRectMax();
+    if (c_max.x > c_min.x + 8.0f && c_max.y > c_min.y + 8.0f) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRect(ImVec2(c_min.x + 1.0f, c_min.y + 1.0f), ImVec2(c_max.x - 1.0f, c_max.y - 1.0f), accent_glow,
+                    5.0f * s, 0, std::max(1.0f, s));
+        dl->AddRectFilled(ImVec2(c_min.x + 1.0f, c_min.y + 3.0f * s),
+                          ImVec2(c_min.x + std::max(3.5f, std::round(3.5f * s)), c_max.y - 3.0f * s), accent_bar,
+                          2.0f * s);
+    }
+
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(2);
+
+    // ------------------------------------------------------------------------
+    // 2. Survival, Combat & Visual Toggles (2-Column Crisp Grid)
+    // ------------------------------------------------------------------------
+    ImGui::TextColored(ImVec4(0.95f, 0.42f, 0.42f, 1.0f), "Survival, Combat & Visual Toggles");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(Session-persistent; arm anytime)");
+
+    if (replay_locked) ImGui::BeginDisabled(true);
+    const auto& toggle_infos = cheats::GetToggleInfos();
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(6.0f * s, 2.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7.0f * s, 3.5f * s));
+    if (ImGui::BeginTable("##CheatTogglesGrid", 2, ImGuiTableFlags_SizingStretchSame)) {
+        for (size_t i = 0; i < toggle_infos.size(); ++i) {
+            ImGui::TableNextColumn();
+            const cheats::CheatToggleInfo& info = toggle_infos[i];
+            bool armed = !replay_locked && cheats::GetToggle(info.id);
+            ImGui::PushID(static_cast<int>(i));
+            if (armed) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.88f, 0.66f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.34f, 0.13f, 0.15f, 0.98f));
+            }
+            if (ImGui::Checkbox(info.label, &armed)) {
+                cheats::SetToggle(info.id, armed);
+            }
+            if (armed) {
+                ImGui::PopStyleColor(2);
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("%s", info.description);
+            }
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f * s, 1.0f * s));
+            ImGui::TextDisabled("  %s", ShortCheatToggleSubtitle(info.id));
+            ImGui::PopStyleVar();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleVar(2);
+    if (replay_locked) ImGui::EndDisabled();
+
+    // ------------------------------------------------------------------------
+    // 3. Instant Loadout & Player Actions
+    // ------------------------------------------------------------------------
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.95f, 0.42f, 0.42f, 1.0f), "Instant Loadout & Player Actions");
+    ImGui::SameLine();
+    if (can_run_actions) {
+        ImGui::TextColored(ImVec4(0.45f, 0.90f, 0.55f, 1.0f), "(Ready)");
+    } else {
+        ImGui::TextDisabled("(Requires active level & live Torque)");
+    }
+
+    if (!can_run_actions) ImGui::BeginDisabled(true);
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * s, 2.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7.0f * s, 4.0f * s));
+    if (ImGui::BeginTable("##CheatLoadoutGrid", 3, ImGuiTableFlags_SizingStretchSame)) {
+        static constexpr std::array<cheats::CheatAction, 6> kLoadoutOrder = {{
+            cheats::CheatAction::FullHealAndXombium,
+            cheats::CheatAction::GiveAllWeaponsAndAmmo,
+            cheats::CheatAction::RefillAllItems,
+            cheats::CheatAction::FillInsanityMeter,
+            cheats::CheatAction::MaxAllAmmo,
+            cheats::CheatAction::GiveGonzoGun,
+        }};
+        for (cheats::CheatAction act : kLoadoutOrder) {
+            ImGui::TableNextColumn();
+            DrawCheatActionButton(act, "Execute");
+        }
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleVar(2);
+    if (!can_run_actions) ImGui::EndDisabled();
+
+    // ------------------------------------------------------------------------
+    // 4. Morality & Bonus Effects
+    // ------------------------------------------------------------------------
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.95f, 0.42f, 0.42f, 1.0f), "Morality & Bonus Effects");
+    DrawMoralitySpectrumWidget(st, s);
+
+    if (!can_run_actions) ImGui::BeginDisabled(true);
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(3.5f * s, 2.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f * s, 4.0f * s));
+    if (ImGui::BeginTable("##CheatMoralityGrid", 5, ImGuiTableFlags_SizingStretchSame)) {
+        // Max Evil & Shift Evil (crimson tint)
+        ImGui::TableNextColumn();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.11f, 0.13f, 0.95f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.64f, 0.15f, 0.18f, 1.00f));
+        DrawCheatActionButton(cheats::CheatAction::SetMaxMoralityEvil, "Set Max Evil");
+        ImGui::PopStyleColor(2);
+
+        ImGui::TableNextColumn();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.34f, 0.12f, 0.14f, 0.94f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.56f, 0.16f, 0.18f, 1.00f));
+        DrawCheatActionButton(cheats::CheatAction::ShiftMoralityEvil, "Shift Evil (-50)");
+        ImGui::PopStyleColor(2);
+
+        // Neutral (slate tint)
+        ImGui::TableNextColumn();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.21f, 0.25f, 0.95f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.36f, 0.34f, 0.40f, 1.00f));
+        DrawCheatActionButton(cheats::CheatAction::ResetMoralityNeutral, "Reset Neutral (0)");
+        ImGui::PopStyleColor(2);
+
+        // Shift Good & Max Good (steel-teal tint)
+        ImGui::TableNextColumn();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.13f, 0.28f, 0.36f, 0.94f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.44f, 0.56f, 1.00f));
+        DrawCheatActionButton(cheats::CheatAction::ShiftMoralityGood, "Shift Good (+50)");
+        ImGui::PopStyleColor(2);
+
+        ImGui::TableNextColumn();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.35f, 0.46f, 0.96f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.52f, 0.68f, 1.00f));
+        DrawCheatActionButton(cheats::CheatAction::SetMaxMoralityGood, "Set Max Good");
+        ImGui::PopStyleColor(2);
+
+        ImGui::EndTable();
+    }
+
+    if (ImGui::BeginTable("##CheatVisualOneShotsGrid", 2, ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextColumn();
+        DrawCheatActionButton(cheats::CheatAction::BloodsoakedTorque, "Bloodsoaked Torque");
+        ImGui::TableNextColumn();
+        DrawCheatActionButton(cheats::CheatAction::CleanTorque, "Clean Torque");
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleVar(2);
+    if (!can_run_actions) ImGui::EndDisabled();
+
+    // ------------------------------------------------------------------------
+    // 5. Subtle HUD Badge Option & Shortcut Legend
+    // ------------------------------------------------------------------------
+    ImGui::Separator();
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7.0f * s, 3.5f * s));
+    if (ImGui::Checkbox("Show active cheats badge on HUD", &ui_opts.show_cheats_hud)) {
+        app::Save();
+    }
+    ImGui::PopStyleVar();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Displays a subtle 'CHEATS ACTIVE (N)' pill in the corner while cheats are armed.");
+    }
+
+    const char* legend = "F2: Quick Cheats  |  F1 / Back+L3: Overlay  |  LB/RB: Switch Tabs";
+    const float leg_w = ImGui::CalcTextSize(legend).x;
+    ImGui::SameLine();
+    const float leg_avail = ImGui::GetContentRegionAvail().x;
+    if (leg_avail >= leg_w + 10.0f * s) {
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + leg_avail - leg_w);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%s", legend);
+    }
+
+    ImGui::PopStyleVar();
 }
 
 }  // namespace suffering
