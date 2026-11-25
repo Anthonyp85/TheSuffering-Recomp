@@ -11,7 +11,15 @@
                 "CMAKE_C_COMPILER": "clang",
                 "CMAKE_CXX_COMPILER": "clang++",
                 "CMAKE_C_FLAGS": "-march=x86-64-v2",
-                "CMAKE_CXX_FLAGS": "-march=x86-64-v2"
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v2",
+                "CMAKE_C_FLAGS_DEBUG": "-O0",
+                "CMAKE_CXX_FLAGS_DEBUG": "-O0",
+                "CMAKE_C_FLAGS_RELEASE": "-O3 -DNDEBUG",
+                "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG",
+                "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O2 -DNDEBUG",
+                "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -DNDEBUG",
+                "CMAKE_C_FLAGS_MINSIZEREL": "-Os -DNDEBUG",
+                "CMAKE_CXX_FLAGS_MINSIZEREL": "-Os -DNDEBUG"
             },
             "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows"}
         },
@@ -42,7 +50,15 @@
                 "CMAKE_C_COMPILER": "clang",
                 "CMAKE_CXX_COMPILER": "clang++",
                 "CMAKE_C_FLAGS": "-march=x86-64-v2",
-                "CMAKE_CXX_FLAGS": "-march=x86-64-v2"
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v2",
+                "CMAKE_C_FLAGS_DEBUG": "-O0 -g",
+                "CMAKE_CXX_FLAGS_DEBUG": "-O0 -g",
+                "CMAKE_C_FLAGS_RELEASE": "-O3 -DNDEBUG",
+                "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG",
+                "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O2 -g -DNDEBUG",
+                "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -g -DNDEBUG",
+                "CMAKE_C_FLAGS_MINSIZEREL": "-Os -DNDEBUG",
+                "CMAKE_CXX_FLAGS_MINSIZEREL": "-Os -DNDEBUG"
             },
             "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux"}
         },
@@ -66,7 +82,15 @@
             "toolchainFile": "${sourceDir}/.local/linux_sysroot/linux-x86_64-toolchain.cmake",
             "cacheVariables": {
                 "CMAKE_C_FLAGS": "-march=x86-64-v2",
-                "CMAKE_CXX_FLAGS": "-march=x86-64-v2"
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v2",
+                "CMAKE_C_FLAGS_DEBUG": "-O0 -g",
+                "CMAKE_CXX_FLAGS_DEBUG": "-O0 -g",
+                "CMAKE_C_FLAGS_RELEASE": "-O3 -DNDEBUG",
+                "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG",
+                "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O2 -g -DNDEBUG",
+                "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -g -DNDEBUG",
+                "CMAKE_C_FLAGS_MINSIZEREL": "-Os -DNDEBUG",
+                "CMAKE_CXX_FLAGS_MINSIZEREL": "-Os -DNDEBUG"
             },
             "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows"}
         },

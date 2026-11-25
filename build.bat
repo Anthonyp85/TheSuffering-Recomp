@@ -1,6 +1,7 @@
 @echo off
 rem SPDX-License-Identifier: GPL-2.0-or-later
 setlocal
+set "_PDB="
 set "GAME_TITLE=The Suffering"
 set "GAME_XBE=default.xbe"
 set "GAME_EXE=suffering"

@@ -1,43 +1,40 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Surgical Staircase Top-Edge Step-Up & Quarry Staircase Anti-Clipping / Anti-Wedge Fixes
+// Surgical Staircase Top-Edge Step-Up, Docks Multi-Flight / Railed Staircase & Quarry Anti-Wedge Fixes
 // for The Suffering (USA) default.xbe (Title ID 0x4D570015).
 //
-// Root causes proven from XBE disassembly & 4a/4b Quarry_level.mdu collision geometry:
-//  1. Unwired CCollider::m_flags bit 0x08 (STEP_UP_ENABLED) & missing 0x8000 on form re-init:
+// Root causes proven from XBE disassembly & 10 Docks / 4a-4b Quarry .mdu collision geometry:
+//  1. Unwired CCollider::m_flags bit 0x08 (STEP_UP_ENABLED), missing 0x8000 on form re-init, AND
+//     inverted 400.0f slope-length comparison in IsWalkableOrStepTriangle (sub_00179D60 @ 0x00179E00):
 //     - CTorque::Init (0x00041F80) sets [col] |= 0x8000, while CTorque::ReinitCollider (0x00054EF4)
 //       omits 0x8000, and neither sets bit 0x08 (STEP_UP_ENABLED).
-//     - With bit 0x08 == 0, IsWalkableOrStepTriangle (sub_00179D60 @ 0x00179D7C) rejects all
-//       0.40 < ny <= 0.76604 (40..66.4 deg, height < 400) staircase ramps (such as 4a Quarry sub=401 /
-//       4b Quarry sub=27 T30/T31 ny=0.741..0.750, sub=142 ny=0.747, sub=681 ny=0.749..0.753), and
-//       ShouldSkipStepTriangle (sub_001709C0 @ 0x001709C3) always returns 0.
-//     - Worse, in GatherObjectMeshTriangles (sub_00173730 @ 0x001740E9..0x001740F4), when [esp+0x1C]==0
-//       and num_spheres > 1, Torque's foot sphere skips those 40.5..45 deg Quarry stair ramps WITHOUT
-//       adding them to step_candidate_tris (sub_00171F70), causing Torque's feet/legs to clip straight
-//       through Quarry staircases until his upper-body sphere wedges!
-//  2. Unchecked post-collision slide addition & coarse spatial substep at 60+ FPS in CCollider::SweepStep
-//     (sub_00174340 @ 0x00174346..0x0017436E & 0x0017447F -> 0x001744B4):
-//     - substep_size = min(40.0f, max_radius / 30.0f) ([col+0x40]) is fixed in world space while
-//       desired_dist = speed * dt shrinks at 60/120/240 FPS, collapsing num_substeps to 1..2 and
-//       max_iterations to 2..3.
-//     - After colliding at substep >= 1 and deflecting remaining_delta onto an UNTESTED slide vector,
-//       0x0017447F (jnp 0x001744B4) jumps to the no-collision completion block whenever
-//       |remaining_delta|^2 < max(substep_size^2, 0.01 * desired_dist^2), blindly adding the unswept
-//       post-collision vector into collision_correction and pushing Torque into staircase creases/walls.
-//  3. Staircase top-edge (crest / lip) horizontal block under ON_GROUND:
-//     - ShouldSkipStepTriangle (sub_001709C0 @ 0x00170A2B) unconditionally returns 0 (never skips)
-//       whenever tri.normal.y >= 0.76604f, which includes every flat horizontal top-landing triangle!
-//     - Meanwhile, when ON_GROUND ([torque+0x98] & 1 -> [col] & 0x10), sub_00170D20 (0x00170DDA) zeroes
-//       desired_delta.y and sub_00170700 (0x001707C6) zeroes slide.y. When Torque's foot sphere rim hits
-//       the horizontal front edge of a top landing of height h (0 < h <= step_height) at horizontal
-//       distance sqrt(R^2 - (ly - cy)^2) ahead of Torque's (x, z) center, ComputeSlide (sub_001712C0)
-//       destroys the upward slide component and hard-stops horizontal motion before (x, z) enters the
-//       top landing triangle for GroundSnap (sub_00172C00) — until jumping clears ON_GROUND.
-//  4. Unwelded Quarry staircase seams (sub_0017A400) + TryLandOnMeshGround (sub_0003CE90 @ 0x0003CF00)
-//     refusing to land on ny <= 0.76604f stair slopes -> permanent State 9 (Fall) lock (Jump disabled):
-//     - Quarry stair meshes have unwelded top/intermediate landings (0 shared vertex indices in sub=401
-//       T30/T31 <-> T20/T21 <-> T43/T44). Crossing an unwelded seam above .wdu terrain drops
-//       CGroundSupport in sub_0003D760 (0x0003D85A) and enters State 9 (Fall, ON_GROUND=0, Jump blocked),
-//       while sub_0003CE90 rejects landing when supportNormal.y <= 0.76604f even when bStepUpSlope is set.
+//     - Worse, in sub_00179D60 (0x00179DFB..0x00179E0E), ComputeSlopeLength (sub_001797B0) returns
+//       ST(0) = (max_y - min_y) / sqrt(1 - ny^2), and 0x00179E00 executes:
+//         fcomp [0x002A451C] (400.0f); fnstsw ax; test ah, 0x41; jnz return_0
+//       Because slope_len <= 400.0f sets C0=1 or C3=1 (ah & 0x41 != 0), native sub_00179D60 REJECTS
+//       every 0.54 <= ny <= 0.76604 staircase ramp with slope_len <= 400.0f (Docks id0=21, 200, 204,
+//       339/343, 353, 544, 586..592 & Quarry sub=401/27 T31), causing GatherObjectMeshTriangles
+//       (0x001740E9..0x001740F4) to skip adding them to step_candidate_tris so Torque's feet clip
+//       through the stairs until his upper-body sphere wedges! Meanwhile CGroundSupport::AdvanceOnMesh
+//       (0x0017A81C) passes gs->hit_info.bStepUpSlope ([gs+0x68] == 0 on flat landings) as allow_step,
+//       dropping CGroundSupport whenever stepping from a flat landing onto a welded stair ramp.
+//  2. ShouldSkipStepTriangle (sub_001709C0 @ 0x00170A3E..0x00170A90) centroid_y >= foot_center_y
+//     rejection on long Docks staircase flights:
+//     - Docks wooden staircases span 400..1301.3 Y units in single triangles (e.g. id0=593 switchback
+//       ny=0.6645 span_y=896.5; id0=602 ny=0.7474 span_y=819.2; id0=354..356 ny=0.705 span_y=1301.3;
+//       id0=544 ny=0.580 span_y=1226; id0=586..591 ny=0.563..0.750 span_y=287..512; id0=60 span_y=881).
+//     - On the lower half/two-thirds of any long flight, tri_centroid_y >= foot_center_y (and at
+//       0x00174152 STriEntry.normal at +0x2C is still uninitialized zero!), so sub_001709C0 returns 0
+//       and adds the staircase ramp itself to [foot_sphere+0x24] as a solid wall while ON_GROUND zeroes
+//       desired_delta.y and slide.y — wedging Torque on the flight and against side railings.
+//  3. Unchecked post-collision slide addition & coarse spatial substep at 60+ FPS in CCollider::SweepStep
+//     (sub_00174340 @ 0x0017447F -> 0x001744B4), plus CTriPool snapshot truncation on dense Docks meshes
+//     (id0=21 660 tris, id0=544 1072 tris, id0=353 1076 tris, id0=13/548 2178 tris).
+//  4. Staircase top-edge (crest / header trim) horizontal block on narrow railed Docks stairs (205..255
+//     units wide): rubbing a side handrail/baluster post while reaching a top landing or raised header
+//     plank stalled top-edge step-up when over_landing failed clearance at snapped_y or when single-ray
+//     probing hit a side railing/post.
+//  5. Unwelded staircase seams (sub_0017A400) + TryLandOnMeshGround (sub_0003CE90 @ 0x0003CF00) refusing
+//     to land on ny <= 0.76604f stair slopes + State 9 (Fall) / ON_GROUND V-pinch wedges.
 
 #include <algorithm>
 #include <array>
@@ -57,6 +54,8 @@ X86_EXTERN_FUNC(__imp__sub_0005BF60);
 X86_EXTERN_FUNC(__imp__sub_0003CE90);
 X86_EXTERN_FUNC(__imp__sub_00174530);
 X86_EXTERN_FUNC(__imp__sub_00174340);
+X86_EXTERN_FUNC(__imp__sub_00179D60);
+X86_EXTERN_FUNC(__imp__sub_001709C0);
 
 namespace {
 
@@ -76,13 +75,21 @@ constexpr uint32_t kFnClearGroundSupport = 0x001798E0u;    // __thiscall(CGround
 constexpr uint32_t kFnSetGroundFromHitInfo = 0x0017A2B0u;  // __thiscall(CGroundSupport*, SFloorHitInfo*) [ret 0x04]
 
 // Walkability & staircase geometry constants (world units; 2048.0f units == 1 .wdu grid cell)
-constexpr float kMinWalkableNormalY = 0.76604f;  // cos(40 deg), [0x002CB858]
-constexpr float kMinStairRampNormalY = 0.62f;    // cos(51.7 deg), covers 40..51 deg Quarry stair ramps
-constexpr float kMaxStairTriSpanY = 400.0f;      // [0x002A451C] native step-slope max triangle height
-constexpr float kGridUnitScale = 2048.0f;        // [0x00295138]
+constexpr float kMinWalkableNormalY = 0.76604f;       // cos(40 deg), [0x002CB858]
+constexpr float kMinStairRampNormalY = 0.54f;         // cos(57.3 deg), covers 40..57 deg Docks & Quarry stair ramps
+constexpr float kMaxModerateStairSpanY = 1800.0f;     // covers long flights (e.g. Docks id0=354 span_y=1301.3)
+constexpr float kMaxSteepStairSpanY = 1350.0f;        // covers steeper dock/ship flights (e.g. Docks id0=544 span_y=1226)
+constexpr float kGridUnitScale = 2048.0f;             // [0x00295138]
 constexpr float kDefaultStepHeight = 160.0f;
 constexpr float kMinStepHeight = 64.0f;
 constexpr float kMaxStepHeight = 240.0f;
+
+inline bool IsValidStairRamp(float ny, float span_y) {
+    if (!std::isfinite(ny) || !std::isfinite(span_y) || span_y < 0.0f) return false;
+    if (ny >= kMinWalkableNormalY || ny < kMinStairRampNormalY) return false;
+    const float max_span = (ny >= 0.60f) ? kMaxModerateStairSpanY : kMaxSteepStairSpanY;
+    return span_y < max_span;
+}
 
 struct Vec3 {
     float x = 0.0f;
@@ -127,8 +134,10 @@ inline bool IsFiniteVec3(const Vec3& v) {
 }
 
 bool ValidGuest(uint32_t va, uint32_t bytes = 4u) {
-    return kernel::g_base != nullptr && va >= 0x10000u && mem::IsCommitted(va) &&
-           (bytes <= 1u || mem::IsCommitted(va + bytes - 1u));
+    if (kernel::g_base == nullptr || va < 0x10000u) return false;
+    const uint32_t last = (bytes > 1u) ? (va + (bytes - 1u)) : va;
+    if (last < va) return false;
+    return mem::IsCommitted(va) && (bytes <= 1u || mem::IsCommitted(last));
 }
 
 Vec3 ReadVec3(uint8_t* base, uint32_t va) {
@@ -164,7 +173,7 @@ struct SavedX87State {
 
 uint32_t CallThiscall(X86Context& ctx, uint32_t fn_va, uint32_t this_ptr,
                       std::initializer_list<uint32_t> args = {}) {
-    if (fn_va < 0x10000u || this_ptr < 0x10000u) return 0u;
+    if (!ValidGuest(fn_va, 1u) || !ValidGuest(this_ptr, 4u)) return 0u;
     const uint32_t saved_ecx = ctx.ecx;
     const SavedX87State saved_fpu = SavedX87State::Capture(ctx);
     ctx.ecx = this_ptr;
@@ -176,7 +185,7 @@ uint32_t CallThiscall(X86Context& ctx, uint32_t fn_va, uint32_t this_ptr,
 
 float CallThiscallFloat(X86Context& ctx, uint32_t fn_va, uint32_t this_ptr,
                         std::initializer_list<uint32_t> args = {}) {
-    if (fn_va < 0x10000u || this_ptr < 0x10000u) return 0.0f;
+    if (!ValidGuest(fn_va, 1u) || !ValidGuest(this_ptr, 4u)) return 0.0f;
     const uint32_t saved_ecx = ctx.ecx;
     const SavedX87State saved_fpu = SavedX87State::Capture(ctx);
     ctx.ecx = this_ptr;
@@ -339,7 +348,9 @@ void CaptureColliderSnapshot(uint8_t* base, uint32_t col_va) {
     const uint32_t pool_arr_va = X86_MEM32(col_va + 0x18Au);
     if (!ValidGuest(pool_arr_va, 0x30u)) return;
 
-    constexpr int32_t kMaxTrisPerPool = 512;
+    // Capture full CTriPool (native CCollider gathers up to 1000+ triangles across dense Docks meshes
+    // such as id0=21 [660], id0=544 [1072], id0=353 [1076], and id0=13/548 [2178]).
+    constexpr int32_t kMaxTrisPerPool = 2048;
     for (int32_t p = 0; p < 3; ++p) {
         const uint32_t hdr_va = pool_arr_va + static_cast<uint32_t>(p) * 0x10u;
         const uint32_t data_va = X86_MEM32(hdr_va + 0x00u);
@@ -385,7 +396,7 @@ void CaptureColliderSnapshot(uint8_t* base, uint32_t col_va) {
             st.min_y = min_y;
             st.max_y = max_y;
             st.is_walkable_floor = (n.y >= kMinWalkableNormalY);
-            st.is_stair_ramp = (!st.is_walkable_floor && n.y >= kMinStairRampNormalY && span_y < kMaxStairTriSpanY);
+            st.is_stair_ramp = (!st.is_walkable_floor && IsValidStairRamp(n.y, span_y));
             g_snap_tris.push_back(st);
         }
     }
@@ -470,21 +481,28 @@ bool PointInTriXZ(float rel_x, float rel_z, const SnapTri& t, float edge_eps, fl
     return true;
 }
 
-bool IsPoseClearOfObstacles(const Vec3& cand_world_pos, float support_world_y, float radius_shrink = 1.5f) {
+bool IsPoseClearOfObstacles(const Vec3& cand_world_pos, float support_world_y, float radius_shrink = 1.5f,
+                            const Vec3* baseline_world_pos = nullptr) {
     if (!g_snapshot_valid) return false;
     const Vec3 cand_rel_base = VSub(cand_world_pos, g_ref_origin);
+    const Vec3 base_rel_base =
+        (baseline_world_pos != nullptr) ? VSub(*baseline_world_pos, g_ref_origin) : Vec3{};
     const float support_rel_y = support_world_y - g_ref_origin.y;
     const bool multi_sphere = (g_snap_spheres.size() > 1u);
 
     for (const SnapSphere& s : g_snap_spheres) {
         const Vec3 center_rel = VAdd(cand_rel_base, s.local_pos);
+        const Vec3 base_center_rel =
+            (baseline_world_pos != nullptr) ? VAdd(base_rel_base, s.local_pos) : Vec3{};
         const float eff_r = std::max(s.radius - radius_shrink, s.radius * 0.80f);
         const float eff_r_sq = eff_r * eff_r;
+        const float hard_min_r = s.radius * 0.65f;
+        const float hard_min_r_sq = hard_min_r * hard_min_r;
 
         for (const SnapTri& t : g_snap_tris) {
             // 1. Triangles lying completely at or below the target support plane (such as the staircase
-            //    riser, lower tread, or top-landing floor we are stepping onto) lie beneath Torque's feet
-            //    at support_world_y, while any wall, railing, closed gate, or ceiling extends above it.
+            //    riser, lower tread, header trim, or top-landing floor we are stepping onto) lie beneath
+            //    Torque's feet at support_world_y, while walls, railings, closed gates, or ceilings rise above it.
             if (t.max_y <= support_rel_y + 6.0f) continue;
 
             // 2. Mirror GatherObjectMeshTriangles (sub_00173730 @ 0x001740E9..0x00174159): when Torque
@@ -504,13 +522,105 @@ bool IsPoseClearOfObstacles(const Vec3& cand_world_pos, float support_world_y, f
             if (d_sq < eff_r_sq) {
                 // Ignore pure back-face interior grazes behind single-sided floor shells
                 const float signed_n = VDot(diff, t.normal);
-                if (signed_n >= -eff_r * 0.40f) {
-                    return false;
+                if (signed_n < -eff_r * 0.40f) {
+                    continue;
                 }
+
+                // Narrow Docks wooden staircases (205..255 units wide, e.g. id0=586..592, 602, 544, 354)
+                // keep Torque's spheres continually grazing the side handrail/baluster posts. If Torque
+                // was ALREADY within eff_r of this vertical side plane at baseline_world_pos, allow poses
+                // that slide parallel to or away from it (d_cand >= d_base - 0.5f) while still rejecting
+                // any ceiling hit, deep penetration, new obstacle, or forward push into a wall/door.
+                if (baseline_world_pos != nullptr && t.normal.y >= -0.30f &&
+                    std::fabs(t.normal.y) < 0.45f && d_sq >= hard_min_r_sq) {
+                    const Vec3 cp_base = ClosestPointOnTriangle(base_center_rel, t.v0, t.v1, t.v2);
+                    const float d_base = VLen(VSub(base_center_rel, cp_base));
+                    const float d_cand = std::sqrt(std::max(d_sq, 0.0f));
+                    if (d_base < eff_r && d_cand >= d_base - 0.5f) {
+                        continue;
+                    }
+                }
+
+                return false;
             }
         }
     }
     return true;
+}
+
+bool IsGeometricallyPinchedAt(const Vec3& world_pos) {
+    if (!g_snapshot_valid) return false;
+    const Vec3 rel_base = VSub(world_pos, g_ref_origin);
+    std::array<Vec3, 24> contact_normals{};
+    size_t contact_count = 0u;
+
+    for (const SnapSphere& s : g_snap_spheres) {
+        const Vec3 c_rel = VAdd(rel_base, s.local_pos);
+        const float probe_r = s.radius + 2.0f;
+        const float probe_r_sq = probe_r * probe_r;
+        const float deep_r = s.radius * 0.78f;
+
+        for (const SnapTri& t : g_snap_tris) {
+            if (s.is_foot && (t.is_walkable_floor || t.is_stair_ramp)) continue;
+            if (c_rel.y + probe_r < t.min_y || c_rel.y - probe_r > t.max_y) continue;
+
+            const Vec3 cp = ClosestPointOnTriangle(c_rel, t.v0, t.v1, t.v2);
+            const Vec3 diff = VSub(c_rel, cp);
+            const float d_sq = VLenSq(diff);
+            if (d_sq >= probe_r_sq) continue;
+            if (VDot(diff, t.normal) < -s.radius * 0.35f) continue;
+
+            const float d = std::sqrt(std::max(d_sq, 1e-6f));
+            if (d < deep_r) {
+                return true;
+            }
+
+            const Vec3 n_out = (d > 1e-3f && VDot(diff, t.normal) > 0.0f) ? VScale(diff, 1.0f / d) : t.normal;
+            for (size_t i = 0u; i < contact_count; ++i) {
+                // Opposing obstacle normals (> ~117 deg apart) indicate a true V-channel / railing pinch
+                // rather than a flat wall (dot = +1) or normal 90-deg room corner (dot = 0).
+                if (VDot(n_out, contact_normals[i]) < -0.45f) {
+                    return true;
+                }
+            }
+            if (contact_count < contact_normals.size()) {
+                contact_normals[contact_count++] = n_out;
+            }
+        }
+    }
+    return false;
+}
+
+float FindForwardLowStepCrestY(const Vec3& start_pos, float after_y, float max_crest_world_y,
+                               float dir_x, float dir_z) {
+    if (!g_snapshot_valid) return after_y;
+    const Vec3 start_rel = VSub(start_pos, g_ref_origin);
+    Vec3 foot_local{};
+    for (const SnapSphere& s : g_snap_spheres) {
+        if (s.is_foot) {
+            foot_local = s.local_pos;
+            break;
+        }
+    }
+    const Vec3 foot_rel = VAdd(start_rel, foot_local);
+    float best_crest_y = after_y;
+
+    for (const SnapTri& t : g_snap_tris) {
+        const float world_max_y = t.max_y + g_ref_origin.y;
+        const float world_min_y = t.min_y + g_ref_origin.y;
+        if (world_max_y <= after_y + 2.0f || world_max_y > max_crest_world_y) continue;
+        if (world_min_y > after_y + g_foot_radius * 1.15f) continue;
+
+        const Vec3 cp = ClosestPointOnTriangle(foot_rel, t.v0, t.v1, t.v2);
+        const float dx = cp.x - start_rel.x;
+        const float dz = cp.z - start_rel.z;
+        const float fwd = dx * dir_x + dz * dir_z;
+        const float lat = std::fabs(-dx * dir_z + dz * dir_x);
+        if (fwd >= -8.0f && fwd <= g_foot_radius * 1.35f && lat <= g_foot_radius * 0.95f) {
+            best_crest_y = std::max(best_crest_y, world_max_y);
+        }
+    }
+    return best_crest_y;
 }
 
 const SnapTri* FindBestSupportTriangleAt(float world_x, float world_z, float min_world_y,
@@ -613,7 +723,239 @@ void AttachTorqueGroundSupport(X86Context& ctx, uint8_t* base, uint32_t torque_v
     CallThiscall(ctx, kFnLandOnGround, torque_va);
 }
 
+struct ScopedActiveTorque {
+    ScopedActiveTorque(uint32_t torque_va, uint32_t col_va) {
+        g_active_torque_va = torque_va;
+        g_active_collider_va = col_va;
+    }
+    ~ScopedActiveTorque() {
+        g_active_torque_va = 0u;
+        g_active_collider_va = 0u;
+    }
+};
+
+struct ScopedGuestFloatRestore {
+    uint8_t* base = nullptr;
+    uint32_t va = 0u;
+    float saved = 0.0f;
+    bool active = false;
+
+    ~ScopedGuestFloatRestore() {
+        if (active && base != nullptr && ValidGuest(va, 4u)) {
+            X86_MEMF32(va) = saved;
+        }
+    }
+};
+
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// 0A. IsWalkableOrStepTriangle (__cdecl, ret 0: 9 stack args -> eax = 0 or 1)
+//     Fixes two native XBE bugs in sub_00179D60 (0x00179D60..0x00179E1E):
+//      1. Inverted 400.0f slope-length branch at 0x00179E00..0x00179E0E (`fcomp [0x002A451C];
+//         fnstsw ax; test ah, 0x41; jnz return_0`), which rejected EVERY staircase ramp with
+//         slope_len <= 400.0f (causing Torque's feet to clip straight through Docks & Quarry stairs)
+//         while accepting huge >400 rock cliffs.
+//      2. CGroundSupport::AdvanceOnMesh (0x0017A81C) passing gs->hit_info.bStepUpSlope ([gs+0x68] == 0
+//         when standing on a flat landing) as allow_step, dropping CGroundSupport on welded landing->ramp seams.
+// ---------------------------------------------------------------------------
+X86_FUNC(sub_00179D60) {
+    if (app::IsReplayOrAutotestActive() || g_active_torque_va == 0u ||
+        !ValidGuest(ctx.esp + 0x04u, 0x24u)) {
+        __imp__sub_00179D60(ctx, base);
+        return;
+    }
+
+    const float ny = X86_MEMF32(ctx.esp + 0x04u);
+    const uint32_t v0_va = X86_MEM32(ctx.esp + 0x08u);
+    const uint32_t v1_va = X86_MEM32(ctx.esp + 0x0Cu);
+    const uint32_t v2_va = X86_MEM32(ctx.esp + 0x10u);
+    const uint32_t owner_obj_va = X86_MEM32(ctx.esp + 0x14u);
+    const uint32_t allow_step_arg = X86_MEM32(ctx.esp + 0x18u);
+    const float min_walk_ny = X86_MEMF32(ctx.esp + 0x1Cu);
+    const float min_step_ny = X86_MEMF32(ctx.esp + 0x20u);
+    const uint32_t verts_already_world = X86_MEM32(ctx.esp + 0x24u);
+
+    if (!std::isfinite(ny) || !std::isfinite(min_walk_ny) || !std::isfinite(min_step_ny)) {
+        __imp__sub_00179D60(ctx, base);
+        return;
+    }
+
+    if (ny > min_walk_ny) {
+        ctx.eax = 1u;
+        ctx.esp += 4u;
+        return;
+    }
+
+    const bool step_enabled =
+        (allow_step_arg != 0u) ||
+        (ValidGuest(g_active_collider_va, 4u) && (X86_MEM32(g_active_collider_va) & 0x08u) != 0u);
+    const float eff_min_step_ny = std::max(min_step_ny, kMinStairRampNormalY);
+    if (!step_enabled || !(ny > eff_min_step_ny)) {
+        ctx.eax = 0u;
+        ctx.esp += 4u;
+        return;
+    }
+
+    if (!ValidGuest(v0_va, 12u) || !ValidGuest(v1_va, 12u) || !ValidGuest(v2_va, 12u)) {
+        __imp__sub_00179D60(ctx, base);
+        return;
+    }
+
+    const Vec3 p0 = ReadVec3(base, v0_va);
+    const Vec3 p1 = ReadVec3(base, v1_va);
+    const Vec3 p2 = ReadVec3(base, v2_va);
+    if (!IsFiniteVec3(p0) || !IsFiniteVec3(p1) || !IsFiniteVec3(p2)) {
+        ctx.eax = 0u;
+        ctx.esp += 4u;
+        return;
+    }
+
+    float y0 = p0.y;
+    float y1 = p1.y;
+    float y2 = p2.y;
+    if (verts_already_world == 0u && owner_obj_va != 0u) {
+        if (!ValidGuest(owner_obj_va + 0x14u, 0x2Cu)) {
+            __imp__sub_00179D60(ctx, base);
+            return;
+        }
+        // Matches CMatrix4x3::RotateVector (sub_00018690 @ 0x000186AE..0x000186C3)
+        const float m01 = X86_MEMF32(owner_obj_va + 0x18u);
+        const float m11 = X86_MEMF32(owner_obj_va + 0x28u);
+        const float m21 = X86_MEMF32(owner_obj_va + 0x38u);
+        y0 = m01 * p0.x + m11 * p0.y + m21 * p0.z;
+        y1 = m01 * p1.x + m11 * p1.y + m21 * p1.z;
+        y2 = m01 * p2.x + m11 * p2.y + m21 * p2.z;
+    }
+
+    const float span_y = std::max({y0, y1, y2}) - std::min({y0, y1, y2});
+    const float max_span = (ny >= 0.60f) ? kMaxModerateStairSpanY : kMaxSteepStairSpanY;
+    ctx.eax = (std::isfinite(span_y) && span_y >= 0.0f && span_y < max_span) ? 1u : 0u;
+    ctx.esp += 4u;
+}
+
+// ---------------------------------------------------------------------------
+// 0B. CCollider::ShouldSkipStepTriangle (__thiscall, ret 0x04: uint32_t packed_tri_id -> eax = skip)
+//     On long Docks wooden staircase flights (span_y = 400..1301.3, e.g. id0=593, 602, 354..356, 544,
+//     586..591, 60, 13/548), tri_centroid_y exceeds foot_center_y across the lower two-thirds of the
+//     flight, and STriEntry.normal (+0x2C) is not yet populated at 0x00174152. Native sub_001709C0
+//     returned 0, adding the staircase ramp itself as a solid wall to [foot_sphere+0x24] while ON_GROUND
+//     zeroed desired_delta.y and slide.y. Skipping solid foot-wall registration when Torque is on the
+//     front/top side of a reachable stair ramp lets GroundSnap (sub_00172C00) climb cleanly while
+//     preserving upper-body sphere & underside collision.
+// ---------------------------------------------------------------------------
+X86_FUNC(sub_001709C0) {
+    if (app::IsReplayOrAutotestActive() || ctx.ecx == 0u || ctx.ecx != g_active_collider_va ||
+        !ValidGuest(ctx.ecx, 0x19Eu) || !ValidGuest(ctx.esp + 0x04u, 4u)) {
+        __imp__sub_001709C0(ctx, base);
+        return;
+    }
+
+    const uint32_t col_va = ctx.ecx;
+    if ((X86_MEM8(col_va) & 0x08u) == 0u) {
+        ctx.eax = 0u;
+        ctx.esp += 8u;
+        return;
+    }
+
+    const uint32_t packed = X86_MEM32(ctx.esp + 0x04u);
+    const int32_t pool_idx = static_cast<int32_t>(packed) >> 16;
+    const int32_t tri_idx = static_cast<int32_t>(packed) - (pool_idx << 16);
+    if (pool_idx != 0 || tri_idx < 0) {
+        // Preserve native terrain-pool handling (pools 1 & 2)
+        __imp__sub_001709C0(ctx, base);
+        return;
+    }
+
+    const uint32_t pool_arr_va = X86_MEM32(col_va + 0x18Au);
+    if (!ValidGuest(pool_arr_va, 0x10u)) {
+        __imp__sub_001709C0(ctx, base);
+        return;
+    }
+    const uint32_t data_va = X86_MEM32(pool_arr_va + 0x00u);
+    const int32_t count = static_cast<int32_t>(X86_MEM32(pool_arr_va + 0x08u));
+    const uint32_t is_chunked = X86_MEM32(pool_arr_va + 0x0Cu);
+    if (is_chunked != 0u || data_va == 0u || tri_idx >= count) {
+        __imp__sub_001709C0(ctx, base);
+        return;
+    }
+
+    const uint32_t t_va = data_va + static_cast<uint32_t>(tri_idx) * 0x40u;
+    if (!ValidGuest(t_va, 0x40u)) {
+        __imp__sub_001709C0(ctx, base);
+        return;
+    }
+
+    const uint32_t t_flags = X86_MEM32(t_va + 0x00u);
+    const Vec3 v0 = ReadVec3(base, t_va + 0x08u);
+    const Vec3 v1 = ReadVec3(base, t_va + 0x14u);
+    const Vec3 v2 = ReadVec3(base, t_va + 0x20u);
+    if (!IsFiniteVec3(v0) || !IsFiniteVec3(v1) || !IsFiniteVec3(v2)) {
+        __imp__sub_001709C0(ctx, base);
+        return;
+    }
+
+    Vec3 n{};
+    if ((t_flags & 0x02u) != 0u) {
+        n = ReadVec3(base, t_va + 0x2Cu);
+    } else {
+        const Vec3 raw_n = VCross(VSub(v2, v0), VSub(v1, v0));
+        const float nl = VLen(raw_n);
+        if (nl > 1e-5f) {
+            n = VScale(raw_n, 1.0f / nl);
+        }
+    }
+    if (!IsFiniteVec3(n) || VLenSq(n) < 0.5f) {
+        __imp__sub_001709C0(ctx, base);
+        return;
+    }
+
+    const float min_y = std::min({v0.y, v1.y, v2.y});
+    const float max_y = std::max({v0.y, v1.y, v2.y});
+    const float span_y = max_y - min_y;
+    if (!IsValidStairRamp(n.y, span_y)) {
+        __imp__sub_001709C0(ctx, base);
+        return;
+    }
+
+    const int32_t foot_bone_id = static_cast<int32_t>(X86_MEM32(col_va + 0x0Cu));
+    const uint32_t spheres_va = X86_MEM32(col_va + 0x122u);
+    const int32_t sphere_count = static_cast<int32_t>(X86_MEM32(col_va + 0x12Au));
+    if (sphere_count <= 0 || sphere_count > 32 ||
+        !ValidGuest(spheres_va, static_cast<uint32_t>(sphere_count) * 0x3Cu)) {
+        __imp__sub_001709C0(ctx, base);
+        return;
+    }
+
+    uint32_t foot_s_va = 0u;
+    for (int32_t i = 0; i < sphere_count; ++i) {
+        const uint32_t s_va = spheres_va + static_cast<uint32_t>(i) * 0x3Cu;
+        if (static_cast<int32_t>(X86_MEM32(s_va + 0x04u)) == foot_bone_id) {
+            foot_s_va = s_va;
+            break;
+        }
+    }
+    if (foot_s_va == 0u) {
+        foot_s_va = spheres_va;
+    }
+
+    const float foot_r = std::clamp(X86_MEMF32(foot_s_va + 0x08u), 30.0f, 250.0f);
+    const Vec3 col_rel_pos = ReadVec3(base, col_va + 0xCCu);
+    const Vec3 foot_local = ReadVec3(base, foot_s_va + 0x0Cu);
+    const Vec3 foot_center_rel = VAdd(col_rel_pos, foot_local);
+    if (!IsFiniteVec3(foot_center_rel)) {
+        __imp__sub_001709C0(ctx, base);
+        return;
+    }
+
+    const float centroid_y = (v0.y + v1.y + v2.y) * (1.0f / 3.0f);
+    const float signed_plane_d = VDot(VSub(foot_center_rel, v0), n);
+    const bool front_or_top_side = (signed_plane_d >= -foot_r * 0.35f);
+    const bool reachable_base = (min_y <= foot_center_rel.y + std::max(foot_r * 0.65f, 64.0f));
+
+    ctx.eax = (centroid_y < foot_center_rel.y || (front_or_top_side && reachable_base)) ? 1u : 0u;
+    ctx.esp += 8u;
+}
 
 // ---------------------------------------------------------------------------
 // 1. CCollider::SweepStep (__thiscall, ret 0: ecx = CCollider* -> eax = continue_loop)
@@ -728,29 +1070,24 @@ X86_FUNC(sub_00174530) {
     const uint32_t col_va = ctx.ecx;
     const float saved_substep = X86_MEMF32(col_va + 0x40u);
     const float desired_dist = X86_MEMF32(col_va + 0x38u);
-    bool modified_substep = false;
+    ScopedGuestFloatRestore restore{base, col_va + 0x40u, saved_substep, false};
 
     if (std::isfinite(saved_substep) && saved_substep > 0.25f &&
         std::isfinite(desired_dist) && desired_dist > 1e-4f) {
         const float target_substep = std::clamp(std::min(saved_substep, desired_dist * 0.125f), 0.25f, saved_substep);
         if (target_substep < saved_substep) {
             X86_MEMF32(col_va + 0x40u) = target_substep;
-            modified_substep = true;
+            restore.active = true;
         }
     }
 
     __imp__sub_00174530(ctx, base);
-
-    if (modified_substep && ValidGuest(col_va + 0x40u, 4u)) {
-        X86_MEMF32(col_va + 0x40u) = saved_substep;
-    }
 }
 
 // ---------------------------------------------------------------------------
 // 3. CTorque::TryLandOnMeshGround (__thiscall, ret 0: ecx = CTorque*)
-//    Allows landing onto verified staircase slopes (ny >= 0.62f, tri_height < 400.0f -> bStepUpSlope == 1
-//    at [col+0x14A]) so Quarry's 40.5..45 deg staircases (ny = 0.707..0.760) do not leave Torque stuck
-//    in State 9 (Fall) with Jump disabled.
+//    Allows landing onto verified staircase slopes (ny >= 0.54f -> bStepUpSlope == 1 at [col+0x14A])
+//    so Docks & Quarry 40..57 deg staircases do not leave Torque stuck in State 9 (Fall).
 // ---------------------------------------------------------------------------
 X86_FUNC(sub_0003CE90) {
     if (app::IsReplayOrAutotestActive() || ctx.ecx == 0u || ctx.ecx != g_active_torque_va ||
@@ -762,22 +1099,18 @@ X86_FUNC(sub_0003CE90) {
     const uint32_t torque_va = ctx.ecx;
     const uint32_t col_va = X86_MEM32(torque_va + 0xD0u);
     const uint32_t gs_va = X86_MEM32(torque_va + 0xD4u);
-    float saved_min_ny = kMinWalkableNormalY;
-    bool lowered_threshold = false;
+    ScopedGuestFloatRestore restore{base, gs_va + 0x0Cu, kMinWalkableNormalY, false};
 
     if (ValidGuest(col_va, 0x180u) && ValidGuest(gs_va, 0xA4u) && X86_MEM32(col_va + 0x14Au) != 0u) {
-        saved_min_ny = X86_MEMF32(gs_va + 0x0Cu);
+        const float saved_min_ny = X86_MEMF32(gs_va + 0x0Cu);
         if (std::isfinite(saved_min_ny) && saved_min_ny > kMinStairRampNormalY) {
+            restore.saved = saved_min_ny;
+            restore.active = true;
             X86_MEMF32(gs_va + 0x0Cu) = kMinStairRampNormalY;
-            lowered_threshold = true;
         }
     }
 
     __imp__sub_0003CE90(ctx, base);
-
-    if (lowered_threshold && ValidGuest(gs_va + 0x0Cu, 4u)) {
-        X86_MEMF32(gs_va + 0x0Cu) = saved_min_ny;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -785,9 +1118,9 @@ X86_FUNC(sub_0003CE90) {
 //    Orchestrates:
 //     A. Enabling CCollider bit 0x08 (STEP_UP_ENABLED) & restoring 0x8000 before GatherCollisionTriangles.
 //     B. Unwelded staircase seam ground-bridging when sub_0003D760 drops support across unwelded .mdu tris.
-//     C. Smooth, framerate-independent staircase top-edge (crest / lip) step-up assist with full all-sphere
-//        headroom/wall/railing clearance verification.
-//     D. Quarry V-crease anti-wedge recovery if pinned in State 9 (Fall) with near-zero displacement.
+//     C. Smooth, framerate-independent staircase top-edge / header-trim step-up assist with narrow-railing
+//        deflection and full all-sphere clearance verification.
+//     D. Staircase V-crease / railing anti-wedge recovery in both State 9 (Fall) and ON_GROUND pinches.
 // ---------------------------------------------------------------------------
 X86_FUNC(sub_0005BF60) {
     if (app::IsReplayOrAutotestActive() || !ValidGuest(ctx.ecx, 0x790u) ||
@@ -853,17 +1186,13 @@ X86_FUNC(sub_0005BF60) {
     // Pillar 1: Ensure STEP_UP_ENABLED (0x08) and 0x8000 (omitted in 0x00054EF4) are active on Torque's collider
     X86_MEM32(col_va) = col_flags_entry | 0x8008u;
 
-    // Arm active scope for sub_00174530, sub_00174340, and sub_0003CE90
-    g_active_torque_va = torque_va;
-    g_active_collider_va = col_va;
     g_active_sweep_had_hit = false;
     g_active_sweep_hard_stopped = false;
     g_snapshot_valid = false;
-
-    __imp__sub_0005BF60(ctx, base);
-
-    g_active_torque_va = 0u;
-    g_active_collider_va = 0u;
+    {
+        const ScopedActiveTorque active_scope(torque_va, col_va);
+        __imp__sub_0005BF60(ctx, base);
+    }
 
     if (!g_snapshot_valid || !ValidGuest(obj_va, 0xF0u) || !ValidGuest(col_va, 0x19Eu) || !ValidGuest(gs_va, 0xA4u)) {
         return;
@@ -873,28 +1202,29 @@ X86_FUNC(sub_0005BF60) {
     if (!IsFiniteVec3(after_pos)) return;
 
     const float step_height = QueryTorqueStepHeight(ctx, base, obj_va);
+    const float effective_step_h = std::max(step_height, 172.0f);
     uint32_t phys_flags_after = X86_MEM32(torque_va + 0x98u);
     uint32_t state_bits_after = X86_MEM32(torque_va + 0xA4u);
     bool is_on_ground_after = (phys_flags_after & 0x01u) != 0u;
 
     // -----------------------------------------------------------------------
     // Pillar 2: Unwelded Staircase Seam Ground-Bridge
-    // When walking across an unwelded .mdu seam (0 shared vertex indices in sub_0017A400) high above
-    // .wdu terrain, sub_0003D760 drops CGroundSupport and forces State 9 (Fall, ON_GROUND = 0).
-    // Immediately re-bridge support if a valid floor/stair triangle lies directly beneath (x, z).
+    // When walking across an unwelded .mdu seam (0 shared vertex indices in sub_0017A400, e.g. Docks
+    // id0=593 switchback or Quarry sub=401) high above .wdu terrain, sub_0003D760 drops CGroundSupport
+    // and forces State 9 (Fall, ON_GROUND = 0). Re-bridge support if a valid floor/stair triangle lies beneath.
     // -----------------------------------------------------------------------
     if (was_on_ground && !was_jumping && vel_y_before <= 5.0f && !is_on_ground_after &&
         (state_bits_after & (1u << 9)) != 0u) {
         float seam_y = 0.0f;
-        const float max_down = std::min(step_height * 0.65f, 96.0f);
-        const float max_up = std::min(step_height * 0.45f, 64.0f);
+        const float max_down = std::min(effective_step_h, 165.0f);
+        const float max_up = std::min(effective_step_h * 0.65f, 96.0f);
         const SnapTri* seam_tri = FindBestSupportTriangleAt(
             after_pos.x, after_pos.z, after_pos.y - max_down, after_pos.y + max_up,
-            after_pos.y, /*allow_stair_ramps=*/true, /*edge_eps=*/4.0f, seam_y);
+            after_pos.y, /*allow_stair_ramps=*/true, /*edge_eps=*/8.0f, seam_y);
 
         if (seam_tri != nullptr) {
             const Vec3 bridged_pos = {after_pos.x, seam_y, after_pos.z};
-            if (IsPoseClearOfObstacles(bridged_pos, seam_y, /*radius_shrink=*/2.5f)) {
+            if (IsPoseClearOfObstacles(bridged_pos, seam_y, /*radius_shrink=*/2.5f, &after_pos)) {
                 ApplyTorquePositionAdjustment(ctx, base, torque_va, obj_va, col_va, after_pos, bridged_pos);
                 AttachTorqueGroundSupport(ctx, base, torque_va, col_va, gs_va, seam_tri);
                 after_pos = bridged_pos;
@@ -906,9 +1236,10 @@ X86_FUNC(sub_0005BF60) {
     }
 
     // -----------------------------------------------------------------------
-    // Pillar 3: Smooth, Framerate-Independent Staircase Top-Edge (Crest / Lip) Step-Up Assist
-    // Handles cases where Torque's foot/shin sphere rim hits a staircase top-edge lip at horizontal
-    // distance sqrt(R^2 - h^2) ahead of Torque's (x, z) center while ON_GROUND zeroes slide.y.
+    // Pillar 3: Smooth, Framerate-Independent Staircase Top-Edge / Header-Trim Step-Up Assist
+    // Handles cases where Torque's foot/shin sphere rim hits a staircase top-edge lip or raised wooden
+    // header trim plank while ON_GROUND zeroes slide.y, including slight inward yaw deflection when
+    // grazing narrow Docks side handrails/baluster posts.
     // -----------------------------------------------------------------------
     const float desired_dx = desired_pos_entry.x - start_pos.x;
     const float desired_dz = desired_pos_entry.z - start_pos.z;
@@ -931,98 +1262,133 @@ X86_FUNC(sub_0005BF60) {
 
         if (horiz_impeded) {
             const float base_y = g_climb.active ? std::max(after_pos.y, g_climb.lifted_y) : after_pos.y;
-            const float min_land_y = g_climb.active
-                                         ? std::min(after_pos.y + 2.0f, g_climb.target_land_y - 4.0f)
-                                         : (after_pos.y + 2.0f);
-            const float max_land_y = start_pos.y + step_height;
+            const float max_land_y = start_pos.y + effective_step_h;
             const float pref_land_y = g_climb.active ? g_climb.target_land_y : (after_pos.y + 24.0f);
 
-            if (max_land_y > min_land_y) {
-                // Probe from Torque's desired step out to just past the foot sphere's front rim
-                const std::array<float, 5> probe_dists = {
-                    desired_horiz,
-                    std::max(desired_horiz, g_foot_radius * 0.35f),
-                    std::max(desired_horiz, g_foot_radius * 0.65f),
-                    std::max(desired_horiz, g_foot_radius * 0.90f),
-                    std::max(desired_horiz, g_foot_radius * 1.15f),
-                };
+            // Probe from Torque's desired step out past the foot sphere rim & wooden landing header planks,
+            // testing 0 deg first and small +/-18 deg, +/-36 deg inward deflections if rubbing a side railing/post.
+            const std::array<float, 6> probe_dists = {
+                desired_horiz,
+                std::max(desired_horiz, g_foot_radius * 0.35f),
+                std::max(desired_horiz, g_foot_radius * 0.65f),
+                std::max(desired_horiz, g_foot_radius * 0.90f),
+                std::max(desired_horiz, g_foot_radius * 1.15f),
+                std::max(desired_horiz, g_foot_radius * 1.40f),
+            };
+            constexpr std::array<std::pair<float, float>, 5> kYawDeflections = {{
+                {1.0f, 0.0f},          //   0 deg
+                {0.95106f, 0.30902f},  // +18 deg
+                {0.95106f, -0.30902f}, // -18 deg
+                {0.80902f, 0.58779f},  // +36 deg
+                {0.80902f, -0.58779f}, // -36 deg
+            }};
 
-                const SnapTri* best_land_tri = nullptr;
-                float best_land_y = 0.0f;
-                float best_probe_d = 0.0f;
+            const SnapTri* best_land_tri = nullptr;
+            float best_land_y = 0.0f;
+            float best_clearance_y = 0.0f;
+            float best_probe_d = 0.0f;
+            float best_dir_x = dir_x;
+            float best_dir_z = dir_z;
+
+            for (const auto& [cos_a, sin_a] : kYawDeflections) {
+                const float pdir_x = dir_x * cos_a - dir_z * sin_a;
+                const float pdir_z = dir_x * sin_a + dir_z * cos_a;
+                const float crest_y =
+                    FindForwardLowStepCrestY(start_pos, after_pos.y, max_land_y, pdir_x, pdir_z);
+                const bool has_low_crest = (crest_y > after_pos.y + 2.0f);
+                const float min_land_y =
+                    g_climb.active
+                        ? std::min(after_pos.y - 8.0f, g_climb.target_land_y - 8.0f)
+                        : (has_low_crest ? (after_pos.y - 16.0f) : (after_pos.y + 2.0f));
+                if (max_land_y <= min_land_y) continue;
 
                 for (float pd : probe_dists) {
-                    const float px = start_pos.x + dir_x * pd;
-                    const float pz = start_pos.z + dir_z * pd;
+                    const float px = start_pos.x + pdir_x * pd;
+                    const float pz = start_pos.z + pdir_z * pd;
                     float cand_land_y = 0.0f;
                     const SnapTri* tri = FindBestSupportTriangleAt(
                         px, pz, min_land_y, max_land_y, pref_land_y,
-                        /*allow_stair_ramps=*/true, /*edge_eps=*/2.5f, cand_land_y);
+                        /*allow_stair_ramps=*/true, /*edge_eps=*/3.5f, cand_land_y);
                     if (tri == nullptr) continue;
 
+                    const float clearance_y = std::max(cand_land_y, crest_y);
+                    if (clearance_y <= after_pos.y + 1.5f && !g_climb.active) continue;
+
                     // Verify full 3D clearance across ALL Torque spheres:
-                    //  (1) Upward headroom at start_pos lifted to cand_land_y
+                    //  (1) Upward headroom at start_pos lifted to clearance_y
                     //  (2) Open space on the target landing itself (rejects railings, fences, closed doors, walls!)
-                    const Vec3 up_pos = {start_pos.x, cand_land_y + 2.0f, start_pos.z};
-                    const Vec3 land_probe_pos = {px, cand_land_y + 2.0f, pz};
-                    if (!IsPoseClearOfObstacles(up_pos, cand_land_y) ||
-                        !IsPoseClearOfObstacles(land_probe_pos, cand_land_y)) {
+                    const Vec3 up_pos = {start_pos.x, clearance_y + 2.0f, start_pos.z};
+                    const Vec3 land_probe_pos = {px, clearance_y + 2.0f, pz};
+                    if (!IsPoseClearOfObstacles(up_pos, clearance_y, 1.5f, &start_pos) ||
+                        !IsPoseClearOfObstacles(land_probe_pos, clearance_y, 1.5f, &start_pos)) {
                         continue;
                     }
 
                     best_land_tri = tri;
                     best_land_y = cand_land_y;
+                    best_clearance_y = clearance_y;
                     best_probe_d = pd;
+                    best_dir_x = pdir_x;
+                    best_dir_z = pdir_z;
                     break;
                 }
+                if (best_land_tri != nullptr) break;
+            }
 
-                if (best_land_tri != nullptr) {
-                    const float next_x = start_pos.x + desired_dx;
-                    const float next_z = start_pos.z + desired_dz;
+            if (best_land_tri != nullptr) {
+                const float move_scale =
+                    desired_horiz * std::max(dir_x * best_dir_x + dir_z * best_dir_z, 0.55f);
+                const float next_x = start_pos.x + best_dir_x * move_scale;
+                const float next_z = start_pos.z + best_dir_z * move_scale;
 
-                    // Check if (next_x, next_z) is already directly over the target landing triangle
-                    float direct_y = 0.0f;
-                    const bool over_landing = PointInTriXZ(
-                        next_x - g_ref_origin.x, next_z - g_ref_origin.z, *best_land_tri, 3.0f, direct_y);
+                // Check if (next_x, next_z) is already directly over the target landing triangle AND clear
+                // of any raised landing-edge header trim at snapped_y; if a trim plank still overlaps at
+                // snapped_y, fall through to the progressive lift branch so Torque steps cleanly over it.
+                bool landed_directly = false;
+                float direct_y = 0.0f;
+                const bool over_landing = PointInTriXZ(
+                    next_x - g_ref_origin.x, next_z - g_ref_origin.z, *best_land_tri, 3.5f, direct_y);
 
-                    if (over_landing) {
-                        const float snapped_y = direct_y + g_ref_origin.y;
-                        const Vec3 final_pos = {next_x, snapped_y, next_z};
-                        if (IsPoseClearOfObstacles(final_pos, snapped_y)) {
-                            ApplyTorquePositionAdjustment(ctx, base, torque_va, obj_va, col_va, after_pos, final_pos);
-                            AttachTorqueGroundSupport(ctx, base, torque_va, col_va, gs_va, best_land_tri);
-                            after_pos = final_pos;
-                            is_on_ground_after = true;
-                            g_climb.active = false;
-                        }
-                    } else if (best_probe_d <= g_foot_radius * 1.20f) {
-                        // Progressive framerate-independent ramp lift (desired_horiz == speed * dt) across the lip
-                        const float climb_step = std::max(desired_horiz * 1.35f, 2.0f);
-                        const float next_y = std::min(best_land_y, base_y + climb_step);
-                        const Vec3 check_lifted = {next_x, best_land_y + 2.0f, next_z};
-                        const Vec3 step_pos = {next_x, next_y, next_z};
-
-                        if (IsPoseClearOfObstacles(check_lifted, best_land_y)) {
-                            ApplyTorquePositionAdjustment(ctx, base, torque_va, obj_va, col_va, after_pos, step_pos);
-                            if (X86_MEMF32(torque_va + 0x15Eu) < 0.0f) {
-                                X86_MEMF32(torque_va + 0x15Eu) = 0.0f;
-                            }
-                            X86_MEM32(col_va) &= ~0x4000u;
-                            CallThiscall(ctx, kFnLandOnGround, torque_va);
-
-                            after_pos = step_pos;
-                            is_on_ground_after = true;
-                            g_climb.active = true;
-                            g_climb.lifted_y = next_y;
-                            g_climb.target_land_y = best_land_y;
-                            g_climb.dir_x = dir_x;
-                            g_climb.dir_z = dir_z;
-                            g_climb.idle_frames = 0;
-                        }
+                if (over_landing) {
+                    const float snapped_y = direct_y + g_ref_origin.y;
+                    const Vec3 final_pos = {next_x, snapped_y, next_z};
+                    if (IsPoseClearOfObstacles(final_pos, snapped_y, 1.5f, &start_pos)) {
+                        ApplyTorquePositionAdjustment(ctx, base, torque_va, obj_va, col_va, after_pos, final_pos);
+                        AttachTorqueGroundSupport(ctx, base, torque_va, col_va, gs_va, best_land_tri);
+                        after_pos = final_pos;
+                        is_on_ground_after = true;
+                        g_climb.active = false;
+                        landed_directly = true;
                     }
-                } else {
-                    g_climb.active = false;
                 }
+
+                if (!landed_directly && best_probe_d <= g_foot_radius * 1.45f) {
+                    // Progressive framerate-independent ramp lift (desired_horiz == speed * dt) across the lip/trim
+                    const float climb_step = std::max(desired_horiz * 1.35f, 2.5f);
+                    const float next_y = std::min(best_clearance_y, base_y + climb_step);
+                    const Vec3 check_lifted = {next_x, best_clearance_y + 2.0f, next_z};
+                    const Vec3 step_pos = {next_x, next_y, next_z};
+
+                    if (IsPoseClearOfObstacles(check_lifted, best_clearance_y, 1.5f, &start_pos)) {
+                        ApplyTorquePositionAdjustment(ctx, base, torque_va, obj_va, col_va, after_pos, step_pos);
+                        if (X86_MEMF32(torque_va + 0x15Eu) < 0.0f) {
+                            X86_MEMF32(torque_va + 0x15Eu) = 0.0f;
+                        }
+                        X86_MEM32(col_va) &= ~0x4000u;
+                        CallThiscall(ctx, kFnLandOnGround, torque_va);
+
+                        after_pos = step_pos;
+                        is_on_ground_after = true;
+                        g_climb.active = true;
+                        g_climb.lifted_y = next_y;
+                        g_climb.target_land_y = best_land_y;
+                        g_climb.dir_x = dir_x;
+                        g_climb.dir_z = dir_z;
+                        g_climb.idle_frames = 0;
+                    }
+                }
+            } else {
+                g_climb.active = false;
             }
         } else if (actual_horiz >= desired_horiz * 0.75f) {
             g_climb.active = false;
@@ -1034,10 +1400,12 @@ X86_FUNC(sub_0005BF60) {
     }
 
     // -----------------------------------------------------------------------
-    // Pillar 4: Quarry Staircase V-Crease Anti-Wedge / Unstuck Safety
-    // If Torque ever becomes wedged in State 9 (Fall, ON_GROUND == 0, Jump disabled) between opposing
-    // non-walkable / crease planes with downward velocity and near-zero 3D displacement for >= 0.12s,
-    // push out along the averaged contact normal + upward lift onto clear support.
+    // Pillar 4: Staircase V-Crease & Narrow-Railing Pinch Anti-Wedge Safety
+    // Rescues Torque if wedged either:
+    //  (a) in State 9 (Fall, ON_GROUND == 0, Jump disabled) with near-zero displacement for >= 0.12s, OR
+    //  (b) ON_GROUND while actively moving (desired_horiz > 1.0f) with near-zero displacement for >= 0.30s
+    //      inside a verified opposing-normal V-pinch (dot < -0.45f) or deep solid sphere embed (< 0.78*R)
+    //      (never triggers against flat walls, locked doors, or normal 90-deg corners).
     // -----------------------------------------------------------------------
     phys_flags_after = X86_MEM32(torque_va + 0x98u);
     state_bits_after = X86_MEM32(torque_va + 0xA4u);
@@ -1054,7 +1422,15 @@ X86_FUNC(sub_0005BF60) {
         g_active_sweep_had_hit &&
         moved_3d < std::max(1.5f, desired_3d * 0.10f);
 
-    if (!pinned_in_fall) {
+    const bool pinned_on_ground_wedge =
+        is_on_ground_after &&
+        !was_jumping &&
+        desired_horiz > 1.0f &&
+        g_active_sweep_had_hit &&
+        moved_3d < std::max(1.0f, desired_horiz * 0.08f) &&
+        IsGeometricallyPinchedAt(after_pos);
+
+    if (!pinned_in_fall && !pinned_on_ground_wedge) {
         g_wedge.frames = 0;
         g_wedge.accum_s = 0.0f;
     } else {
@@ -1064,13 +1440,17 @@ X86_FUNC(sub_0005BF60) {
         ++g_wedge.frames;
         g_wedge.accum_s += dt;
 
+        const float max_anchor_drift = pinned_in_fall ? (g_foot_radius * 0.50f) : (g_foot_radius * 0.35f);
+        const int req_frames = pinned_in_fall ? 5 : 15;
+        const float req_seconds = pinned_in_fall ? 0.12f : 0.30f;
+
         const float drift_from_anchor = VLen(VSub(after_pos, g_wedge.anchor_pos));
-        if (drift_from_anchor > g_foot_radius * 0.50f) {
+        if (drift_from_anchor > max_anchor_drift) {
             g_wedge.anchor_pos = after_pos;
             g_wedge.frames = 1;
             g_wedge.accum_s = dt;
-        } else if (g_wedge.frames >= 5 && g_wedge.accum_s >= 0.12f) {
-            // Accumulate outward depenetration direction from all nearby / contacting triangles
+        } else if (g_wedge.frames >= req_frames && g_wedge.accum_s >= req_seconds) {
+            // Accumulate outward depenetration direction from all nearby / contacting obstacle triangles
             Vec3 push_dir = {0.0f, 1.0f, 0.0f};
             const Vec3 after_rel_base = VSub(after_pos, g_ref_origin);
             for (const SnapSphere& s : g_snap_spheres) {
@@ -1078,6 +1458,7 @@ X86_FUNC(sub_0005BF60) {
                 const float probe_r = s.radius + 8.0f;
                 const float probe_r_sq = probe_r * probe_r;
                 for (const SnapTri& t : g_snap_tris) {
+                    if (s.is_foot && (t.is_walkable_floor || t.is_stair_ramp)) continue;
                     if (c_rel.y + probe_r < t.min_y || c_rel.y - probe_r > t.max_y) continue;
                     const Vec3 cp = ClosestPointOnTriangle(c_rel, t.v0, t.v1, t.v2);
                     const Vec3 diff = VSub(c_rel, cp);
@@ -1091,17 +1472,20 @@ X86_FUNC(sub_0005BF60) {
                 }
             }
 
-            float push_horiz = std::hypot(push_dir.x, push_dir.z);
-            const float nx = (push_horiz > 1e-3f) ? (push_dir.x / push_horiz) : 0.0f;
-            const float nz = (push_horiz > 1e-3f) ? (push_dir.z / push_horiz) : 0.0f;
+            const float push_horiz = std::hypot(push_dir.x, push_dir.z);
+            const float nx = (push_horiz > 1e-3f) ? (push_dir.x / push_horiz) : (desired_horiz > 0.05f ? (desired_dx / desired_horiz) : 1.0f);
+            const float nz = (push_horiz > 1e-3f) ? (push_dir.z / push_horiz) : (desired_horiz > 0.05f ? (desired_dz / desired_horiz) : 0.0f);
 
             constexpr std::array<float, 4> kLiftHeights = {20.0f, 44.0f, 76.0f, 116.0f};
-            constexpr std::array<float, 4> kHorizRadii = {0.0f, 14.0f, 30.0f, 52.0f};
-            constexpr std::array<std::pair<float, float>, 5> kDirs = {{
+            constexpr std::array<float, 5> kHorizRadii = {0.0f, 14.0f, 30.0f, 52.0f, 76.0f};
+            constexpr std::array<std::pair<float, float>, 8> kDirs = {{
                 {1.0f, 0.0f},
                 {0.7071f, 0.7071f},
                 {0.7071f, -0.7071f},
                 {0.0f, 1.0f},
+                {0.0f, -1.0f},
+                {-0.7071f, 0.7071f},
+                {-0.7071f, -0.7071f},
                 {-1.0f, 0.0f},
             }};
 
@@ -1119,7 +1503,7 @@ X86_FUNC(sub_0005BF60) {
                         float support_y = cand.y;
                         const SnapTri* floor_tri = FindBestSupportTriangleAt(
                             cand.x, cand.z, after_pos.y - 32.0f, cand.y + 16.0f,
-                            cand.y, /*allow_stair_ramps=*/true, /*edge_eps=*/4.0f, support_y);
+                            cand.y, /*allow_stair_ramps=*/true, /*edge_eps=*/5.0f, support_y);
 
                         const Vec3 resolved = (floor_tri != nullptr)
                                                   ? Vec3{cand.x, std::max(cand.y, support_y), cand.z}

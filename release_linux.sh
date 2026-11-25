@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# Stages and packages TheSuffering-Recomp-v1.6.0-linux-x86_64.tar.gz for Native Linux x86_64 & Steam Deck.
+# Stages and packages TheSuffering-Recomp-v1.6.1-linux-x86_64.tar.gz for Native Linux x86_64 & Steam Deck.
 # Bundles stripped non-LSB shared library dependencies for compiler/{clang,ld.lld,xbe_recomp} inside
 # compiler/lib/ with $ORIGIN:$ORIGIN/lib RPATH so stock read-only SteamOS 3.x requires ZERO system LLVM packages.
 # Strictly excludes libsuffering.so, *.dll, *.exe, *.xbe, *.iso, compiler/work/, and runtime state.
@@ -8,7 +8,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="1.6.0"
+VERSION="1.6.1"
 BUILD_DIR="$REPO_ROOT/out/build/linux-release"
 OUT_TAR=""
 
@@ -18,8 +18,8 @@ Usage: ./release_linux.sh [options]
 
 Options:
   --build-dir <dir>   CMake Linux build output directory (default: out/build/linux-release)
-  --out-tar <path>    Output .tar.gz path (default: .local/dist/TheSuffering-Recomp-v1.6.0-linux-x86_64.tar.gz)
-  --version <ver>     Release version tag without 'v' (default: 1.6.0)
+  --out-tar <path>    Output .tar.gz path (default: .local/dist/TheSuffering-Recomp-v1.6.1-linux-x86_64.tar.gz)
+  --version <ver>     Release version tag without 'v' (default: 1.6.1)
   -h, --help          Show this help text
 EOF
 }
@@ -168,8 +168,9 @@ collect_deps "$STAGE/compiler/xbe_recomp"
 collect_deps "$STAGE/compiler/clang"
 collect_deps "$STAGE/compiler/ld.lld"
 
-# Strip debug info from bundled compiler libs and set $ORIGIN RPATHs
+# Strip debug info from host/recompiler ELF binaries and bundled compiler libs, then set $ORIGIN RPATHs
 if command -v strip >/dev/null 2>&1; then
+    strip --strip-debug "$STAGE/suffering" "$STAGE/compiler/xbe_recomp" 2>/dev/null || true
     for so in "$STAGE/compiler/lib"/*.so*; do
         [[ -f "$so" ]] || continue
         strip --strip-unneeded "$so" 2>/dev/null || true

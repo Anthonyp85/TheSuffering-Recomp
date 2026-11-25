@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Automated Copyright, Sanitization, History & Cross-Platform Release Archive Auditor (v1.6.0).
+"""Automated Copyright, Sanitization, History & Cross-Platform Release Archive Auditor (v1.6.1).
 
 Runs 6 mandatory gates and writes a JSON report to .local/m6_audit/audit_release_report.json:
   Gate 1: Full Git history scan (git rev-list --objects --all) for forbidden extensions/paths,
@@ -9,14 +9,14 @@ Runs 6 mandatory gates and writes a JSON report to .local/m6_audit/audit_release
   Gate 2: HEAD & working-tree hygiene/sanitization (clean tree unless --allow-dirty, zero
           machine/site leak strings, GPL-2.0-or-later SPDX headers incl. .sh/.yml/.desktop,
           SDK patch byte parity).
-  Gate 3: Source release archive (.local/dist/TheSuffering-Recomp-v1.6.0-source.zip) exact
+  Gate 3: Source release archive (.local/dist/TheSuffering-Recomp-v1.6.1-source.zip) exact
           1-to-1 match with git ls-tree -r HEAD, required files, zero forbidden files/strings.
-  Gate 4: Win64 launcher release archive (.local/dist/TheSuffering-Recomp-v1.6.0-win64-launcher.zip)
+  Gate 4: Win64 launcher release archive (.local/dist/TheSuffering-Recomp-v1.6.1-win64-launcher.zip)
           exact allowlist of redistributable PE/lib files (incl. SHA-256-pinned official vendor
           upscaler plugins), required license/notice docs, zero suffering.dll / .xbe / .iso /
           .7z / compiler/work / runtime state.
   Gate 4b: Native Linux x86_64 & Steam Deck release archive
-          (.local/dist/TheSuffering-Recomp-v1.6.0-linux-x86_64.tar.gz) ELF64 header check,
+          (.local/dist/TheSuffering-Recomp-v1.6.1-linux-x86_64.tar.gz) ELF64 header check,
           GLIBC_2.35 max symbol version verification, self-contained compiler/ RPATH & deps,
           required Steam Deck/desktop/license files, LF script endings, zero libsuffering.so /
           .dll / .exe / .xbe / .iso / compiler/work / runtime state.
@@ -43,9 +43,9 @@ REPO = Path(__file__).resolve().parent.parent
 SDK_DIR = REPO / "XboxXBERecomp"
 PATCH_FILE = REPO / "patches" / "xboxxberecomp.patch"
 DIST_DIR = REPO / ".local" / "dist"
-DEFAULT_SOURCE_ZIP = DIST_DIR / "TheSuffering-Recomp-v1.6.0-source.zip"
-DEFAULT_LAUNCHER_ZIP = DIST_DIR / "TheSuffering-Recomp-v1.6.0-win64-launcher.zip"
-DEFAULT_LINUX_TAR = DIST_DIR / "TheSuffering-Recomp-v1.6.0-linux-x86_64.tar.gz"
+DEFAULT_SOURCE_ZIP = DIST_DIR / "TheSuffering-Recomp-v1.6.1-source.zip"
+DEFAULT_LAUNCHER_ZIP = DIST_DIR / "TheSuffering-Recomp-v1.6.1-win64-launcher.zip"
+DEFAULT_LINUX_TAR = DIST_DIR / "TheSuffering-Recomp-v1.6.1-linux-x86_64.tar.gz"
 REPORT_PATH = REPO / ".local" / "m6_audit" / "audit_release_report.json"
 
 FORBIDDEN_EXTS = {
@@ -71,11 +71,70 @@ MAX_REPO_BLOB_BYTES = 512 * 1024
 MAX_PATCH_BLOB_BYTES = 1536 * 1024
 
 SANITIZE_REGEXES: list[tuple[str, re.Pattern[str]]] = [
-    ("windows_users_path", re.compile(r"[A-Za-z]:\\Users\\[A-Za-z0-9_.-]+", re.IGNORECASE)),
-    ("macos_users_path", re.compile(r"/Users/[A-Za-z0-9_.-]+/")),
+    ("windows_users_path", re.compile(r"[A-Za-z]:[/\\]Users[/\\][A-Za-z0-9_.-]+", re.IGNORECASE)),
+    ("macos_users_path", re.compile(r"(?<![A-Za-z0-9_.:/-])/Users/[A-Za-z0-9_.-]+/")),
+    ("posix_home_path", re.compile(r"(?<![A-Za-z0-9_.:/-])/home/[A-Za-z0-9_.-]+/")),
+    ("abs_win_underscore_root", re.compile(r"[A-Za-z]:[/\\]_[A-Za-z0-9_.-]{2,}")),
     ("private_key_block", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
     ("github_token", re.compile(r"(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
 ]
+
+BINARY_PRINTABLE_ASCII_RE = re.compile(rb"[\x20-\x7e]{5,}")
+BINARY_PRINTABLE_UTF16LE_RE = re.compile(rb"(?:[\x20-\x7e]\x00){5,}")
+URL_STRIP_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+# Prebuilt Microsoft MSVC CRT static startup/debug libraries embed internal vctools\crt paths (D:\a\_work\1\s\src\vctools\crt\...).
+MSVC_CRT_INTERNAL_RE = re.compile(
+    r"[A-Za-z]:[/\\]a[/\\]_work[/\\]\d+[/\\]s[/\\](?:src[/\\]vctools[/\\]crt|binaries[/\\])[/\\][^\s\"'<>]+",
+    re.IGNORECASE,
+)
+
+# Patterns forbidden inside project-built PE/ELF/COFF-archive binaries (both ASCII/UTF-8 and UTF-16LE).
+# Carefully anchored so legitimate strings (https://..., C:/Windows/USB_Vibration, C:\Windows\Fonts,
+# C:\ProgramData, /.local/share, /usr/include/..., SDL_OpenUserStorage) produce zero false positives.
+BINARY_PATH_LEAK_REGEXES: list[tuple[str, re.Pattern[str]]] = [
+    ("windows_users_path", re.compile(r"[A-Za-z]:[/\\]Users[/\\][A-Za-z0-9_.-]+", re.IGNORECASE)),
+    ("posix_home_or_users_path", re.compile(r"(?<![A-Za-z0-9_.:/-])/(?:home|Users)/[A-Za-z0-9_.-]+[/\\]")),
+    ("wsl_mnt_path", re.compile(r"(?<![A-Za-z0-9_.:/-])/mnt/[A-Za-z]/[A-Za-z0-9_.-]+")),
+    ("worktree_or_agent_dir", re.compile(r"(?:[/\\]\.gemini[/\\]|[/\\]worktrees[/\\][0-9a-f-]{8,})", re.IGNORECASE)),
+    ("cmake_build_dir", re.compile(r"(?:^|[/\\])out[/\\]build(?:[/\\]|$)", re.IGNORECASE)),
+    ("fetchcontent_deps_dir", re.compile(r"(?:^|[/\\])_deps[/\\][A-Za-z0-9_.-]+-(?:src|build)(?:[/\\]|$)", re.IGNORECASE)),
+    ("abs_pdb_path", re.compile(r"(?:[A-Za-z]:[/\\]|(?<![A-Za-z0-9_.:/-])/)[A-Za-z0-9_./\\: -]{1,240}\.pdb\b", re.IGNORECASE)),
+    ("abs_win_underscore_root", re.compile(r"[A-Za-z]:[/\\]_[A-Za-z0-9_.-]{2,}")),
+    (
+        "abs_win_source_path",
+        re.compile(
+            r"[A-Za-z]:[/\\][A-Za-z0-9_./\\+ -]{1,240}\.(?:c|cc|cpp|cxx|h|hpp|inl|obj|o)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "abs_posix_build_source_path",
+        re.compile(
+            r"(?<![A-Za-z0-9_.:/-])/(?!usr/(?:include|lib|local/include)/)(?:root|tmp|var/folders|private/var|opt|work|workspace|runner|build)/[A-Za-z0-9_./+-]{1,240}\.(?:c|cc|cpp|cxx|h|hpp|inl|o)\b"
+        ),
+    ),
+]
+
+PROJECT_LAUNCHER_BINARIES = {
+    "suffering.exe",
+    "compiler/xbe_recomp.exe",
+    "compiler/suffering.lib",
+}
+PROJECT_LINUX_BINARIES = {
+    "suffering",
+    "compiler/xbe_recomp",
+}
+PROJECT_BUILD_DIR_BINARIES = (
+    "suffering.exe",
+    "compiler/xbe_recomp.exe",
+    "compiler/suffering.lib",
+    "xbe_symbols.exe",
+    "suffering.dll",
+    "suffering",
+    "compiler/xbe_recomp",
+    "xbe_symbols",
+    "libsuffering.so",
+)
 
 SPDX_EXTS = {".h", ".hpp", ".c", ".cpp", ".py", ".rc", ".bat", ".sh", ".yml", ".yaml", ".desktop"}
 SPDX_EXACT = {"CMakeLists.txt"}
@@ -231,12 +290,179 @@ def detect_magic(data: bytes) -> str | None:
     return None
 
 
-def scan_sanitize(text: str) -> list[str]:
+def scan_sanitize(text: str, repo_root: Path = REPO) -> list[str]:
     hits = []
     for label, rx in SANITIZE_REGEXES:
         if rx.search(text):
             hits.append(label)
+    repo_name = repo_root.name
+    if len(repo_name) >= 5 and repo_name.lower() not in {
+        "thesuffering-recomp",
+        "thesufferingrecomp",
+        "thesuffering",
+        "suffering",
+        "source",
+        "recomp",
+    }:
+        if re.search(re.escape(repo_name), text, re.IGNORECASE):
+            hits.append("repo_dir_name")
     return hits
+
+
+def inspect_pe_codeview(data: bytes) -> list[str]:
+    """Pure-Python PE/COFF CodeView (RSDS/NB10) debug directory PDB path extractor."""
+    pdb_paths: list[str] = []
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return pdb_paths
+    e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    if e_lfanew + 24 > len(data) or data[e_lfanew : e_lfanew + 4] != b"PE\x00\x00":
+        return pdb_paths
+    coff = e_lfanew + 4
+    num_sections = struct.unpack_from("<H", data, coff + 2)[0]
+    size_opt_hdr = struct.unpack_from("<H", data, coff + 16)[0]
+    opt = coff + 20
+    if opt + size_opt_hdr > len(data) or size_opt_hdr < 96:
+        return pdb_paths
+    magic = struct.unpack_from("<H", data, opt)[0]
+    if magic == 0x20B and size_opt_hdr >= 112 + 7 * 8:  # PE32+ (x64)
+        num_dd = struct.unpack_from("<I", data, opt + 108)[0]
+        dd_base = opt + 112
+    elif magic == 0x10B and size_opt_hdr >= 96 + 7 * 8:  # PE32 (x86)
+        num_dd = struct.unpack_from("<I", data, opt + 92)[0]
+        dd_base = opt + 96
+    else:
+        return pdb_paths
+    if num_dd <= 6:
+        return pdb_paths
+    debug_rva, debug_size = struct.unpack_from("<II", data, dd_base + 6 * 8)
+    if debug_rva == 0 or debug_size < 28:
+        return pdb_paths
+
+    sec_base = opt + size_opt_hdr
+    sections: list[tuple[int, int, int, int]] = []
+    for i in range(num_sections):
+        so = sec_base + i * 40
+        if so + 40 > len(data):
+            break
+        vsize, va, raw_size, raw_ptr = struct.unpack_from("<IIII", data, so + 8)
+        sections.append((va, max(vsize, raw_size), raw_ptr, raw_size))
+
+    def rva_to_off(rva: int) -> int | None:
+        for va, span, raw_ptr, raw_size in sections:
+            if va <= rva < va + span:
+                delta = rva - va
+                if delta < raw_size and raw_ptr + delta < len(data):
+                    return raw_ptr + delta
+                return None
+        return None
+
+    dir_off = rva_to_off(debug_rva)
+    if dir_off is None:
+        return pdb_paths
+    count = debug_size // 28
+    for i in range(count):
+        eo = dir_off + i * 28
+        if eo + 28 > len(data):
+            break
+        dbg_type, size_of_data, _addr_raw, ptr_raw = struct.unpack_from("<IIII", data, eo + 12)
+        if dbg_type != 2 or ptr_raw == 0 or size_of_data < 16 or ptr_raw + size_of_data > len(data):
+            continue
+        cv = data[ptr_raw : ptr_raw + size_of_data]
+        raw_pdb: bytes | None = None
+        if cv[:4] == b"RSDS" and len(cv) >= 24:
+            raw_pdb = cv[24:]
+        elif cv[:4] == b"NB10" and len(cv) >= 16:
+            raw_pdb = cv[16:]
+        if raw_pdb is not None:
+            nul = raw_pdb.find(b"\x00")
+            if nul >= 0:
+                raw_pdb = raw_pdb[:nul]
+            pdb_paths.append(raw_pdb.decode("utf-8", errors="replace"))
+    return pdb_paths
+
+
+def scan_binary_paths(data: bytes, repo_root: Path = REPO) -> list[str]:
+    """Scan compiled PE/ELF/archive binary bytes (ASCII/UTF-8, UTF-16LE, and PE CodeView RSDS) for host path leaks."""
+    findings: list[str] = []
+    seen: set[str] = set()
+
+    def record(tag: str, sample: str) -> None:
+        clipped = sample.strip()[:160]
+        key = f"{tag}:{clipped}"
+        if key not in seen:
+            seen.add(key)
+            findings.append(key)
+
+    for pdb_path in inspect_pe_codeview(data):
+        if "/" in pdb_path or "\\" in pdb_path or ":" in pdb_path:
+            record("pe_codeview_abs_pdb", pdb_path)
+
+    extra_regexes: list[tuple[str, re.Pattern[str]]] = []
+    repo_name = repo_root.name
+    if len(repo_name) >= 5 and repo_name.lower() not in {
+        "thesuffering-recomp",
+        "thesufferingrecomp",
+        "thesuffering",
+        "suffering",
+        "source",
+        "recomp",
+    }:
+        extra_regexes.append(("repo_dir_name", re.compile(re.escape(repo_name), re.IGNORECASE)))
+    else:
+        extra_regexes.append(
+            (
+                "repo_checkout_path",
+                re.compile(r"(?<!Anthonyp85)(?<!anthonyp85)[/\\]TheSuffering-Recomp[/\\]", re.IGNORECASE),
+            )
+        )
+
+    for env_key in ("USERNAME", "USER"):
+        uname = os.environ.get(env_key, "").strip()
+        if len(uname) >= 3 and uname.lower() not in {
+            "user",
+            "users",
+            "public",
+            "default",
+            "root",
+            "admin",
+            "administrator",
+            "runner",
+            "ubuntu",
+            "app",
+            "src",
+            "bin",
+            "lib",
+            "opt",
+            "cpu",
+            "gpu",
+            "xdk",
+        }:
+            extra_regexes.append(
+                ("host_username_path", re.compile(rf"[/\\]{re.escape(uname)}(?:[/\\]|$)", re.IGNORECASE))
+            )
+            break
+
+    all_checks = BINARY_PATH_LEAK_REGEXES + extra_regexes
+
+    def check_strings(strings_iter: Any, enc_label: str) -> None:
+        for s in strings_iter:
+            cleaned = MSVC_CRT_INTERNAL_RE.sub("", URL_STRIP_RE.sub("", s))
+            if not cleaned:
+                continue
+            for label, rx in all_checks:
+                m = rx.search(cleaned)
+                if m:
+                    record(f"{enc_label}:{label}", m.group(0))
+
+    check_strings(
+        (m.group(0).decode("ascii", errors="ignore") for m in BINARY_PRINTABLE_ASCII_RE.finditer(data)),
+        "ascii",
+    )
+    check_strings(
+        (m.group(0).decode("utf-16le", errors="ignore") for m in BINARY_PRINTABLE_UTF16LE_RE.finditer(data)),
+        "utf16le",
+    )
+    return findings
 
 
 def inspect_elf64(data: bytes) -> dict[str, Any]:
@@ -553,6 +779,12 @@ def gate4_launcher_zip(zip_path: Path) -> dict[str, Any]:
             if ext in {".exe", ".dll", ".lib"} and low not in ALLOWED_LAUNCHER_BINARIES:
                 errors.append(f"launcher.zip non-allowlisted binary: {name}")
 
+            if low in PROJECT_LAUNCHER_BINARIES:
+                bdata = zf.read(info)
+                path_leaks = scan_binary_paths(bdata)
+                if path_leaks:
+                    errors.append(f"launcher.zip binary path leak in {name}: {path_leaks[:10]}")
+
             if low == "compiler/suffering.lib":
                 data = zf.read(info)
                 if not data.startswith(b"!<arch>\n"):
@@ -648,6 +880,11 @@ def gate4b_linux_tar_gz(tar_path: Path) -> dict[str, Any]:
             if low in {"install-steamdeck.sh", "the-suffering-recomp.desktop"} and b"\r\n" in data:
                 errors.append(f"linux tar script/desktop file has CRLF line endings: {name}")
 
+            if low in PROJECT_LINUX_BINARIES:
+                path_leaks = scan_binary_paths(data)
+                if path_leaks:
+                    errors.append(f"linux tar binary path leak in {name}: {path_leaks[:10]}")
+
             is_target_elf = low in {"suffering", "compiler/xbe_recomp", "compiler/clang", "compiler/ld.lld"} or (
                 low.startswith("compiler/lib/") and ".so" in Path(low).name
             )
@@ -706,6 +943,63 @@ def gate4b_linux_tar_gz(tar_path: Path) -> dict[str, Any]:
     }
 
 
+def gate2b_binary_hygiene(build_dirs: list[Path], explicit_binaries: list[Path]) -> dict[str, Any]:
+    """Scan built PE/ELF/archive project binaries for leaked personal, workspace, build, or PDB paths."""
+    errors: list[str] = []
+    scanned: list[dict[str, Any]] = []
+
+    targets: list[Path] = []
+    seen_paths: set[Path] = set()
+
+    for bpath in explicit_binaries:
+        rp = bpath.resolve()
+        if not bpath.is_file():
+            errors.append(f"Requested --scan-binary file does not exist: {bpath}")
+            continue
+        if rp not in seen_paths:
+            seen_paths.add(rp)
+            targets.append(bpath)
+
+    candidate_dirs = build_dirs if build_dirs else [
+        REPO / "out" / "build" / "release",
+        REPO / "out" / "build" / "linux-release",
+        REPO / "out" / "build" / "linux-cross-release",
+    ]
+    for bdir in candidate_dirs:
+        if build_dirs and not bdir.is_dir():
+            errors.append(f"Requested --build-dir directory does not exist: {bdir}")
+            continue
+        if not bdir.is_dir():
+            continue
+        for rel in PROJECT_BUILD_DIR_BINARIES:
+            cand = bdir / rel
+            if cand.is_file():
+                rp = cand.resolve()
+                if rp not in seen_paths:
+                    seen_paths.add(rp)
+                    targets.append(cand)
+
+    for target in targets:
+        data = target.read_bytes()
+        leaks = scan_binary_paths(data)
+        rel_label = str(target.relative_to(REPO)) if target.is_relative_to(REPO) else str(target)
+        scanned.append({
+            "path": rel_label.replace("\\", "/"),
+            "bytes": len(data),
+            "clean": len(leaks) == 0,
+            "leaks": leaks[:20],
+        })
+        if leaks:
+            errors.append(f"Built binary path leak in {rel_label}: {leaks[:10]}")
+
+    return {
+        "passed": len(errors) == 0,
+        "binaries_scanned": len(scanned),
+        "details": scanned,
+        "errors": errors,
+    }
+
+
 def gate5_protected_media() -> dict[str, Any]:
     """Verify optional local disc image (if present) remains readable and unmodified during builds."""
     errors: list[str] = []
@@ -723,11 +1017,14 @@ def gate5_protected_media() -> dict[str, Any]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Audit repository, Win64 release zips, and Linux x86_64 release tarball for copyright, sanitization, ELF64/GLIBC parity, and completeness."
+        description="Audit repository, built binaries, Win64 release zips, and Linux x86_64 release tarball for copyright, path privacy, ELF64/GLIBC parity, and completeness."
     )
     ap.add_argument("--source-zip", type=Path, default=DEFAULT_SOURCE_ZIP)
     ap.add_argument("--launcher-zip", type=Path, default=DEFAULT_LAUNCHER_ZIP)
     ap.add_argument("--linux-tar", type=Path, default=None, help=f"Path to Linux .tar.gz (default: {DEFAULT_LINUX_TAR})")
+    ap.add_argument("--build-dir", type=Path, action="append", default=[], help="Build output directory to scan for binary path leaks (repeatable)")
+    ap.add_argument("--scan-binary", type=Path, action="append", default=[], help="Explicit PE/ELF/lib binary path to scan for leaked host paths (repeatable)")
+    ap.add_argument("--skip-build-binaries", action="store_true", help="Skip scanning local out/build/* binaries")
     ap.add_argument("--allow-dirty", action="store_true")
     ap.add_argument("--allow-remote", action="store_true")
     ap.add_argument("--skip-zips", action="store_true")
@@ -747,6 +1044,8 @@ def main() -> int:
 
     report["gates"]["gate1_git_history"] = gate1_git_history(args.allow_remote)
     report["gates"]["gate2_head_hygiene"] = gate2_head_hygiene(args.allow_dirty)
+    if not args.skip_build_binaries or args.build_dir or args.scan_binary:
+        report["gates"]["gate2b_binary_hygiene"] = gate2b_binary_hygiene(args.build_dir, args.scan_binary)
     if not args.skip_zips:
         if not args.skip_source_zip:
             report["gates"]["gate3_source_zip"] = gate3_source_zip(args.source_zip)

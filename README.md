@@ -13,8 +13,20 @@
 
 ---
 
-## What's New in `v1.6.0`
+## What's New in `v1.6.1`
 
+- **Cheat Menu `PopStyleColor()` Crash Fix & Full ImGui Stack / Gamepad / Modal Hardening:**
+  - Fixed a Dear ImGui `g.ColorStack.Size` underflow crash when clicking **Disable All Cheats** inside the **`F2` / `F1 -> Cheats`** overlay (where `PopStyleColor(3)` ran unconditionally after `DisableAllCheatToggles()` mutated `any_toggle` mid-scope), and deployed RAII `ScopedStyleColors` / `ScopedStyleVars` / `ScopedDisabled` guards across `ui_common.cpp`, `settings_ui.cpp`, `launcher_ui.cpp`, and `file_browser_ui.cpp` so early returns and state transitions can never leak or underflow ImGui stacks.
+  - Hardened gamepad `LB`/`RB` tab switching while modals or key-rebind capture are active, preserved file-list focus when navigating up directories in the in-app XISO file browser, and sanitized popup/modal dismissal paths across both the Pre-Game Launcher and in-game overlay.
+- **`10 Docks` Wooden / Railed / Long-Flight Staircase Fix (`sub_00179D60` & `sub_001709C0`):**
+  - Fixed Torque clipping through, wedging against side handrails on, or getting blocked on wooden, switchback, and multi-flight staircases in **`10 Docks`** (as well as **`4a/4b Quarry`**): corrected the inverted `400.0f` slope-length FPU check in `IsWalkableOrStepTriangle` (`sub_00179D60 @ 0x00179E00`, which previously rejected `40°–57°` staircase ramps with `slope_len <= 400.0f` from `step_candidate_tris`), fixed `ShouldSkipStepTriangle` (`sub_001709C0`) rejecting the lower half of long `400..1301`-unit Docks staircase flights (`tri_centroid_y >= foot_center_y` with uninitialized `STriEntry.normal`) as solid walls, preserved `CGroundSupport` step transitions off flat landings, expanded `CTriPool` snapshot handling on dense Docks meshes, and widened multi-offset top-edge clearance probing on narrow railed stairs.
+- **`OneHitKills` `8b Bluff` Hermes Boss Softlock Guard & `hooks.cpp` FPU / Memory Bounds Hardening:**
+  - Hardened **One-Hit Kills (Hostiles Only)** (`CNPC::ApplyHealthLoss`, `sub_000F1E80`) to explicitly exclude environmental-puzzle apparition bosses (`CHermes` in `8b Bluff` — whose `999,999 HP` burner encounter has `m_bInvulnerable == 0` and softlocks burner relay `#7949` if killed directly — plus `CHorace` and `CKilljoy`) and sentinel-HP setpiece actors (`>= 5,000 HP`), alongside Dallas (`#2152`) and plot-protected allies.
+  - Added full `SavedX87State` FPU register/control-word preservation around nested `CallGuest` / `CallThiscall` invocations and strict overflow-safe `ValidGuest(va, size)` committed-memory bounds checks across `hooks.cpp` and `cheats.cpp`.
+- **Windows Release `-O3 -DNDEBUG` Optimization, Zero-Path-Leak Deterministic Builds & Binary Hygiene Gate:**
+  - Enforced explicit `-O3 -DNDEBUG` Release flags across Windows & Linux Clang presets (fixing unoptimized Windows Clang Release builds and stripping debug assertions from Release binaries while keeping them in Debug), deterministic `/Brepro` + `/PDBALTPATH:%_PDB%` PE linking and `--build-id=sha1 --strip-debug` ELF linking, comprehensive `-ffile-prefix-map` / `-fdebug-compilation-dir=.` host/workspace/FetchContent path remapping before `FetchContent_MakeAvailable()`, and automated PE/ELF/COFF binary path-leak scanning (`gate2b_binary_hygiene` in `tools/audit_release.py`).
+
+### Previous Highlights (`v1.6.0`)
 - **In-Game Cheat Menu (`F2` Quick-Toggle or `F1` / `BACK + L3` -> `Cheats`) & Native Main Menu `"Quit Game"`:**
   - Added a native **"Quit Game"** button directly below **"Bonus Material"** on the in-game Main Menu (matching Original Xbox typography, horror `CGUIEffects` ghosting, and UI audio) with full Controller (`D-Pad`/Stick + `A`), Keyboard (`Up`/`Down`/`W`/`S` + `Enter`), and PC Mouse hover/click support for clean host shutdown without `Alt+F4` (automatically bypassed during deterministic `--replay-input`).
   - Added a thread-safe **In-Game Cheat Menu** (`F2` quick-open/close, or `F1` / `BACK + L3` -> **Cheats** tab with `LB`/`RB` controller tab switching) featuring a live Torque status header (`HP`, `Xombium`, `Insanity`, `Morality` gauge, and 1-click **Disable All Cheats**), 9 persistent combat & XBE post-FX toggles (with friendly-NPC/Dallas `#2152` protection on **One-Hit Kills**), 13 queued guest-main-thread loadout, morality, and appearance actions (including the secret **Gonzo Gun**), and an optional **`CHEATS ACTIVE (N)`** HUD badge.
@@ -27,28 +39,16 @@
 - **Staircase Top-Edge Step-Up & Quarry Staircase Clipping / Anti-Wedge Fix:**
   - Fixed Torque getting snagged horizontally at the top lip/crest of staircases until jumping, clipping his legs through `40.5°–45°` Quarry industrial staircases (`4a/4b Quarry`), and getting locked in State `9` (`Fall`, `Jump` disabled) across unwelded `.mdu` staircase seams and V-creases — enabling `CCollider` step-up slope support (`0x8008`), fixing high-FPS (`60+ Hz`) `SweepStep` post-collision micro-slide penetration and spatial substep scaling, adding framerate-independent 3D-clearance-verified top-edge step-up assist and unwelded seam ground-bridging, and adding automatic V-crease anti-wedge recovery (bypassed during deterministic `--replay-input`).
 
-### Previous Highlights (`v1.5.0`)
-- **Launcher & In-Game Update Checker, Startup Alerts & One-Click Self-Updater:**
-  - Added a **Check for Updates** button and automatic background startup check (configurable via **Automatically check for updates on startup** in `settings.toml`, using native `WinHTTP` on Windows and zero-library `curl`/`wget`/`python3` subprocess fetches on Linux so `ELF64` `DT_NEEDED` / `glibc 2.35` portability remains untouched) to both the **Pre-Game Graphical Launcher** and the **In-Game `F1` -> Launcher & Diagnostics** tab (plus a non-intrusive corner toast when `"Skip launcher on future starts"` is active).
-  - When a newer GitHub release is detected, a high-visibility **Update Alert** banner offers one-click **Update Now** (`SHA-256` & size-verified download, archive staging, atomic binary/plugin/compiler swap preserving `settings.toml`, `hdd/` Xbox saves, `assets/`, `cache/`, and `.iso` paths, automatic recompile-stamp refresh if `compiler/` changed, and clean relaunch), **Open Release Page**, and per-version **Dismiss**.
-- **Recreation Yard Searchlight Rendering Fix (D3D12 & Vulkan):**
-  - Fixed the bright concentric-ring bullseye and grey rectangular quad artifact on guard-tower pedestal searchlights in `3a YardCellBlock`: `BindTexture` / `CanSampleAsTarget` now reject paletted `D3DFMT_P8` (`0x0B`), YUV, compressed, cube/3D, and dimension-mismatched textures that reuse freed contiguous render-target addresses so they always decode with their bound stage palette (`ReadStagePalette`) rather than unpaletted `(idx, idx, idx, 255)` greyscale.
-  - Matched XDK 5788 / NV2A fixed-function fog hardware behavior (`SPECULAR.A` passthrough when `FOGTABLEMODE == D3DFOG_NONE`, and `1 / rhw.w` eye-distance fog on pre-transformed `XYZRHW` sprites when table fog is active) and bumped shader/PSO metadata cache versions (`v2`).
-- **`2 Cellblocks` ("Byron" / Dallas) Progression, `CClock` & Single-Core `SRSC` Streaming Fixes:**
-  - Restored strict Original Xbox relative thread priority ordering (`SRSC` streaming worker `+1 -> HIGHEST` above boosted `Main` `0 -> ABOVE_NORMAL`) and fixed bootstrap-thread (`0x10 -> 0x14`) re-latching on Windows & Linux `single_core_guest`, eliminating 60+ FPS streaming starvation alongside cooperative yields across all synchronous `SRSC` spin-waiters and main-thread completion gating on `CSTOMPInstance::Start` (`sub_001BAB90`).
-  - Fixed `CClock` (`0x002DC724`) hooks so checkpoint/room partial resets (`sub_001A31A0(0)`) preserve `g_ElapsedGameTime` (`0x002E0290`) instead of freezing NPC pathfinding and animation blends mid-level, kept all `CClock` fields synchronized across `SaveState`/`LoadState`/`GetTimeScale`, paused elapsed game time cleanly during UI & streaming pauses (`0x002E0274 & 1`), and matched `TimeMgr`'s `0.10s` `max_dt` clamp.
-  - Added surgical `2 Cellblocks` script guards (`MessageRelay #4051 -> #11966` and `Timer #12614`, gated on `IsDallasAlive` to preserve Evil-morality runs and heal pre-existing `v1.4.0` checkpoints) so sprinting ahead before the mounted machine-gun encounter can no longer stall Dallas or permanently lock the Control Room exit gates (`#7001` / `#7002`).
-
 ---
 
 ## System Requirements (End Users)
 
-### Windows (`v1.6.0` — Native Win64 D3D12)
+### Windows (`v1.6.1` — Native Win64 D3D12)
 - **OS:** Windows 11 x64 or Windows 10 1809+ x64
 - **GPU:** Direct3D 12-capable GPU (Feature Level `11_0` or newer — supports NVIDIA, AMD, Intel Arc/Iris, and Handheld/iGPU UMA systems)
 - **Storage:** ~400 MB free writable disk space beside `suffering.exe` (for locally compiled `suffering.dll`, per-adapter shader/PSO cache `cache\`, virtual Xbox HDD `hdd\`, and logs)
 
-### Native Linux `x86_64` & Steam Deck (`v1.6.0` — Native Vulkan 1.2 + SDL3 + ELF64)
+### Native Linux `x86_64` & Steam Deck (`v1.6.1` — Native Vulkan 1.2 + SDL3 + ELF64)
 - **OS:** Any `x86_64` Linux distribution with **`glibc 2.35+`** and `libstdc++.so.6` (`GLIBCXX_3.4.30+`): **SteamOS 3.x (Steam Deck LCD & OLED)**, Ubuntu 22.04+, Debian 12+, Fedora 36+, Arch Linux, Bazzite, CachyOS — **zero Proton or Wine required**, and **zero system LLVM/Clang dev packages required** on stock read-only SteamOS!
 - **GPU:** Vulkan 1.2-capable GPU (AMD RADV on Steam Deck / Radeon, NVIDIA proprietary Vulkan, Intel ANV, or Mesa `lavapipe` software fallback)
 - **Audio / Display / Input:** PipeWire, PulseAudio, or ALSA; Wayland, Gamescope (Steam Deck Gaming Mode), or X11; SDL3 `evdev` + `HIDAPI` (Steam Deck integrated controls, DualSense 5, Xbox, Switch) + SDL3 Relative Mouse
@@ -74,7 +74,7 @@
 
 ## Quick Start (End-User Release Packages)
 
-### Windows (`TheSuffering-Recomp-v1.6.0-win64-launcher.zip`)
+### Windows (`TheSuffering-Recomp-v1.6.1-win64-launcher.zip`)
 You do **not** need Visual Studio, CMake, Python, or manual file extraction to play from a packaged Win64 launcher release:
 
 1. **Unpack** the archive into any writable folder (for example, `C:\Games\TheSuffering\`).
@@ -88,14 +88,14 @@ You do **not** need Visual Studio, CMake, Python, or manual file extraction to p
    - Enable **"Skip launcher on future starts"** inside the launcher to boot straight into gameplay on future runs.
    - To reopen the Pre-Game Launcher anytime while skipping is enabled, **hold `Shift`** while starting `suffering.exe`, pass `--launcher`, or re-enable **"Show Pre-Game Launcher on Startup"** inside the in-game **`F1`** overlay (**Launcher & Diagnostics**).
 
-### Native Linux `x86_64` & Steam Deck (`TheSuffering-Recomp-v1.6.0-linux-x86_64.tar.gz`)
+### Native Linux `x86_64` & Steam Deck (`TheSuffering-Recomp-v1.6.1-linux-x86_64.tar.gz`)
 
 Runs **100% natively on Linux Vulkan 1.2 + SDL3** with zero Proton overhead and zero system LLVM dependencies on stock read-only SteamOS:
 
 1. **Extract** the tarball into a writable directory (for example, `~/Games/TheSuffering/`):
    ```bash
    mkdir -p ~/Games/TheSuffering
-   tar -xzf TheSuffering-Recomp-v1.6.0-linux-x86_64.tar.gz -C ~/Games/TheSuffering
+   tar -xzf TheSuffering-Recomp-v1.6.1-linux-x86_64.tar.gz -C ~/Games/TheSuffering
    cd ~/Games/TheSuffering
    ```
 2. **Optional — Register in Steam Deck Gaming Mode & Desktop Menu:**
@@ -124,7 +124,7 @@ Runs **100% natively on Linux Vulkan 1.2 + SDL3** with zero Proton overhead and 
 
 ---
 
-## Modern Upscaling Suite (`v1.6.0`)
+## Modern Upscaling Suite (`v1.6.1`)
 
 Both Windows (Direct3D 12) and Native Linux / Steam Deck (Vulkan 1.2) decouple the internal 3D rendering resolution (`render_w x render_h`) from the native display resolution (`bb_w x bb_h`), apply square-pixel aspect-locked upscaling before compositing crisp native-resolution Dear ImGui overlays, and bypass temporal upscaling cleanly on 2D menus, loading screens, and FMVs.
 
@@ -232,7 +232,7 @@ Additional runtime flags (non-persistent session overrides unless saved via UI):
 *The Suffering* supports full **zero-controller, native-PC Mouse & Keyboard play** from launch to end-credits alongside instant **Auto hot-switching** with DualSense 5 / Xbox controllers:
 
 - **True 1:1 Raw Mouse Aim:** Uses Windows Raw Input (`WM_INPUT`) injected directly past the Original Xbox 30% stick deadzone, divided algebraically by frame `dt` and guest sensitivity for framerate-independent 1:1 horizontal & vertical camera control (`~0.09°/count` at `1.00x` across 3rd-Person, 1st-Person, Creature, and Mounted Turret/Searchlight modes), with yaw slew acceleration bypassed for **zero stop-coasting drift** and optional **Raw 1:1 Aim** bypassing controller sticky target slowdown.
-- **Full Point-and-Click Menu, Main Menu `"Quit Game"` & Interactive Map Mouse Support (`v1.4.0`–`v1.6.0`):** Hover to highlight items and Left-Click (`LMB`) to select across Title, Main Menu (including the native **Quit Game** option directly below **Bonus Material** for clean PC exit without `Alt+F4`), Pause, Options (including clicking/dragging sliders and toggles, automatically persisted to `settings.toml`), Save/Load lists, Clem's Journal/Archives, and Confirmation modals; Right-Click (`RMB`) to go Back/Unpause; scroll the **Mouse Wheel** through menus and journal pages; and **Left-Click Drag + Mouse Wheel Zoom** on the interactive Map (`Tab` / `M`) — with automatic click-release latching so clicking *Resume Game* never fires a stray shot.
+- **Full Point-and-Click Menu, Main Menu `"Quit Game"` & Interactive Map Mouse Support (`v1.4.0`–`v1.6.1`):** Hover to highlight items and Left-Click (`LMB`) to select across Title, Main Menu (including the native **Quit Game** option directly below **Bonus Material** for clean PC exit without `Alt+F4`), Pause, Options (including clicking/dragging sliders and toggles, automatically persisted to `settings.toml`), Save/Load lists, Clem's Journal/Archives, and Confirmation modals; Right-Click (`RMB`) to go Back/Unpause; scroll the **Mouse Wheel** through menus and journal pages; and **Left-Click Drag + Mouse Wheel Zoom** on the interactive Map (`Tab` / `M`) — with automatic click-release latching so clicking *Resume Game* never fires a stray shot.
 - **Smart Cursor Capture & Release:** Automatically clips and hides the cursor during active 3D gameplay, and releases it immediately on Pause, Archives/Map, FMVs/Cutscenes, Title/Main Menu, `F1` / `F2` Overlay, `Alt+Tab`/Focus Loss, or window resize/move.
 - **Scheme 1 Flashlight Upgrade:** Automatically upgrades the game's default Xbox control table (`Scheme 0`) to `Scheme 1` (`R3` -> Flashlight Toggle) so **`F`** toggles the flashlight natively on 1 keypress without disturbing controller layouts.
 - **All 18 Actions Rebindable (`Primary` + `Secondary`):** Stored under `[controls]` and `[controls.bindings]` in `settings.toml` and synced live between the Pre-Game Launcher (**Controls** tab) and the in-game **`F1` -> Controls** tab.
@@ -337,7 +337,7 @@ All runtime data is portable and stored beside `suffering.exe`:
   cmake --build out/build/linux-release --parallel
   # Package self-contained Linux & Steam Deck tarball:
   bash release_linux.sh --build-dir out/build/linux-release \
-    --out-tar .local/dist/TheSuffering-Recomp-v1.6.0-linux-x86_64.tar.gz
+    --out-tar .local/dist/TheSuffering-Recomp-v1.6.1-linux-x86_64.tar.gz
   ```
 - **Automated 6-Gate Release & Copyright Audit (Windows + Linux ELF64):**
   ```bash

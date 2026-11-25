@@ -864,10 +864,10 @@ bool RunLauncher(void* hinstance) {
         if (lctx.dpi_changed) {
             lctx.dpi_changed = false;
             lctx.WaitForGpu();
+            ImGui_ImplDX12_InvalidateDeviceObjects();
             lctx.ui_scale = ComputeWindowDpiScale(hwnd);
             LoadCrispUiFonts(io, lctx.ui_scale, lctx.fonts);
             ApplyDarkIndustrialStyle(lctx.ui_scale);
-            ImGui_ImplDX12_InvalidateDeviceObjects();
             ImGui_ImplDX12_CreateDeviceObjects();
         }
         lctx.ResizeSwapIfNeeded();
@@ -875,9 +875,10 @@ bool RunLauncher(void* hinstance) {
         // Poll SDL3 gamepad (kernel::Current() == nullptr here, so safe outside boot)
         input::Pad pad = input::Poll(0);
         FeedPadToImGui(pad, true, was_pad_active);
-        bool l1 = pad.connected && pad.analog[5] > 64;
-        bool r1 = pad.connected && pad.analog[4] > 64;
-        bool start = pad.connected && ((pad.buttons & (1u << 4)) != 0);
+        const bool modal_blocking = MkbIsRebinding();
+        bool l1 = pad.connected && !modal_blocking && pad.analog[5] > 64;
+        bool r1 = pad.connected && !modal_blocking && pad.analog[4] > 64;
+        bool start = pad.connected && !modal_blocking && ((pad.buttons & (1u << 4)) != 0);
         if (l1 && !prev_l1) requested_tab = (selected_tab + 5) % 6;
         if (r1 && !prev_r1) requested_tab = (selected_tab + 1) % 6;
         if (start && !prev_start && disc.valid) {
@@ -906,11 +907,12 @@ bool RunLauncher(void* hinstance) {
                                                 ImGuiWindowFlags_NoBringToFrontOnFocus;
         if (ImGui::Begin("##SufferingLauncherRoot", nullptr, kRootFlags)) {
             // --- Header ---
-            if (lctx.fonts.heading) ImGui::PushFont(lctx.fonts.heading);
+            ImFont* const heading_font = lctx.fonts.heading;
+            if (heading_font) ImGui::PushFont(heading_font);
             ImGui::TextColored(ImVec4(0.96f, 0.34f, 0.34f, 1.0f), "THE SUFFERING");
             ImGui::SameLine();
             ImGui::TextUnformatted("- PC Recompilation Launcher " SUFFERING_VERSION_TAG);
-            if (lctx.fonts.heading) ImGui::PopFont();
+            if (heading_font) ImGui::PopFont();
             DrawLauncherHeaderUpdateButton(upd_snap, lctx.ui_scale, [&] {
                 if (!GetSharedUiOptions().dismissed_update_tag.empty()) {
                     GetSharedUiOptions().dismissed_update_tag.clear();
@@ -945,7 +947,7 @@ bool RunLauncher(void* hinstance) {
                 app::HardwarePreset::High1440p, app::HardwarePreset::Ultra4k};
             for (app::HardwarePreset tier : kTiers) {
                 ImGui::SameLine();
-                bool active = (s.hardware_preset == tier);
+                const bool active = (s.hardware_preset == tier);
                 if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.56f, 0.16f, 0.18f, 1.0f));
                 if (ImGui::Button(HardwarePresetName(tier))) {
                     ApplyHardwarePreset(tier, active_gpu, plugins, desktop);
@@ -957,7 +959,7 @@ bool RunLauncher(void* hinstance) {
 
             // --- Tabbed Content Body (reserve space for sticky footer) ---
             float footer_h = (status_banner.empty() ? 52.0f : 78.0f) * lctx.ui_scale;
-            if (ImGui::BeginChild("##LauncherBody", ImVec2(0.0f, -footer_h), false)) {
+            if (ImGui::BeginChild("##LauncherBody", ImVec2(0.0f, -footer_h), ImGuiChildFlags_None)) {
                 bool show_upd_banner = DrawLauncherUpdateAlertIfNeeded(upd_snap, lctx.ui_scale, set_status,
                                                                        lctx.launch_game, lctx.quit);
 
@@ -992,10 +994,11 @@ bool RunLauncher(void* hinstance) {
                     // Tab 0: Play & Game Disc
                     if (ImGui::BeginTabItem("Play & Game Disc", nullptr, tab_flags(0))) {
                         selected_tab = 0;
+                        MkbCancelRebind();
                         ImGui::Spacing();
                         ImGui::TextUnformatted("Original Xbox Disc Image Status (Opened Strictly Read-Only):");
                         float disc_card_h = (show_upd_banner ? 94.0f : 114.0f) * lctx.ui_scale;
-                        if (ImGui::BeginChild("##DiscCard", ImVec2(0.0f, disc_card_h), true)) {
+                        if (ImGui::BeginChild("##DiscCard", ImVec2(0.0f, disc_card_h), ImGuiChildFlags_Border)) {
                             if (disc.valid) {
                                 ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.45f, 1.0f), "READY: %s",
                                                    disc.summary.c_str());
@@ -1069,6 +1072,7 @@ bool RunLauncher(void* hinstance) {
                     // Tab 1: Upscaling & Graphics
                     if (ImGui::BeginTabItem("Upscaling & Graphics", nullptr, tab_flags(1))) {
                         selected_tab = 1;
+                        MkbCancelRebind();
                         ImGui::Spacing();
                         DrawUpscalingGraphicsPanel(pctx);
                         ImGui::EndTabItem();
@@ -1077,6 +1081,7 @@ bool RunLauncher(void* hinstance) {
                     // Tab 2: Display & GPU
                     if (ImGui::BeginTabItem("Display & GPU", nullptr, tab_flags(2))) {
                         selected_tab = 2;
+                        MkbCancelRebind();
                         ImGui::Spacing();
                         DrawDisplayGpuPanel(pctx);
                         ImGui::EndTabItem();
@@ -1085,6 +1090,7 @@ bool RunLauncher(void* hinstance) {
                     // Tab 3: Audio
                     if (ImGui::BeginTabItem("Audio", nullptr, tab_flags(3))) {
                         selected_tab = 3;
+                        MkbCancelRebind();
                         ImGui::Spacing();
                         DrawAudioPanel(pctx);
                         ImGui::EndTabItem();
@@ -1101,6 +1107,7 @@ bool RunLauncher(void* hinstance) {
                     // Tab 5: Tools & Diagnostics
                     if (ImGui::BeginTabItem("Tools & Diagnostics", nullptr, tab_flags(5))) {
                         selected_tab = 5;
+                        MkbCancelRebind();
                         ImGui::Spacing();
                         SharedUiOptions& o = GetSharedUiOptions();
                         if (ImGui::Checkbox("Show Live FPS, Frame-Time & Upscaler HUD In-Game", &o.show_fps_hud)) {
@@ -1283,6 +1290,7 @@ bool RunLauncher(void* hinstance) {
         }
     }
 
+    MkbCancelRebind();
     if (rumble_active) input::Rumble(0, 0, 0);
     if (lctx.launch_game) {
         app::Save();
@@ -1439,9 +1447,9 @@ bool RunLauncher(void* /*hinstance*/) {
                 float new_scale = ComputeWindowDpiScale(win);
                 if (std::fabs(new_scale - ui_scale) > 0.05f) {
                     ui_scale = new_scale;
+                    ImGui_ImplSDLRenderer3_DestroyFontsTexture();
                     LoadCrispUiFonts(io, ui_scale, fonts);
                     ApplyDarkIndustrialStyle(ui_scale);
-                    ImGui_ImplSDLRenderer3_DestroyFontsTexture();
                     ImGui_ImplSDLRenderer3_CreateFontsTexture();
                 }
             }
@@ -1455,16 +1463,15 @@ bool RunLauncher(void* /*hinstance*/) {
 
         input::Pad pad = input::Poll(0);
         FeedPadToImGui(pad, true, was_pad_active);
-        bool l1 = pad.connected && pad.analog[5] > 64;
-        bool r1 = pad.connected && pad.analog[4] > 64;
-        bool start = pad.connected && ((pad.buttons & (1u << 4)) != 0);
-        if (!file_browser.IsOpen()) {
-            if (l1 && !prev_l1) requested_tab = (selected_tab + 5) % 6;
-            if (r1 && !prev_r1) requested_tab = (selected_tab + 1) % 6;
-            if (start && !prev_start && disc.valid) {
-                launch_game = true;
-                quit = true;
-            }
+        const bool modal_blocking = file_browser.IsOpen() || MkbIsRebinding();
+        bool l1 = pad.connected && !modal_blocking && pad.analog[5] > 64;
+        bool r1 = pad.connected && !modal_blocking && pad.analog[4] > 64;
+        bool start = pad.connected && !modal_blocking && ((pad.buttons & (1u << 4)) != 0);
+        if (l1 && !prev_l1) requested_tab = (selected_tab + 5) % 6;
+        if (r1 && !prev_r1) requested_tab = (selected_tab + 1) % 6;
+        if (start && !prev_start && disc.valid) {
+            launch_game = true;
+            quit = true;
         }
         prev_l1 = l1;
         prev_r1 = r1;
@@ -1488,11 +1495,12 @@ bool RunLauncher(void* /*hinstance*/) {
                                                 ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings |
                                                 ImGuiWindowFlags_NoBringToFrontOnFocus;
         if (ImGui::Begin("##SufferingLauncherRoot", nullptr, kRootFlags)) {
-            if (fonts.heading) ImGui::PushFont(fonts.heading);
+            ImFont* const heading_font = fonts.heading;
+            if (heading_font) ImGui::PushFont(heading_font);
             ImGui::TextColored(ImVec4(0.96f, 0.34f, 0.34f, 1.0f), "THE SUFFERING");
             ImGui::SameLine();
             ImGui::TextUnformatted("- PC Recompilation Launcher " SUFFERING_VERSION_TAG);
-            if (fonts.heading) ImGui::PopFont();
+            if (heading_font) ImGui::PopFont();
             DrawLauncherHeaderUpdateButton(upd_snap, ui_scale, [&] {
                 if (!GetSharedUiOptions().dismissed_update_tag.empty()) {
                     GetSharedUiOptions().dismissed_update_tag.clear();
@@ -1528,7 +1536,7 @@ bool RunLauncher(void* /*hinstance*/) {
                 app::HardwarePreset::High1440p, app::HardwarePreset::Ultra4k};
             for (app::HardwarePreset tier : kTiers) {
                 ImGui::SameLine();
-                bool active = (s.hardware_preset == tier);
+                const bool active = (s.hardware_preset == tier);
                 if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.56f, 0.16f, 0.18f, 1.0f));
                 if (ImGui::Button(HardwarePresetName(tier))) {
                     ApplyHardwarePreset(tier, active_gpu, plugins, desktop);
@@ -1539,7 +1547,7 @@ bool RunLauncher(void* /*hinstance*/) {
             ImGui::Separator();
 
             float footer_h = (status_banner.empty() ? 52.0f : 78.0f) * ui_scale;
-            if (ImGui::BeginChild("##LauncherBody", ImVec2(0.0f, -footer_h), false)) {
+            if (ImGui::BeginChild("##LauncherBody", ImVec2(0.0f, -footer_h), ImGuiChildFlags_None)) {
                 bool show_upd_banner = DrawLauncherUpdateAlertIfNeeded(upd_snap, ui_scale, set_status, launch_game,
                                                                        quit);
 
@@ -1569,10 +1577,11 @@ bool RunLauncher(void* /*hinstance*/) {
                     // Tab 0: Play & Game Disc
                     if (ImGui::BeginTabItem("Play & Game Disc", nullptr, tab_flags(0))) {
                         selected_tab = 0;
+                        MkbCancelRebind();
                         ImGui::Spacing();
                         ImGui::TextUnformatted("Original Xbox Disc Image Status (Opened Strictly Read-Only):");
                         float disc_card_h = (show_upd_banner ? 94.0f : 114.0f) * ui_scale;
-                        if (ImGui::BeginChild("##DiscCard", ImVec2(0.0f, disc_card_h), true)) {
+                        if (ImGui::BeginChild("##DiscCard", ImVec2(0.0f, disc_card_h), ImGuiChildFlags_Border)) {
                             if (disc.valid) {
                                 ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.45f, 1.0f), "READY: %s",
                                                    disc.summary.c_str());
@@ -1633,6 +1642,7 @@ bool RunLauncher(void* /*hinstance*/) {
                     // Tab 1: Upscaling & Graphics
                     if (ImGui::BeginTabItem("Upscaling & Graphics", nullptr, tab_flags(1))) {
                         selected_tab = 1;
+                        MkbCancelRebind();
                         ImGui::Spacing();
                         DrawUpscalingGraphicsPanel(pctx);
                         ImGui::EndTabItem();
@@ -1641,6 +1651,7 @@ bool RunLauncher(void* /*hinstance*/) {
                     // Tab 2: Display & GPU
                     if (ImGui::BeginTabItem("Display & GPU", nullptr, tab_flags(2))) {
                         selected_tab = 2;
+                        MkbCancelRebind();
                         ImGui::Spacing();
                         DrawDisplayGpuPanel(pctx);
                         ImGui::EndTabItem();
@@ -1649,6 +1660,7 @@ bool RunLauncher(void* /*hinstance*/) {
                     // Tab 3: Audio
                     if (ImGui::BeginTabItem("Audio", nullptr, tab_flags(3))) {
                         selected_tab = 3;
+                        MkbCancelRebind();
                         ImGui::Spacing();
                         DrawAudioPanel(pctx);
                         ImGui::EndTabItem();
@@ -1665,6 +1677,7 @@ bool RunLauncher(void* /*hinstance*/) {
                     // Tab 5: Tools & Diagnostics
                     if (ImGui::BeginTabItem("Tools & Diagnostics", nullptr, tab_flags(5))) {
                         selected_tab = 5;
+                        MkbCancelRebind();
                         ImGui::Spacing();
                         SharedUiOptions& o = GetSharedUiOptions();
                         if (ImGui::Checkbox("Show Live FPS, Frame-Time & Upscaler HUD In-Game", &o.show_fps_hud)) {
@@ -1836,6 +1849,7 @@ bool RunLauncher(void* /*hinstance*/) {
         }
     }
 
+    MkbCancelRebind();
     if (rumble_active) input::Rumble(0, 0, 0);
     if (launch_game) {
         app::Save();

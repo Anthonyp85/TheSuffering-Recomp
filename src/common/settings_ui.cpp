@@ -183,14 +183,21 @@ void SyncImGuiCursorFlag(bool overlay_open) {
     else io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
 }
 
+void ClearCachedUiPad() {
+    std::lock_guard<std::mutex> lock(g_pad_lock);
+    g_ui_pad = input::Pad{};
+}
+
 void UpdateMainThreadCursor(void* hwnd) {
     bool open = g_overlay_open.load(std::memory_order_acquire);
     SyncImGuiCursorFlag(open);
-    if (open) {
-        MkbForceReleaseCursor(hwnd);
-    } else {
-        MkbSyncCursorOnWindowThread(hwnd);
+    if (!open) {
+        ClearCachedUiPad();
+#ifndef _WIN32
+        g_file_browser.Close();
+#endif
     }
+    MkbOnOverlayToggled(open, hwnd);
 }
 
 void ApplyRadialDeadzone(int16_t& sx, int16_t& sy, uint32_t dz_pct) {
@@ -495,6 +502,7 @@ void DrawSettingsWindow(double fps, float ui_scale) {
             // 1. Upscaling & Graphics Tab
             if (ImGui::BeginTabItem("Upscaling & Graphics", nullptr, tab_flags(0))) {
                 g_selected_tab.store(0, std::memory_order_release);
+                MkbCancelRebind();
                 ImGui::Spacing();
                 DrawUpscalingGraphicsPanel(pctx);
                 gpu::UpscalerStatus us = gpu::GetUpscalerStatus();
@@ -509,12 +517,14 @@ void DrawSettingsWindow(double fps, float ui_scale) {
             // 2. Display & GPU Tab
             if (ImGui::BeginTabItem("Display & GPU", nullptr, tab_flags(1))) {
                 g_selected_tab.store(1, std::memory_order_release);
+                MkbCancelRebind();
                 ImGui::Spacing();
                 DrawDisplayGpuPanel(pctx);
                 ImGui::SameLine();
                 if (ImGui::Button("Apply & Save")) {
                     app::ApplyDisplay();
                     app::Save();
+                    PostAction(UiAction::RefreshCursor);
                     SetStatus("Display settings saved to settings.toml.");
                 }
                 ImGui::EndTabItem();
@@ -531,6 +541,7 @@ void DrawSettingsWindow(double fps, float ui_scale) {
             // 4. Audio Tab
             if (ImGui::BeginTabItem("Audio", nullptr, tab_flags(3))) {
                 g_selected_tab.store(3, std::memory_order_release);
+                MkbCancelRebind();
                 ImGui::Spacing();
                 DrawAudioPanel(pctx);
                 ImGui::EndTabItem();
@@ -539,6 +550,7 @@ void DrawSettingsWindow(double fps, float ui_scale) {
             // 5. Launcher & Diagnostics Tab
             if (ImGui::BeginTabItem("Launcher & Diagnostics", nullptr, tab_flags(4))) {
                 g_selected_tab.store(4, std::memory_order_release);
+                MkbCancelRebind();
                 ImGui::Spacing();
                 SharedUiOptions& o = GetSharedUiOptions();
 
@@ -589,7 +601,7 @@ void DrawSettingsWindow(double fps, float ui_scale) {
                     ImGui::Spacing();
                 }
 
-                bool upd_busy =
+                const bool upd_busy =
                     (upd_snap.state == UpdateState::Checking || upd_snap.state == UpdateState::Downloading);
                 if (upd_busy) ImGui::BeginDisabled(true);
                 if (ImGui::Button(upd_snap.state == UpdateState::Checking ? "Checking...##InGameUpdBtn"
@@ -742,6 +754,7 @@ void DrawSettingsWindow(double fps, float ui_scale) {
             // 6. Cheats Tab (Quick-Toggle via F2)
             if (ImGui::BeginTabItem("Cheats", nullptr, tab_flags(kTabCheats))) {
                 g_selected_tab.store(kTabCheats, std::memory_order_release);
+                MkbCancelRebind();
                 float body_h = has_banner_pre ? -std::round(28.0f * ui_scale) : 0.0f;
                 if (ImGui::BeginChild("##CheatsTabBody", ImVec2(0.0f, body_h), ImGuiChildFlags_NavFlattened)) {
                     DrawCheatsPanel(ui_scale, pctx.set_status);
@@ -823,6 +836,7 @@ void ToggleOrSwitchCheatsOverlay(void* hwnd_ptr) {
     int req_tab = g_requested_tab.load(std::memory_order_acquire);
     int effective_tab = (req_tab >= 0) ? req_tab : cur_tab;
     if (!was_open) {
+        ClearCachedUiPad();
         g_requested_tab.store(kTabCheats, std::memory_order_release);
         g_selected_tab.store(kTabCheats, std::memory_order_release);
         g_overlay_open.store(true, std::memory_order_release);
@@ -830,12 +844,14 @@ void ToggleOrSwitchCheatsOverlay(void* hwnd_ptr) {
         MkbOnOverlayToggled(true, hwnd_ptr);
     } else if (effective_tab == kTabCheats) {
         g_overlay_open.store(false, std::memory_order_release);
+        ClearCachedUiPad();
 #ifndef _WIN32
         g_file_browser.Close();
 #endif
         SyncImGuiCursorFlag(false);
         MkbOnOverlayToggled(false, hwnd_ptr);
     } else {
+        MkbCancelRebind();
 #ifndef _WIN32
         g_file_browser.Close();
 #endif
@@ -985,6 +1001,7 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
         case WM_KEYDOWN:
             if (wp == VK_F1) {
                 bool next = !g_overlay_open.load(std::memory_order_relaxed);
+                ClearCachedUiPad();
                 g_overlay_open.store(next, std::memory_order_release);
                 SyncImGuiCursorFlag(next);
                 MkbOnOverlayToggled(next, hwnd);
@@ -1000,6 +1017,7 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
             }
             if (wp == VK_ESCAPE && g_overlay_open.load(std::memory_order_relaxed)) {
                 g_overlay_open.store(false, std::memory_order_release);
+                ClearCachedUiPad();
                 SyncImGuiCursorFlag(false);
                 MkbOnOverlayToggled(false, hwnd);
                 if (result) *result = 0;
@@ -1104,6 +1122,7 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
             if (ev->key.repeat) return false;
             if (ev->key.key == SDLK_F1) {
                 bool next = !g_overlay_open.load(std::memory_order_relaxed);
+                ClearCachedUiPad();
                 g_overlay_open.store(next, std::memory_order_release);
                 if (!next) g_file_browser.Close();
                 SyncImGuiCursorFlag(next);
@@ -1119,6 +1138,7 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
             if (ev->key.key == SDLK_ESCAPE && g_overlay_open.load(std::memory_order_relaxed)) {
                 if (g_file_browser.IsOpen()) return false;  // Let the modal handle Esc first
                 g_overlay_open.store(false, std::memory_order_release);
+                ClearCachedUiPad();
                 SyncImGuiCursorFlag(false);
                 MkbOnOverlayToggled(false, hwnd_ptr);
                 if (result) *result = 0;
@@ -1211,6 +1231,8 @@ void OnUi(double fps) {
     if (open) {
         std::lock_guard<std::mutex> lock(g_pad_lock);
         p = g_ui_pad;
+    } else if (g_was_overlay_open_ui) {
+        ClearCachedUiPad();
     }
     FeedPadToImGui(p, open, g_was_pad_active);
 
@@ -1294,6 +1316,7 @@ void UiFilterPad(int port, input::Pad& pad, bool scripted) {
     bool chord = pad.connected && ((pad.buttons & 0x60u) == 0x60u);
     if (chord && !g_chord_held) {
         bool next = !g_overlay_open.load(std::memory_order_relaxed);
+        ClearCachedUiPad();
         g_overlay_open.store(next, std::memory_order_release);
         PostAction(UiAction::RefreshCursor);
     }
@@ -1333,6 +1356,7 @@ void UiFilterRumble(int /*port*/, uint16_t& left, uint16_t& right) {
 bool UiIsOverlayOpen() { return g_overlay_open.load(std::memory_order_acquire); }
 
 void UiSetOverlayOpen(bool open) {
+    ClearCachedUiPad();
     g_overlay_open.store(open, std::memory_order_release);
     PostAction(UiAction::RefreshCursor);
 }

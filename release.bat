@@ -1,6 +1,7 @@
 @echo off
 rem SPDX-License-Identifier: GPL-2.0-or-later
 setlocal
+set "_PDB="
 set "GAME_EXE=suffering"
 cd /d "%~dp0"
 set "OUT=out\build\release"
@@ -39,4 +40,4 @@ del /q "%OUT%\compiler\*.dll" 2>nul
 for %%f in (msvcp140 vcruntime140 vcruntime140_1) do if exist "%VCRUNTIME%\%%f.dll" copy /y "%VCRUNTIME%\%%f.dll" "%OUT%\compiler\" >nul
 
 rem Package ONLY clean redistributable binaries/docs (zero copyrighted assets, XBE, ISO, or game-derived code)
-"%SEVENZ%" a "%GAME_EXE%.zip" ".\%OUT%\%GAME_EXE%.exe" ".\%OUT%\release\assets" ".\%OUT%\release\plugins" ".\%OUT%\compiler" .\README.md .\LICENSE .\THIRD_PARTY_NOTICES.md ".\%OUT%\release\SDK-LICENSE.txt" "%SDK%\THIRD_PARTY.txt" "%VCRUNTIME%\msvcp140.dll" "%VCRUNTIME%\vcruntime140.dll" "%VCRUNTIME%\vcruntime140_1.dll" -xr!work
+"%SEVENZ%" a "%GAME_EXE%.zip" ".\%OUT%\%GAME_EXE%.exe" ".\%OUT%\release\assets" ".\%OUT%\release\plugins" ".\%OUT%\compiler" .\README.md .\LICENSE .\THIRD_PARTY_NOTICES.md ".\%OUT%\release\SDK-LICENSE.txt" "%SDK%\THIRD_PARTY.txt" "%VCRUNTIME%\msvcp140.dll" "%VCRUNTIME%\vcruntime140.dll" "%VCRUNTIME%\vcruntime140_1.dll" -xr!work -xr!*.pdb -xr!*.ilk -xr!*.exp

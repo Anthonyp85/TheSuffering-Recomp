@@ -71,7 +71,11 @@ constexpr uint32_t kVaLevelFlags = 0x002DEF14u;        // bit 1 (0x02) = level l
 constexpr uint32_t kHashPlayer = 0xC8BC44E1u;
 constexpr uint32_t kHashRangedWeapon = 0x9710D816u;
 constexpr uint32_t kVtTorquePrimary = 0x00299FC8u;
+constexpr uint32_t kVtHermes = 0x0029C460u;    // CHermes (0x04AD652D) — environmental burner boss / apparition
+constexpr uint32_t kVtHorace = 0x0029C5B0u;    // CHorace (0xE589963F) — environmental generator boss / apparition
+constexpr uint32_t kVtKilljoy = 0x0029C858u;   // CKilljoy (0x490379CD) — environmental projector boss / apparition
 constexpr uint32_t kIidDallas = 2152u;
+constexpr float kSentinelBossOrSetpieceHp = 5000.0f;  // Surreal sentinel HP (9999..999999) on puzzle bosses & cutscene NPCs
 
 // Verified guest helper functions (called exclusively on Guest Main Thread 0x14 via CallGuest)
 constexpr uint32_t kFnCastToFlashlight = 0x000173A0u;      // __cdecl(CGameObject*) -> CFlashlight*
@@ -184,8 +188,10 @@ void RecordFeedback(const std::string& msg, bool is_warning = false) {
 }
 
 bool ValidGuest(uint32_t va, uint32_t bytes = 4u) {
-    return kernel::g_base != nullptr && va >= 0x10000u && mem::IsCommitted(va) &&
-           (bytes <= 1u || mem::IsCommitted(va + bytes - 1u));
+    if (kernel::g_base == nullptr || bytes == 0u || va < 0x10000u) return false;
+    const uint32_t last = va + (bytes - 1u);
+    if (last < va) return false;
+    return mem::IsCommitted(va) && (bytes == 1u || mem::IsCommitted(last));
 }
 
 uint32_t FloatBits(float f) {
@@ -213,7 +219,7 @@ struct SavedX87State {
 
 uint32_t CallThiscall(X86Context& ctx, uint32_t fn_va, uint32_t this_ptr,
                       std::initializer_list<uint32_t> args = {}) {
-    if (fn_va < 0x10000u || this_ptr < 0x10000u) return 0u;
+    if (!ValidGuest(fn_va, 1u) || !ValidGuest(this_ptr, 4u)) return 0u;
     const uint32_t saved_ecx = ctx.ecx;
     const SavedX87State saved_fpu = SavedX87State::Capture(ctx);
     ctx.ecx = this_ptr;
@@ -225,7 +231,7 @@ uint32_t CallThiscall(X86Context& ctx, uint32_t fn_va, uint32_t this_ptr,
 
 float CallThiscallFloat(X86Context& ctx, uint32_t fn_va, uint32_t this_ptr,
                         std::initializer_list<uint32_t> args = {}) {
-    if (fn_va < 0x10000u || this_ptr < 0x10000u) return 0.0f;
+    if (!ValidGuest(fn_va, 1u) || !ValidGuest(this_ptr, 4u)) return 0.0f;
     const uint32_t saved_ecx = ctx.ecx;
     const SavedX87State saved_fpu = SavedX87State::Capture(ctx);
     ctx.ecx = this_ptr;
@@ -237,7 +243,7 @@ float CallThiscallFloat(X86Context& ctx, uint32_t fn_va, uint32_t this_ptr,
 }
 
 uint32_t CallGuestFreeFn(X86Context& ctx, uint32_t fn_va, std::initializer_list<uint32_t> args = {}) {
-    if (fn_va < 0x10000u) return 0u;
+    if (!ValidGuest(fn_va, 1u)) return 0u;
     const SavedX87State saved_fpu = SavedX87State::Capture(ctx);
     const uint32_t res = kernel::CallGuest(ctx, fn_va, args);
     saved_fpu.Restore(ctx);
@@ -945,8 +951,10 @@ X86_FUNC(sub_0005CE80) {
 
 // 6. CNPC::ApplyHealthLoss (__thiscall, ret 0x08: float dmg, CGameObject* attacker_obj -> ST(0) float)
 // One-Hit Kills strictly scoped to:
-//  - Live CNPC targets (entity_kind == 7; never CTorque, props, doors, switches, or breakables),
-//  - Explicitly excluding Dallas (#2152) and any plot-protected NPC (m_bCannotDie [+0x0E] or m_bInvulnerable [+0x1E]),
+//  - Live CNPC targets (entity_kind == 7; never CTorque, Black One, props, doors, switches, or breakables),
+//  - Explicitly excluding Dallas (#2152), environmental-puzzle bosses (Hermes/Horace/Killjoy — e.g. 8b Bluff
+//    Hermes #7667..#9515 has m_bInvulnerable == 0 & 999,999 HP and softlocks if killed outside burner relay #7949),
+//    plot-protected NPCs (m_bCannotDie [+0x0E] or m_bInvulnerable [+0x1E]), and sentinel-HP setpiece actors (>=5000 HP),
 //  - Verified player attacker (attacker_obj == live CTorque CGameObject*, class hash 0xC8BC44E1),
 //  - Verified active hostility toward Torque via Surreal's canonical AreHostile(player_obj, npc_obj, -1.0f) (sub_000F25E0).
 X86_FUNC(sub_000F1E80) {
@@ -957,8 +965,15 @@ X86_FUNC(sub_000F1E80) {
         const uint32_t attacker_obj = X86_MEM32(ctx.esp + 0x08u);
 
         if (std::isfinite(incoming_dmg) && incoming_dmg > 0.0f && ValidGuest(npc_va, 0x60u)) {
+            const uint32_t npc_vt = X86_MEM32(npc_va);
             const uint32_t npc_obj = X86_MEM32(npc_va + 0x04u);
-            if (ValidGuest(npc_obj, 0xF0u) && npc_obj != attacker_obj &&
+            const float raw_cur_hp = X86_MEMF32(npc_va + 0x16u);
+            const float raw_max_hp = X86_MEMF32(npc_va + 0x1Au);
+            if (npc_vt != kVtHermes && npc_vt != kVtHorace && npc_vt != kVtKilljoy &&
+                std::isfinite(raw_cur_hp) && std::isfinite(raw_max_hp) &&
+                raw_max_hp > 0.0f && raw_max_hp < kSentinelBossOrSetpieceHp &&
+                raw_cur_hp < kSentinelBossOrSetpieceHp &&
+                ValidGuest(npc_obj, 0xF0u) && npc_obj != attacker_obj &&
                 (X86_MEM32(npc_obj + 0x08u) & 0x80000000u) == 0u &&
                 X86_MEM32(npc_obj + 0xE0u) == 7u &&
                 X86_MEM32(npc_obj + 0xD0u) != kIidDallas &&
@@ -974,9 +989,9 @@ X86_FUNC(sub_000F1E80) {
                     const uint32_t is_hostile =
                         CallGuestFreeFn(ctx, kFnAreHostile, {player_obj, npc_obj, FloatBits(-1.0f)});
                     if (is_hostile != 0u) {
-                        const float cur_hp = std::max(X86_MEMF32(npc_va + 0x16u), 1.0f);
-                        const float max_hp = std::max(X86_MEMF32(npc_va + 0x1Au), cur_hp);
-                        const float lethal_dmg = std::max(incoming_dmg, max_hp * 100.0f + 100000.0f);
+                        const float cur_hp = std::max(raw_cur_hp, 1.0f);
+                        const float max_hp = std::max(raw_max_hp, cur_hp);
+                        const float lethal_dmg = std::max(incoming_dmg, max_hp * 4.0f + 1000.0f);
                         X86_MEMF32(ctx.esp + 0x04u) = lethal_dmg;
                     }
                 }

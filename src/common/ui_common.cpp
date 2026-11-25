@@ -221,6 +221,8 @@ float ComputeWindowDpiScale(void* hwnd) {
 }
 
 void LoadCrispUiFonts(ImGuiIO& io, float ui_scale, UiFonts& out) {
+    out.regular = nullptr;
+    out.heading = nullptr;
     io.Fonts->Clear();
     float s = std::clamp(ui_scale, 1.0f, 2.5f);
     float body_px = std::round(16.0f * s);
@@ -301,6 +303,8 @@ void LoadCrispUiFonts(ImGuiIO& io, float ui_scale, UiFonts& out) {
         def.SizePixels = std::round(13.0f * s);
         out.regular = io.Fonts->AddFontDefault(&def);
         out.heading = out.regular;
+    } else if (!out.heading) {
+        out.heading = out.regular;
     }
     io.FontDefault = out.regular;
     io.FontGlobalScale = 1.0f;
@@ -350,7 +354,7 @@ void ApplyDarkIndustrialStyle(float ui_scale) {
 
 void FeedPadToImGui(const input::Pad& p, bool active, bool& was_active) {
     ImGuiIO& io = ImGui::GetIO();
-    if (!active) {
+    if (!active || !p.connected) {
         if (was_active) {
             was_active = false;
             io.AddKeyEvent(ImGuiKey_GamepadDpadUp, false);
@@ -366,10 +370,12 @@ void FeedPadToImGui(const input::Pad& p, bool active, bool& was_active) {
             io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickUp, false, 0.0f);
             io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickDown, false, 0.0f);
         }
+        if (!p.connected) {
+            io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
+        }
         return;
     }
     was_active = true;
-    if (!p.connected) return;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
     io.AddKeyEvent(ImGuiKey_GamepadDpadUp, (p.buttons & (1u << 0)) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadDpadDown, (p.buttons & (1u << 1)) != 0);
@@ -584,7 +590,7 @@ void DrawUpscalingGraphicsPanel(const UiPanelContext& ctx) {
             app::HardwarePreset::High1440p, app::HardwarePreset::Ultra4k};
         for (app::HardwarePreset tier : kTiers) {
             ImGui::SameLine();
-            bool active = (s.hardware_preset == tier);
+            const bool active = (s.hardware_preset == tier);
             if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.54f, 0.15f, 0.17f, 1.0f));
             if (ImGui::SmallButton(HardwarePresetName(tier))) {
                 ApplyHardwarePreset(tier, sel_gpu, plugins, app::Desktop());
@@ -630,7 +636,8 @@ void DrawUpscalingGraphicsPanel(const UiPanelContext& ctx) {
             std::string lbl = std::string(upscale::UpscalerModeName(m)) + badge_for(m);
             bool sel = (s.upscaler == m);
 #ifndef _WIN32
-            bool win_only = (m == app::UpscalerMode::Dlss || m == app::UpscalerMode::Fsr3 || m == app::UpscalerMode::Xess);
+            const bool win_only =
+                (m == app::UpscalerMode::Dlss || m == app::UpscalerMode::Fsr3 || m == app::UpscalerMode::Xess);
             if (win_only) ImGui::BeginDisabled(true);
 #endif
             if (ImGui::Selectable(lbl.c_str(), sel)) {
@@ -838,11 +845,13 @@ void DrawDisplayGpuPanel(const UiPanelContext& ctx) {
                               double(g.dedicated_vram) / (1024.0 * 1024.0 * 1024.0),
                               g.is_software ? "Software Vulkan" : (g.likely_uma ? "Integrated/UMA" : "Dedicated VRAM"));
                 bool sel = (s.gpu_adapter == g.key);
+                ImGui::PushID(g.key.c_str());
                 if (ImGui::Selectable(buf, sel)) {
                     s.gpu_adapter = g.key;
                     app::MarkGpuAdapterUserEdited();
                     app::Save();
                 }
+                ImGui::PopID();
             }
         }
         ImGui::EndCombo();
@@ -853,7 +862,7 @@ void DrawDisplayGpuPanel(const UiPanelContext& ctx) {
 
     ImGui::Separator();
     const char* mode_names[] = {"Fullscreen", "Borderless", "Windowed"};
-    int mode_idx = int(s.display_mode);
+    int mode_idx = std::clamp(int(s.display_mode), 0, 2);
     if (ImGui::Combo("Display Mode", &mode_idx, mode_names, 3)) {
         s.display_mode = app::DisplayMode(mode_idx);
         app::Save();
@@ -879,12 +888,14 @@ void DrawDisplayGpuPanel(const UiPanelContext& ctx) {
         }
         if (ctx.monitors) {
             for (const auto& m : *ctx.monitors) {
+                ImGui::PushID(m.device.c_str());
                 if (ImGui::Selectable(m.label.c_str(), s.monitor == m.device)) {
                     s.monitor = m.device;
                     if (ctx.resolutions) ctx.resolutions->clear();
                     app::Save();
                     if (ctx.on_display_changed) ctx.on_display_changed();
                 }
+                ImGui::PopID();
             }
         }
         ImGui::EndCombo();
@@ -913,15 +924,18 @@ void DrawDisplayGpuPanel(const UiPanelContext& ctx) {
                 if (ctx.on_display_changed) ctx.on_display_changed();
             }
             if (ctx.resolutions) {
-                for (const auto& r : *ctx.resolutions) {
+                for (size_t i = 0; i < ctx.resolutions->size(); ++i) {
+                    const auto& r = (*ctx.resolutions)[i];
                     char opt[48];
                     std::snprintf(opt, sizeof(opt), "%ux%u", r.width, r.height);
+                    ImGui::PushID(static_cast<int>(i));
                     if (ImGui::Selectable(opt, s.width == r.width && s.height == r.height)) {
                         s.width = r.width;
                         s.height = r.height;
                         app::Save();
                         if (ctx.on_display_changed) ctx.on_display_changed();
                     }
+                    ImGui::PopID();
                 }
             }
             ImGui::EndCombo();
@@ -982,7 +996,7 @@ void DrawAudioPanel(const UiPanelContext& /*ctx*/) {
 #else
     const char* spk_modes[] = {"Auto (Match System)", "Stereo (2.0)", "5.1 Surround", "Mono"};
 #endif
-    int spk = int(s.audio_output);
+    int spk = std::clamp(int(s.audio_output), 0, 3);
     if (ImGui::Combo("Speaker Output Mode", &spk, spk_modes, 4)) {
         s.audio_output = uint32_t(spk);
         audio::SetOutputMode(s.audio_output);
@@ -1010,16 +1024,22 @@ void DrawControlsPanel(const UiPanelContext& ctx) {
         InputModeName(InputMode::MouseKeyboardOnly),
         InputModeName(InputMode::ControllerOnly),
     };
-    int cur_mode = int(mkb.input_mode);
+    int cur_mode = std::clamp(int(mkb.input_mode), 0, 2);
     ImGui::SetNextItemWidth(std::min(430.0f, ImGui::GetContentRegionAvail().x * 0.65f));
     if (ImGui::Combo("Input Mode", &cur_mode, mode_items, 3)) {
         mkb.input_mode = static_cast<InputMode>(cur_mode);
+        if (mkb.input_mode == InputMode::ControllerOnly) {
+            MkbCancelRebind();
+        }
         MkbMarkInputModeUserEdited();
         app::Save();
     }
 
     input::DeviceInfo dev = input::GetDeviceInfo(0);
-    bool mkb_enabled = (mkb.input_mode != InputMode::ControllerOnly);
+    const bool mkb_enabled = (mkb.input_mode != InputMode::ControllerOnly);
+    if (!mkb_enabled) {
+        MkbCancelRebind();
+    }
     ImGui::TextColored(mkb_enabled ? ImVec4(0.35f, 0.90f, 0.45f, 1.0f) : ImVec4(0.65f, 0.65f, 0.70f, 1.0f),
                        "Mouse & Keyboard: %s",
 #ifdef _WIN32
@@ -1107,7 +1127,7 @@ void DrawControlsPanel(const UiPanelContext& ctx) {
 
                     for (int slot = 0; slot < 2; ++slot) {
                         ImGui::TableSetColumnIndex(1 + slot);
-                        bool capturing_this = is_rebinding && rebind_act == info.action && rebind_slot == slot;
+                        const bool capturing_this = is_rebinding && rebind_act == info.action && rebind_slot == slot;
                         std::string btn_label =
                             capturing_this ? "Press Input..." : BindSlotToDisplay(mkb.bindings[i][size_t(slot)]);
                         std::string btn_id = btn_label + "##rebind_" + std::to_string(i) + "_" + std::to_string(slot);
@@ -1135,6 +1155,7 @@ void DrawControlsPanel(const UiPanelContext& ctx) {
 
         // Sub-tab 2: Controller (DualSense / Xbox)
         if (ImGui::BeginTabItem("Controller (DualSense / Xbox)")) {
+            MkbCancelRebind();
             ImGui::Spacing();
             if (dev.connected) {
                 ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.45f, 1.0f), "Port 1 Connected: %s", dev.name.c_str());
@@ -1377,7 +1398,7 @@ void DrawLauncherHeaderUpdateButton(const UpdateStatusSnapshot& snap, float ui_s
         ImGui::SetCursorPosX(right_x);
     }
 
-    bool disabled = checking || downloading;
+    const bool disabled = checking || downloading;
     if (disabled) ImGui::BeginDisabled(true);
 
     if (has_banner) {
@@ -1592,11 +1613,12 @@ void DrawUpdateAlertCard(const UpdateStatusSnapshot& snap, const UpdateCardConte
             ImGui::TextWrapped("%s", summary_line.c_str());
             ImGui::PopStyleColor();
             if (!full_tooltip.empty() && ImGui::IsItemHovered()) {
-                ImGui::BeginTooltip();
-                ImGui::PushTextWrapPos(460.0f * s);
-                ImGui::TextUnformatted(full_tooltip.c_str());
-                ImGui::PopTextWrapPos();
-                ImGui::EndTooltip();
+                if (ImGui::BeginTooltip()) {
+                    ImGui::PushTextWrapPos(460.0f * s);
+                    ImGui::TextUnformatted(full_tooltip.c_str());
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                }
             }
             if (!uctx.in_launcher && !ready) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.74f, 0.30f, 1.0f));
@@ -1897,15 +1919,16 @@ void DrawCheatsPanel(float ui_scale, const std::function<void(const std::string&
             ImGui::TableNextColumn();
             const cheats::CheatToggleInfo& info = toggle_infos[i];
             bool armed = !replay_locked && cheats::GetToggle(info.id);
+            const bool style_pushed = armed;
             ImGui::PushID(static_cast<int>(i));
-            if (armed) {
+            if (style_pushed) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.88f, 0.66f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.34f, 0.13f, 0.15f, 0.98f));
             }
             if (ImGui::Checkbox(info.label, &armed)) {
                 cheats::SetToggle(info.id, armed);
             }
-            if (armed) {
+            if (style_pushed) {
                 ImGui::PopStyleColor(2);
             }
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {

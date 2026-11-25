@@ -250,6 +250,7 @@ bool XisoFileBrowser::Draw(float ui_scale, fs::path& out_picked,
         } else if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) {
             if (current_dir_.has_parent_path() && current_dir_.parent_path() != current_dir_) {
                 NavigateTo(current_dir_.parent_path());
+                if (!sidebar_focused_) focus_list_requested_ = true;
             } else {
                 open_ = false;
                 ImGui::CloseCurrentPopup();
@@ -261,6 +262,7 @@ bool XisoFileBrowser::Draw(float ui_scale, fs::path& out_picked,
         if (ImGui::Button("Up (..)", ImVec2(82.0f * s, 30.0f * s))) {
             if (current_dir_.has_parent_path() && current_dir_.parent_path() != current_dir_) {
                 NavigateTo(current_dir_.parent_path());
+                if (!sidebar_focused_) focus_list_requested_ = true;
             }
         }
         ImGui::SameLine();
@@ -290,7 +292,7 @@ bool XisoFileBrowser::Draw(float ui_scale, fs::path& out_picked,
         float body_h = std::max(140.0f, ImGui::GetContentRegionAvail().y - footer_h);
         float sidebar_w = std::clamp(200.0f * s, 160.0f, modal_sz.x * 0.32f);
 
-        if (ImGui::BeginChild("##BrowserSidebar", ImVec2(sidebar_w, body_h), true)) {
+        if (ImGui::BeginChild("##BrowserSidebar", ImVec2(sidebar_w, body_h), ImGuiChildFlags_Border)) {
             ImGui::TextDisabled("Quick Jump (LB/RB)");
             ImGui::Separator();
             if (focus_sidebar_requested_) {
@@ -312,7 +314,7 @@ bool XisoFileBrowser::Draw(float ui_scale, fs::path& out_picked,
 
         ImGui::SameLine();
 
-        if (ImGui::BeginChild("##BrowserList", ImVec2(0.0f, body_h), true)) {
+        if (ImGui::BeginChild("##BrowserList", ImVec2(0.0f, body_h), ImGuiChildFlags_Border)) {
             if (!dir_error_.empty()) {
                 ImGui::TextColored(ImVec4(0.95f, 0.38f, 0.35f, 1.0f), "%s", dir_error_.c_str());
             } else if (entries_.empty()) {
@@ -337,6 +339,7 @@ bool XisoFileBrowser::Draw(float ui_scale, fs::path& out_picked,
                     }
                     label += "##entry_" + std::to_string(i);
 
+                    const bool pushed_text_col = (e.is_dir || e.is_archive_hint);
                     if (e.is_dir) {
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.76f, 0.88f, 1.0f, 1.0f));
                     } else if (e.is_archive_hint) {
@@ -344,7 +347,7 @@ bool XisoFileBrowser::Draw(float ui_scale, fs::path& out_picked,
                     }
                     bool clicked = ImGui::Selectable(label.c_str(), is_sel, ImGuiSelectableFlags_AllowDoubleClick,
                                                      ImVec2(0.0f, row_h));
-                    if (e.is_dir || e.is_archive_hint) ImGui::PopStyleColor();
+                    if (pushed_text_col) ImGui::PopStyleColor();
 
                     bool dbl = clicked && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
                     bool pad_or_enter =
@@ -368,6 +371,7 @@ bool XisoFileBrowser::Draw(float ui_scale, fs::path& out_picked,
                 }
                 if (!pending_nav.empty()) {
                     NavigateTo(pending_nav);
+                    focus_list_requested_ = true;
                 }
             }
         }
@@ -416,6 +420,8 @@ bool XisoFileBrowser::Draw(float ui_scale, fs::path& out_picked,
         ImGui::EndDisabled();
 
         ImGui::EndPopup();
+    } else if (!ImGui::IsPopupOpen(kPopupId)) {
+        open_ = false;
     }
 
     if (!modal_open) {

@@ -88,7 +88,7 @@ namespace {
 constexpr uint32_t kVaLevelMgrPtr = 0x002D0D88u;
 constexpr uint32_t kVaWorldPtr = 0x002D0DC0u;
 constexpr uint32_t kVaUiMgrPtr = 0x002DAD78u;
-constexpr uint32_t kVaMainMenuPtr = 0x002DADACu;
+[[maybe_unused]] constexpr uint32_t kVaMainMenuPtr = 0x002DADACu;
 constexpr uint32_t kVaRendererPtr = 0x002DC75Cu;
 constexpr uint32_t kVaUserSettings = 0x002DB218u;
 constexpr uint32_t kVaSensMax = 0x002DADA0u;
@@ -187,16 +187,46 @@ bool IsNonInteractiveScreenVt(uint32_t vt) {
 }
 
 bool ValidGuest(uint32_t va, uint32_t bytes = 4u) {
-    return va >= 0x10000u && mem::IsCommitted(va) && (bytes <= 1u || mem::IsCommitted(va + bytes - 1u));
+    if (kernel::g_base == nullptr || bytes == 0u || va < 0x10000u) return false;
+    const uint32_t last = va + (bytes - 1u);
+    if (last < va) return false;
+    return mem::IsCommitted(va) && (bytes == 1u || mem::IsCommitted(last));
 }
+
+struct SavedX87State {
+    int top = 0;
+    double st[8]{};
+
+    static SavedX87State Capture(const X86Context& ctx) {
+        SavedX87State s{};
+        s.top = ctx.top;
+        std::memcpy(s.st, ctx.st, sizeof(s.st));
+        return s;
+    }
+
+    void Restore(X86Context& ctx) const {
+        ctx.top = top;
+        std::memcpy(ctx.st, st, sizeof(st));
+    }
+};
 
 uint32_t CallThiscall(X86Context& ctx, uint32_t fn_va, uint32_t this_ptr,
                       std::initializer_list<uint32_t> args = {}) {
-    if (fn_va < 0x10000u) return 0u;
-    uint32_t saved_ecx = ctx.ecx;
+    if (!ValidGuest(fn_va, 1u) || !ValidGuest(this_ptr, 4u)) return 0u;
+    const uint32_t saved_ecx = ctx.ecx;
+    const SavedX87State saved_fpu = SavedX87State::Capture(ctx);
     ctx.ecx = this_ptr;
-    uint32_t res = kernel::CallGuest(ctx, fn_va, args);
+    const uint32_t res = kernel::CallGuest(ctx, fn_va, args);
     ctx.ecx = saved_ecx;
+    saved_fpu.Restore(ctx);
+    return res;
+}
+
+uint32_t CallGuestFreeFn(X86Context& ctx, uint32_t fn_va, std::initializer_list<uint32_t> args = {}) {
+    if (!ValidGuest(fn_va, 1u)) return 0u;
+    const SavedX87State saved_fpu = SavedX87State::Capture(ctx);
+    const uint32_t res = kernel::CallGuest(ctx, fn_va, args);
+    saved_fpu.Restore(ctx);
     return res;
 }
 
@@ -328,6 +358,9 @@ bool FocusChainToWidget(X86Context& ctx, uint8_t* base, uint32_t ui_mgr, uint32_
     for (int i = depth - 1; i >= 0; --i) {
         uint32_t p = parents[i];
         int32_t want_idx = indices[i];
+        if (!ValidGuest(p, 0x54u)) break;
+        const int32_t cnt = int32_t(X86_MEM32(p + 0x50u));
+        if (want_idx < 0 || want_idx >= cnt) break;
         int32_t cur_idx = int32_t(X86_MEM32(p + 0x08u));
         if (cur_idx != want_idx) {
             uint32_t ok = CallThiscall(ctx, kFnSetFocusedChild, p, {uint32_t(want_idx)});
@@ -493,7 +526,7 @@ void ClearMenuDragAndFlush() {
 
 void ApplyContinuousAudioSlider(X86Context& ctx, uint8_t* base, uint32_t ui_mgr, uint32_t top_va, uint32_t meter_va,
                                 uint32_t val_off, float t, bool play_sound) {
-    if (!ValidGuest(meter_va, 0xB0u) || !ValidGuest(top_va, 0xD0u)) return;
+    if (!ValidGuest(meter_va, 0xB0u) || !ValidGuest(top_va, 0x10Cu) || !ValidGuest(kVaUserSettings, 0x54u)) return;
     t = std::clamp(t, 0.0f, 1.0f);
     X86_MEMF32(meter_va + 0xA8u) = t;
     X86_MEMF32(top_va + val_off) = t;
@@ -504,7 +537,7 @@ void ApplyContinuousAudioSlider(X86Context& ctx, uint8_t* base, uint32_t ui_mgr,
 
 void ApplyContinuousGameplaySlider(X86Context& ctx, uint8_t* base, uint32_t ui_mgr, uint32_t top_va, uint32_t meter_va,
                                    uint32_t val_off, float t, bool play_sound) {
-    if (!ValidGuest(meter_va, 0xB0u) || !ValidGuest(top_va, 0x118u)) return;
+    if (!ValidGuest(meter_va, 0xB0u) || !ValidGuest(top_va, 0x13Cu) || !ValidGuest(kVaUserSettings, 0x54u)) return;
     t = std::clamp(t, 0.0f, 1.0f);
     float lo = ValidGuest(kVaSensMin, 4u) ? X86_MEMF32(kVaSensMin) : 0.25f;
     float hi = ValidGuest(kVaSensMax, 4u) ? X86_MEMF32(kVaSensMax) : 4.0f;
@@ -601,11 +634,12 @@ void CommitOptionsDiscreteToggle(X86Context& ctx, uint8_t* base, uint32_t top_va
     CallOnAction(ctx, base, slider_va, action_id);
     // Pump slider->Update() immediately so listener->Notify(slider) updates staged CUserSettings now.
     CallWidgetUpdate(ctx, base, slider_va);
-    if (top_vt == kVtAudio) {
+    if (!ValidGuest(kVaUserSettings, 0x54u)) return;
+    if (top_vt == kVtAudio && ValidGuest(top_va + 0xB8u, 0x54u)) {
         CallThiscall(ctx, kFnUserSettingsCopyFrom, kVaUserSettings, {top_va + 0xB8u});
-    } else if (top_vt == kVtGameplay) {
+    } else if (top_vt == kVtGameplay && ValidGuest(top_va + 0xE8u, 0x54u)) {
         CallThiscall(ctx, kFnUserSettingsCopyFrom, kVaUserSettings, {top_va + 0xE8u});
-    } else if (top_vt == kVtController) {
+    } else if (top_vt == kVtController && ValidGuest(top_va + 0x184u, 0x54u)) {
         CallThiscall(ctx, kFnUserSettingsCopyFrom, kVaUserSettings, {top_va + 0x184u});
     }
 }
@@ -667,8 +701,9 @@ void RequestCleanHostQuit() {
 bool SetWidgetWideTextAscii(X86Context& ctx, uint8_t* base, uint32_t widget_va, const char* ascii) {
     if (!ValidGuest(widget_va, 0x84u) || !ascii) return false;
     const uint32_t saved_esp = ctx.esp;
+    if (saved_esp < 0x10200u) return false;
     const uint32_t scratch_esp = (saved_esp - 96u) & ~15u;
-    if (!ValidGuest(scratch_esp, 64u)) return false;
+    if (scratch_esp < 0x10100u || !ValidGuest(scratch_esp - 256u, 320u)) return false;
     const uint32_t str_va = scratch_esp + 16u;
     size_t len = 0u;
     while (ascii[len] != '\0' && len < 22u) {
@@ -823,7 +858,7 @@ void EnsureAndSyncMainMenuQuitButton(X86Context& ctx, uint8_t* base, uint32_t me
     if (!ReadRawRect(base, bonus_va).valid || !ReadRawRect(base, archives_va).valid) return;
 
     const uint32_t bonus_tmpl_id = X86_MEM32(bonus_va + 0x0Cu);
-    const uint32_t btn_alloc = kernel::CallGuest(ctx, kFnOperatorNew, {0x40u, 0xB0u});
+    const uint32_t btn_alloc = CallGuestFreeFn(ctx, kFnOperatorNew, {0x40u, 0xB0u});
     if (!ValidGuest(btn_alloc, 0xB0u)) return;
 
     const uint32_t quit_btn = CallThiscall(ctx, kFnSimpleButtonCtor, btn_alloc, {bonus_tmpl_id});
@@ -853,7 +888,7 @@ void EnsureAndSyncMainMenuQuitButton(X86Context& ctx, uint8_t* base, uint32_t me
     const uint32_t bonus_fx = X86_MEM32(menu_va + 0xC0u);
     if (ValidGuest(bonus_fx, 0x98u) && X86_MEM32(bonus_fx) == kVtGuiEffects) {
         const uint32_t fx_tmpl_id = X86_MEM32(bonus_fx + 0x0Cu);
-        const uint32_t fx_alloc = kernel::CallGuest(ctx, kFnOperatorNew, {0x40u, 0xF4u});
+        const uint32_t fx_alloc = CallGuestFreeFn(ctx, kFnOperatorNew, {0x40u, 0xF4u});
         if (ValidGuest(fx_alloc, 0xF4u)) {
             const int32_t quit_idx_before = FindChildIndex(base, menu_va, quit_btn);
             quit_fx = CallThiscall(ctx, kFnGuiEffectsCtor, fx_alloc, {fx_tmpl_id, quit_btn});
@@ -879,6 +914,17 @@ void EnsureAndSyncMainMenuQuitButton(X86Context& ctx, uint8_t* base, uint32_t me
     LOGI("ui: injected Main Menu Quit Game button (menu=%08X btn=%08X fx=%08X rect=%.1f,%.1f %.1fx%.1f)", menu_va,
          quit_btn, quit_fx, X86_MEMF32(quit_btn + 0x38u), X86_MEMF32(quit_btn + 0x3Cu),
          X86_MEMF32(quit_btn + 0x40u), X86_MEMF32(quit_btn + 0x44u));
+}
+
+bool IsScreenStillActiveTop(uint8_t* base, uint32_t ui_mgr, uint32_t expected_top) {
+    if (!ValidGuest(ui_mgr, 0x54u) || !ValidGuest(expected_top, 0x28u)) return false;
+    const int32_t count = int32_t(X86_MEM32(ui_mgr + 0x50u));
+    const uint32_t arr = X86_MEM32(ui_mgr + 0x48u);
+    if (count <= 0 || count > 64 || !ValidGuest(arr, uint32_t(count) * 4u)) return false;
+    if (X86_MEM32(arr + uint32_t(count - 1) * 4u) != expected_top) return false;
+    const uint32_t flags = X86_MEM32(expected_top + 0x04u);
+    const uint32_t state = X86_MEM32(expected_top + 0x24u);
+    return state == 4u && (flags & 0x01u) != 0u && (flags & 0x10u) == 0u;
 }
 
 void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) {
@@ -1049,9 +1095,12 @@ void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) 
         if (mf.wheel_steps != 0) {
             uint32_t act = (mf.wheel_steps > 0) ? kActGuiLeft : kActGuiRight;
             int n = std::min(std::abs(mf.wheel_steps), 4);
-            for (int i = 0; i < n; ++i) CallOnAction(ctx, base, top, act);
+            for (int i = 0; i < n && IsScreenStillActiveTop(base, ui_mgr, top); ++i) {
+                CallOnAction(ctx, base, top, act);
+            }
         }
-        if (mf.lmb_pressed && mf.pt.in_viewport) {
+        if (mf.lmb_pressed && mf.pt.in_viewport && IsScreenStillActiveTop(base, ui_mgr, top)) {
+            open_page = int32_t(X86_MEM32(top + 0x70u));
             if (open_page < 0) {
                 if (mf.pt.gx < guest_w * 0.28f) CallOnAction(ctx, base, top, kActGuiLeft);
                 else if (mf.pt.gx > guest_w * 0.72f) CallOnAction(ctx, base, top, kActGuiRight);
@@ -1074,7 +1123,9 @@ void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) 
             int n = std::min(std::abs(mf.wheel_steps), 4);
             if (over_inv && ValidGuest(map_inv, 4u)) {
                 uint32_t act = (mf.wheel_steps > 0) ? kActMapInvUp : kActMapInvDown;
-                for (int i = 0; i < n; ++i) CallOnAction(ctx, base, map_inv, act);
+                for (int i = 0; i < n && IsScreenStillActiveTop(base, ui_mgr, top); ++i) {
+                    CallOnAction(ctx, base, map_inv, act);
+                }
             } else {
                 uint32_t entry = LookupMapDisplayEntry(ctx, base, map_disp);
                 if (entry != 0u) {
@@ -1100,7 +1151,9 @@ void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) 
         if (mf.wheel_steps != 0) {
             uint32_t act = (mf.wheel_steps > 0) ? kActGuiUp : kActGuiDown;
             int n = std::min(std::abs(mf.wheel_steps), 4);
-            for (int i = 0; i < n; ++i) CallOnAction(ctx, base, top, act);
+            for (int i = 0; i < n && IsScreenStillActiveTop(base, ui_mgr, top); ++i) {
+                CallOnAction(ctx, base, top, act);
+            }
         }
         return;
     }
@@ -1244,7 +1297,7 @@ void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) 
                 } else {
                     uint32_t act = (mf.wheel_steps > 0) ? kActGuiRight : kActGuiLeft;
                     int n = std::min(std::abs(mf.wheel_steps), 4);
-                    for (int i = 0; i < n; ++i) {
+                    for (int i = 0; i < n && IsScreenStillActiveTop(base, ui_mgr, top); ++i) {
                         CommitOptionsDiscreteToggle(ctx, base, top, top_vt, target_slider, act);
                     }
                     return;
@@ -1256,7 +1309,7 @@ void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) 
         if (listbox != 0u) {
             uint32_t act = (mf.wheel_steps > 0) ? kActGuiUp : kActGuiDown;
             int n = std::min(std::abs(mf.wheel_steps), 6);
-            for (int i = 0; i < n; ++i) {
+            for (int i = 0; i < n && IsScreenStillActiveTop(base, ui_mgr, top); ++i) {
                 DispatchListboxAction(ctx, base, ui_mgr, listbox, act);
             }
             return;
@@ -1267,7 +1320,9 @@ void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) 
             top_vt == kVtLevelSelect) {
             uint32_t act = (mf.wheel_steps > 0) ? kActGuiUp : kActGuiDown;
             int n = std::min(std::abs(mf.wheel_steps), 6);
-            for (int i = 0; i < n; ++i) CallOnAction(ctx, base, top, act);
+            for (int i = 0; i < n && IsScreenStillActiveTop(base, ui_mgr, top); ++i) {
+                CallOnAction(ctx, base, top, act);
+            }
         }
     }
 }
@@ -1347,14 +1402,13 @@ HighResClockState g_main_clk{};
 void WaitSrscResourceReady(uint8_t* base, uint32_t res_va) {
     if (!ValidGuest(res_va + 0x0Eu, 1u)) return;
     volatile const uint8_t* state_ptr = reinterpret_cast<volatile const uint8_t*>(base + res_va + 0x0Eu);
-    uint32_t spins = 0;
-    while ((*state_ptr & 0x03u) == 0x02u) {
+    constexpr uint32_t kMaxSrscWaitIters = 200000u;  // ~10.0s bounded safety cap
+    for (uint32_t spins = 0; spins < kMaxSrscWaitIters && ((*state_ptr & 0x03u) == 0x02u); ++spins) {
         if (spins < 16u) {
             std::this_thread::yield();
         } else {
             kernel::SleepHighResUs(50);
         }
-        ++spins;
     }
     std::atomic_thread_fence(std::memory_order_acquire);
 }
@@ -1867,7 +1921,8 @@ void SetSubtitles(bool enabled) {
 // toggles the flashlight natively without touching D-Pad or affecting existing controller bindings.
 X86_FUNC(sub_0014E1F0) {
     if (!app::IsReplayOrAutotestActive() &&
-        suffering::MkbGetConfig().input_mode != suffering::InputMode::ControllerOnly) {
+        suffering::MkbGetConfig().input_mode != suffering::InputMode::ControllerOnly &&
+        ValidGuest(ctx.esp + 0x04u, 4u)) {
         if (X86_MEM32(ctx.esp + 0x04u) == 0x002BE260u) {
             X86_MEM32(ctx.esp + 0x04u) = 0x002BE8E0u;
             suffering::MkbNotifyScheme1HookApplied();
@@ -1892,9 +1947,11 @@ X86_FUNC(sub_001B09A0) {
     const uint32_t dev = ctx.ecx;
     __imp__sub_001B09A0(ctx, base);
 
-    if (ctx.eax != 0u && dev >= 0x10000u && X86_MEM32(dev + 0x0Cu) == 0u && suffering::MkbIsInActive3DGameplay()) {
+    if (ctx.eax != 0u && ValidGuest(dev, 0xA0u) && X86_MEM32(dev + 0x0Cu) == 0u &&
+        suffering::MkbIsInActive3DGameplay() && ValidGuest(0x002D0D94u, 4u) && ValidGuest(0x002E01D0u, 4u) &&
+        ValidGuest(0x002DB23Cu, 8u)) {
         uint32_t dt_ptr = X86_MEM32(0x002D0D94u);
-        float dt = (dt_ptr >= 0x10000u && mem::IsCommitted(dt_ptr)) ? X86_MEMF32(dt_ptr) : X86_MEMF32(0x002E01D0u);
+        float dt = ValidGuest(dt_ptr, 4u) ? X86_MEMF32(dt_ptr) : X86_MEMF32(0x002E01D0u);
         float sens_x = X86_MEMF32(0x002DB23Cu);
         float sens_y = X86_MEMF32(0x002DB240u);
 
@@ -1914,12 +1971,13 @@ X86_FUNC(sub_001B09A0) {
 // Bypass yaw acceleration slew so mouse movement snaps in 1 frame with zero stop-coasting drift,
 // and optionally bypass controller sticky slowdown ([ent + 0x664]) when mouse_raw_aim is enabled.
 X86_FUNC(sub_000576A0) {
-    if (app::IsReplayOrAutotestActive() || !suffering::MkbIsMouseLookActive()) {
+    const uint32_t ent = ctx.ecx;
+    if (app::IsReplayOrAutotestActive() || !suffering::MkbIsMouseLookActive() || !ValidGuest(ent, 0x666u)) {
         __imp__sub_000576A0(ctx, base);
         return;
     }
 
-    const uint32_t ent = ctx.ecx;
+    const float saved_accel = X86_MEMF32(ent + 0x182u);
     X86_MEMF32(ent + 0x182u) = 1.0e9f;
     const bool raw_aim = suffering::MkbGetConfig().mouse_raw_aim;
     uint16_t saved_target = 0;
@@ -1931,18 +1989,22 @@ X86_FUNC(sub_000576A0) {
     if (raw_aim) {
         X86_MEM16(ent + 0x664u) = saved_target;
     }
+    if (X86_MEMF32(ent + 0x182u) == 1.0e9f) {
+        X86_MEMF32(ent + 0x182u) = saved_accel;
+    }
 }
 
 // 4. Player Pitch Behavior (shared across 3rd-Person, 1st-Person, and Creature modes):
 // Decouple PC mouse Y polarity from Xbox controller Invert Pitch ([0x002DB248]) and optionally
 // bypass controller sticky slowdown ([ent + 0x664]).
 X86_FUNC(sub_000505D0) {
-    if (app::IsReplayOrAutotestActive() || !suffering::MkbIsMouseLookActive()) {
+    const uint32_t ent = ctx.ecx;
+    if (app::IsReplayOrAutotestActive() || !suffering::MkbIsMouseLookActive() || !ValidGuest(ent, 0x666u) ||
+        !ValidGuest(0x002DB248u, 4u)) {
         __imp__sub_000505D0(ctx, base);
         return;
     }
 
-    const uint32_t ent = ctx.ecx;
     const uint32_t saved_inv = X86_MEM32(0x002DB248u);
     X86_MEM32(0x002DB248u) = 0u;  // Canonical non-inverted PC sign: RS_UP (+0x50) pitches camera UP
     const bool raw_aim = suffering::MkbGetConfig().mouse_raw_aim;
@@ -1961,12 +2023,13 @@ X86_FUNC(sub_000505D0) {
 // 5. Mounted Turret / Searchlight Aim:
 // Apply identical yaw slew bypass and decoupled PC pitch polarity during mouse look.
 X86_FUNC(sub_000465F0) {
-    if (app::IsReplayOrAutotestActive() || !suffering::MkbIsMouseLookActive()) {
+    const uint32_t ent = ctx.ecx;
+    if (app::IsReplayOrAutotestActive() || !suffering::MkbIsMouseLookActive() || !ValidGuest(ent, 0x186u) ||
+        !ValidGuest(0x002DB248u, 4u)) {
         __imp__sub_000465F0(ctx, base);
         return;
     }
 
-    const uint32_t ent = ctx.ecx;
     const float saved_accel = X86_MEMF32(ent + 0x182u);
     const uint32_t saved_inv = X86_MEM32(0x002DB248u);
     X86_MEMF32(ent + 0x182u) = 1.0e9f;
@@ -2142,36 +2205,36 @@ X86_FUNC(sub_00072120) {
 X86_FUNC(sub_001A3170) {
     const uint32_t clock_va = ctx.ecx;
     __imp__sub_001A3170(ctx, base);
-    if (clock_va == kVaMainClock) g_main_clk.OnCtor(base, clock_va);
+    if (clock_va == kVaMainClock && ValidGuest(clock_va, 0x30u)) g_main_clk.OnCtor(base, clock_va);
 }
 
 X86_FUNC(sub_001A31A0) {
     const uint32_t clock_va = ctx.ecx;
-    const uint32_t full_reset = X86_MEM32(ctx.esp + 0x04u);
+    const uint32_t full_reset = ValidGuest(ctx.esp + 0x04u, 4u) ? X86_MEM32(ctx.esp + 0x04u) : 0u;
     __imp__sub_001A31A0(ctx, base);
-    if (clock_va == kVaMainClock) g_main_clk.OnReset(base, clock_va, full_reset != 0u);
+    if (clock_va == kVaMainClock && ValidGuest(clock_va, 0x30u)) g_main_clk.OnReset(base, clock_va, full_reset != 0u);
 }
 
 X86_FUNC(sub_001A3210) {
     const uint32_t clock_va = ctx.ecx;
     __imp__sub_001A3210(ctx, base);
-    if (clock_va == kVaMainClock) g_main_clk.OnPause(base, clock_va);
+    if (clock_va == kVaMainClock && ValidGuest(clock_va, 0x30u)) g_main_clk.OnPause(base, clock_va);
 }
 
 X86_FUNC(sub_001A3220) {
     const uint32_t clock_va = ctx.ecx;
-    if (clock_va == kVaMainClock && g_main_clk.valid) {
+    if (clock_va == kVaMainClock && g_main_clk.valid && ValidGuest(clock_va, 0x30u)) {
         const float t = float(g_main_clk.total_s);
         X86_MEMF32(clock_va + 0x20u) = t;
         X86_MEMF32(clock_va + 0x24u) = t;
     }
     __imp__sub_001A3220(ctx, base);
-    if (clock_va == kVaMainClock) g_main_clk.OnUnpause(base, clock_va);
+    if (clock_va == kVaMainClock && ValidGuest(clock_va, 0x30u)) g_main_clk.OnUnpause(base, clock_va);
 }
 
 X86_FUNC(sub_001A3320) {
     const uint32_t clock_va = ctx.ecx;
-    if (clock_va != kVaMainClock || !g_main_clk.valid) {
+    if (clock_va != kVaMainClock || !g_main_clk.valid || !ValidGuest(clock_va, 0x30u)) {
         __imp__sub_001A3320(ctx, base);
         return;
     }
@@ -2191,14 +2254,14 @@ X86_FUNC(sub_001A3320) {
 X86_FUNC(sub_001A3390) {
     const uint32_t clock_va = ctx.ecx;
     __imp__sub_001A3390(ctx, base);
-    if (clock_va == kVaMainClock) g_main_clk.OnLoadState(base, clock_va);
+    if (clock_va == kVaMainClock && ValidGuest(clock_va, 0x30u)) g_main_clk.OnLoadState(base, clock_va);
 }
 
 X86_FUNC(sub_001A3470) {
     const uint32_t clock_va = ctx.ecx;
-    const uint32_t out_dt_va = X86_MEM32(ctx.esp + 0x04u);
+    const uint32_t out_dt_va = ValidGuest(ctx.esp + 0x04u, 4u) ? X86_MEM32(ctx.esp + 0x04u) : 0u;
     __imp__sub_001A3470(ctx, base);
-    if (clock_va != kVaMainClock) return;
+    if (clock_va != kVaMainClock || !ValidGuest(clock_va, 0x30u)) return;
 
     auto now = std::chrono::steady_clock::now();
     double raw_dt = g_main_clk.valid ? std::chrono::duration<double>(now - g_main_clk.last_tick).count() : (1.0 / 60.0);
@@ -2213,7 +2276,7 @@ X86_FUNC(sub_001A3470) {
         g_main_clk.valid = true;
     }
 
-    const float guest_max_dt = X86_MEMF32(kVaMaxDt);
+    const float guest_max_dt = ValidGuest(kVaMaxDt, 4u) ? X86_MEMF32(kVaMaxDt) : 0.10f;
     const double max_dt_d =
         (std::isfinite(guest_max_dt) && guest_max_dt > 0.001f) ? std::min(double(guest_max_dt), 0.10) : 0.10;
     raw_dt = std::clamp(raw_dt, 0.0001, max_dt_d);
@@ -2225,11 +2288,11 @@ X86_FUNC(sub_001A3470) {
     // Freeze g_ElapsedGameTime (0x002E0290) whenever EngineFrameTick skips World::Update
     // (both Pause Menu and Mid-Level Streaming Pause set bit 0 of 0x002E0274), while keeping
     // *out_dt_va (0x002E01D0) live so CGUI menu screens continue updating smoothly.
-    const bool world_paused = (X86_MEM8(kVaPauseFlags) & 0x01u) != 0u;
+    const bool world_paused = ValidGuest(kVaPauseFlags, 1u) && (X86_MEM8(kVaPauseFlags) & 0x01u) != 0u;
     if (!world_paused) {
         g_main_clk.total_s += dt_d;
     }
-    if (out_dt_va >= 0x10000u && mem::IsCommitted(out_dt_va)) {
+    if (ValidGuest(out_dt_va, 4u)) {
         X86_MEMF32(out_dt_va) = float(dt_d);
     }
     g_main_clk.SyncGuestClockAnchors(base, clock_va);
