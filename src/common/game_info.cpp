@@ -11,12 +11,13 @@
 #include "common/launcher_ui.h"
 #include "common/mkb_input.h"
 #include "common/settings_ui.h"
+#include "common/ui_aspect.h"
 #include "common/ui_common.h"
 #include "common/version.h"
 #include "game/guest_settings.h"
 
-static_assert(SUFFERING_VERSION_MAJOR == 1 && SUFFERING_VERSION_MINOR == 6 && SUFFERING_VERSION_PATCH == 2,
-              "Keep game_info.cpp and suffering.rc synchronized with version.h (v1.6.2)");
+static_assert(SUFFERING_VERSION_MAJOR == 1 && SUFFERING_VERSION_MINOR == 6 && SUFFERING_VERSION_PATCH == 3,
+              "Keep game_info.cpp and suffering.rc synchronized with version.h (v1.6.3)");
 
 namespace {
 
@@ -27,6 +28,7 @@ double Round3(float v) {
 
 void LoadAllGameSettings(const void* table_ptr) {
     suffering::MkbLoadSettings(table_ptr);
+    suffering::ui_aspect::LoadSettings(table_ptr);
     suffering::SharedUiOptions& ui = suffering::GetSharedUiOptions();
     ui.dismissed_update_tag.clear();
 
@@ -92,6 +94,7 @@ void LoadAllGameSettings(const void* table_ptr) {
 void SaveAllGameSettings(void* table_ptr) {
     if (!table_ptr) return;
     suffering::MkbSaveSettings(table_ptr);
+    suffering::ui_aspect::SaveSettings(table_ptr);
 
     auto& root = *static_cast<toml::table*>(table_ptr);
     root.insert_or_assign("dismissed_update_tag", suffering::GetSharedUiOptions().dismissed_update_tag);
@@ -131,7 +134,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 #endif
 
-// Host application metadata for The Suffering (USA, Original Xbox, Title ID 0x4D570015, Recomp v1.6.2).
+// Host application metadata for The Suffering (USA, Original Xbox, Title ID 0x4D570015, Recomp v1.6.3).
 const app::GameInfo app::kGame = {
     .title = L"The Suffering",
     .short_title = L"The Suffering",

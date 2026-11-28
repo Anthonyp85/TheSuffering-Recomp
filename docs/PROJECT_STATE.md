@@ -1,6 +1,31 @@
 # Project state and coding-tool handoff
 
-Updated: 2026-11-27. This is the shared resume document for Gemini/Antigravity, Claude, and Codex. Read `AGENTS.md` for architecture, protected game media, SDK patch workflow, and build requirements. Existing `.local/docs_private/` notes are historical and may describe older releases.
+Updated: 2026-11-28. This is the shared resume document for Gemini/Antigravity, Claude, and Codex. Read `AGENTS.md` for architecture, protected game media, SDK patch workflow, and build requirements. Existing `.local/docs_private/` notes are historical and may describe older releases.
+
+## Uncommitted work in progress (post-`v1.6.2`)
+
+**Widescreen UI & Crosshair Aspect Ratio Fix (implemented, built, visually verified, audited — not yet committed or released).**
+
+- **Settings & UI (`src/common/ui_aspect.{h,cpp}`, `src/common/game_info.cpp`, `src/common/ui_common.cpp`, `src/common/settings_ui.cpp`):**
+  - Added 3-mode selector `"UI & Crosshair Aspect"` (`AspectCorrect` default = 4:3 UI + 1:1 Crosshair, `MenusAndCrosshair` = 4:3 Menus/FMVs + 1:1 Crosshair with 16:9 edge HUD, `Stretched16x9` = original Xbox 16:9 stretch) with live status badge and description in both Launcher Tab 1 (`Upscaling & Graphics`) and In-Game `F1` Overlay.
+  - Persists under `[ui_aspect]` in `settings.toml` (omitted at default `aspect_correct` to keep existing configs clean) and supports transient CLI override `--ui-aspect=<aspect_correct|menus_and_crosshair|stretched_16x9>`.
+- **Guest Aspect-Ratio Hooks (`src/game/ui_aspect_hooks.cpp`, zero changes to `XboxXBERecomp/`):**
+  - Strictly disjoint `X86_FUNC` hook set: `sub_00177BB0` (shared 2D `XYZRHW` quad builder), `sub_0005DF40` (`CUIMgr::Render`), `sub_00060320` (`CGUI::Render`), `sub_00076BE0` (3D HUD item mesh alignment with exact bit restore), `sub_001CEFB0` (`MovieXBox::Update` FMV 4:3 mapping), and `sub_00029590`/`sub_000289C0` (weapon reticle HUD widget `[weapon+0x19A]`/`[weapon+0x19E]` tracking).
+  - Clears opaque black pillarbox sidebars `[0..80]` and `[560..640]` via cross-platform HLE `D3DDevice_Clear` (`0x00209ED0`) inside `CUIMgr::Render` on opaque 2D/FMV screens while keeping live `16:9` 3D scenes and full-screen translucent dim quads behind Pause/overlay menus. Leaves 3D post-FX, bloom, motion blur, 3D billboards, lens flares, screen flash, and Screen Fader full `16:9`.
+- **4:3 Menu Mouse Remapping (`src/common/mkb_input.{h,cpp}`):**
+  - Narrows the effective guest menu hit-rect to `0.75 * ui_w` horizontally when `widescreen && menu_pillarboxed_43` across `16:9`, `16:10`, `21:9`, `4:3`, and `Integer` scaling, with 3 added cases (7–9) in `MkbRunMenuCoordSelfTest`.
+- **Unit Tests (`tests/gameplay_input_regression.cpp`):**
+  - Added `UiAspectGeometryAndModes` covering pillarbox/local-scale math, inverse mouse mapping, and mode predicates.
+
+### Verification results (2026-11-28, Windows x64 Release)
+
+- `cmake --build out/build/release --parallel`: **PASS** (0 errors, 0 warnings; `suffering.exe` + `suffering.dll`).
+- Live `16:9` (`1280x720`) visual inspection via `--capture-bmp` + `--ui-aspect`: **PASS** across Launcher Tab 1, Surreal Software FMV, Main Menu (`aspect_correct` vs `stretched_16x9`, pure black `0.0` sidebars), Options Menu (circular A/B button icons, pure black `0.0` sidebars), Pause Menu (4:3 centered over uniformly dimmed full-16:9 live 3D), and active 3D Gameplay HUD (`AspectCorrect` 4:3 HUD + square `Photo` quick-item icon vs `MenusAndCrosshair` 16:9 edge-anchored HUD). Note: the brief boot static legal/copyright splash (`gframe=650`) does not render through `sub_00177BB0` and remains full-frame on black.
+- `python -u tools/test_review_fixes.py`: **PASS** (0 failures, including `UiAspectGeometryAndModes`).
+- `python -u tools/run_regression.py --single release_warm`: **PASS** (`rc=0`, `deadzone_drift=0.0`, `revert_err_from_spawn=0.0`, `9,776` polls, `164` checkpoints under default `AspectCorrect`).
+- `python -u tools/test_mkb_controls.py`: **Stage 1, Stage 3, and Stage 4 (Menu Mouse & Click-Through) PASS** (`CoordSelfTest=True`, `MainMenuLMB=True`, `DeadSpaceNoop=True/True`, `Hover=[4, 8, 10, 12, 14]`, `SubmenuLMB/RMB=True/True`, all 4 click-through checks `True`). Stage 2 reported 2 pre-existing local-config failures (`wheel_up_dpad_left`, `wheel_down_dpad_right`) solely because local `out/build/release/settings.toml` has `prev_item_left`/`next_item_right` unbound from mouse wheel (`['None', '3']`, `['None', '4']`).
+- `python -u tools/audit_release.py --allow-remote --allow-dirty --skip-zips --skip-linux-tar`: **PASS** (`gate1_git_history`, `gate2_head_hygiene`, `gate2b_binary_hygiene`, `gate5_protected_media`; `XboxXBERecomp` patch parity preserved).
+- **Not run in this session:** Linux `x86_64` / Vulkan build & visual check, `-DSUFFERING_ALLOW_NO_XBE=ON` CI build, Debug/cold-Z passes of `run_regression.py`, and live armed-weapon crosshair visual capture (verified via unit test and reticle widget hooks; Torque has no firearm at `1a PrisonDeathRow` spawn).
 
 ## Current status
 

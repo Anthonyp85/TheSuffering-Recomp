@@ -15,6 +15,7 @@
 #include "common/input_recorder.h"
 #include "common/mkb_input.h"
 #include "common/settings_ui.h"
+#include "common/ui_aspect.h"
 #include "common/ui_common.h"
 #include "common/update_checker.h"
 #include "common/version.h"
@@ -900,6 +901,16 @@ void UiInit() {
             g_capture_ui_path = fs::path(args[i].substr(17));
         } else if (args[i] == L"--capture-ui-exit") {
             g_capture_ui_exit = true;
+        } else if (args[i] == L"--ui-aspect" && i + 1 < args.size()) {
+            ui_aspect::Mode parsed = ui_aspect::Mode::AspectCorrect;
+            if (ui_aspect::ParseModeToken(WideToUtf8Str(args[++i]).c_str(), parsed)) {
+                ui_aspect::SetTransientCliMode(parsed);
+            }
+        } else if (args[i].rfind(L"--ui-aspect=", 0) == 0) {
+            ui_aspect::Mode parsed = ui_aspect::Mode::AspectCorrect;
+            if (ui_aspect::ParseModeToken(WideToUtf8Str(args[i].substr(12)).c_str(), parsed)) {
+                ui_aspect::SetTransientCliMode(parsed);
+            }
         } else if (args[i].rfind(L"--capture-", 0) == 0 || args[i].rfind(L"--replay-input", 0) == 0) {
             g_suppress_warmup_toast = true;
         }
@@ -943,6 +954,16 @@ void UiInit() {
             g_capture_ui_path = fs::path(args[i].substr(17));
         } else if (args[i] == "--capture-ui-exit") {
             g_capture_ui_exit = true;
+        } else if (args[i] == "--ui-aspect" && i + 1 < args.size()) {
+            ui_aspect::Mode parsed = ui_aspect::Mode::AspectCorrect;
+            if (ui_aspect::ParseModeToken(args[++i].c_str(), parsed)) {
+                ui_aspect::SetTransientCliMode(parsed);
+            }
+        } else if (args[i].rfind("--ui-aspect=", 0) == 0) {
+            ui_aspect::Mode parsed = ui_aspect::Mode::AspectCorrect;
+            if (ui_aspect::ParseModeToken(args[i].substr(12).c_str(), parsed)) {
+                ui_aspect::SetTransientCliMode(parsed);
+            }
         } else if (args[i].rfind("--capture-", 0) == 0 || args[i].rfind("--replay-input", 0) == 0) {
             g_suppress_warmup_toast = true;
         }

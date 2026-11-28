@@ -16,6 +16,7 @@
 
 #include "common/mkb_input.h"
 #include "common/ui_common.h"
+#include "common/ui_aspect.h"
 #include "common/input_recorder.h"
 #include "game/cheats.h"
 #include "game/guest_settings.h"
@@ -757,6 +758,37 @@ void DrawUpscalingGraphicsPanel(const UiPanelContext& ctx) {
     // Live effective internal -> output resolution readout
     app::Mode out = app::Output();
     bool wide = (out.width * 2 >= out.height * 3);
+
+    // 6. Widescreen UI & Crosshair Aspect Ratio correction (takes effect immediately, live in-game & launcher)
+    ui_aspect::Mode ui_mode = ui_aspect::GetMode();
+    if (ImGui::BeginCombo("UI & Crosshair Aspect", ui_aspect::ModeLabel(ui_mode))) {
+        for (uint32_t i = 0; i < static_cast<uint32_t>(ui_aspect::Mode::Count); ++i) {
+            auto candidate = static_cast<ui_aspect::Mode>(i);
+            bool selected = (ui_mode == candidate);
+            if (ImGui::Selectable(ui_aspect::ModeLabel(candidate), selected)) {
+                ui_aspect::SetMode(candidate);
+                ui_mode = candidate;
+                app::Save();
+            }
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    if (wide) {
+        ImVec4 badge_col = (ui_mode == ui_aspect::Mode::AspectCorrect)
+                               ? ImVec4(0.45f, 0.90f, 0.55f, 1.0f)
+                               : (ui_mode == ui_aspect::Mode::MenusAndCrosshair
+                                      ? ImVec4(0.60f, 0.86f, 1.0f, 1.0f)
+                                      : ImVec4(0.95f, 0.80f, 0.45f, 1.0f));
+        ImGui::TextColored(badge_col, "UI Aspect Status: %s (16:9 output)%s", ui_aspect::ModeShortLabel(ui_mode),
+                           ui_aspect::HasTransientCliMode() ? " [CLI override]" : "");
+    } else {
+        ImGui::TextDisabled("UI Aspect Status: Native 4:3 output (no horizontal stretch)");
+    }
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("%s", ui_aspect::ModeDescription(ui_mode));
+    ImGui::PopTextWrapPos();
+
     float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
     uint32_t vp_w = uint32_t(std::lround(std::min(float(out.width), float(out.height) * aspect)));
     uint32_t vp_h = uint32_t(std::lround(float(vp_w) / aspect));

@@ -14,6 +14,7 @@
 #include "common/mkb_input.h"
 #include "common/input_recorder.h"
 #include "common/settings_ui.h"
+#include "common/ui_aspect.h"
 
 #include <algorithm>
 #include <array>
@@ -2028,7 +2029,7 @@ bool MkbConsumeMouseLook(float dt, float guest_sens_x, float guest_sens_y, float
 GuestUiPoint MkbTransformPhysicalToGuestUi(float phys_x, float phys_y, uint32_t bb_w, uint32_t bb_h, uint32_t vp_w,
                                            uint32_t vp_h, uint32_t render_w, uint32_t render_h,
                                            uint32_t active_upscaler_mode, bool widescreen, float guest_w,
-                                           float guest_h) {
+                                           float guest_h, bool menu_pillarboxed_43) {
     GuestUiPoint out{};
     if (guest_w <= 1.0f) guest_w = 640.0f;
     if (guest_h <= 1.0f) guest_h = 480.0f;
@@ -2062,10 +2063,23 @@ GuestUiPoint MkbTransformPhysicalToGuestUi(float phys_x, float phys_y, uint32_t 
 
     if (eff_vpw == 0 || eff_vph == 0) return out;
 
-    out.in_viewport = (phys_x >= float(eff_vpx) && phys_x < float(eff_vpx + eff_vpw) &&
-                       phys_y >= float(eff_vpy) && phys_y < float(eff_vpy + eff_vph));
-    out.gx = ((phys_x - float(eff_vpx)) / float(eff_vpw)) * guest_w;
-    out.gy = ((phys_y - float(eff_vpy)) / float(eff_vph)) * guest_h;
+    float ui_x = float(eff_vpx);
+    float ui_y = float(eff_vpy);
+    float ui_w = float(eff_vpw);
+    float ui_h = float(eff_vph);
+
+    // When widescreen 16:9 is active and the current 2D menu is pillarboxed to 4:3
+    // ([80..560] in 640x480 guest space), narrow the active menu rect to the centered 0.75x sub-box.
+    if (widescreen && menu_pillarboxed_43) {
+        const float sub_w = ui_w * ui_aspect::kPillarboxScaleX;
+        ui_x += (ui_w - sub_w) * 0.5f;
+        ui_w = sub_w;
+    }
+
+    out.in_viewport = (phys_x >= ui_x && phys_x < (ui_x + ui_w) &&
+                       phys_y >= ui_y && phys_y < (ui_y + ui_h));
+    out.gx = ((phys_x - ui_x) / ui_w) * guest_w;
+    out.gy = ((phys_y - ui_y) / ui_h) * guest_h;
     out.gx_clamped = std::clamp(out.gx, 0.0f, guest_w);
     out.gy_clamped = std::clamp(out.gy, 0.0f, guest_h);
     return out;
@@ -2114,7 +2128,8 @@ MenuMouseFrame MkbConsumeMenuMouse(float guest_w, float guest_h) {
             bb_h = out_m.height;
         }
         f.pt = MkbTransformPhysicalToGuestUi(px, py, bb_w, bb_h, us.vp_w, us.vp_h, us.render_w, us.render_h,
-                                             us.active_mode, app::Widescreen(), guest_w, guest_h);
+                                             us.active_mode, app::Widescreen(), guest_w, guest_h,
+                                             ui_aspect::IsCurrentMenuPillarboxed43());
     }
     return f;
 }
@@ -2155,6 +2170,24 @@ bool MkbRunMenuCoordSelfTest() {
     auto p6a = MkbTransformPhysicalToGuestUi(100.0f, 720.0f, 2560, 1440, 2560, 1440, 640, 480, int_mode, true);
     auto p6b = MkbTransformPhysicalToGuestUi(1280.0f, 720.0f, 2560, 1440, 2560, 1440, 640, 480, int_mode, true);
     ok = ok && !p6a.in_viewport && p6b.in_viewport && approx_eq(p6b.gx, 320.0f) && approx_eq(p6b.gy, 240.0f);
+    // 7. 4:3 pillarboxed menu inside 16:9 (1280x720 -> active 960x720 @ +160px)
+    auto p7a = MkbTransformPhysicalToGuestUi(80.0f, 360.0f, 1280, 720, 1280, 720, 1280, 720, 0, true, 640.0f, 480.0f, true);
+    auto p7b = MkbTransformPhysicalToGuestUi(160.0f, 360.0f, 1280, 720, 1280, 720, 1280, 720, 0, true, 640.0f, 480.0f, true);
+    auto p7c = MkbTransformPhysicalToGuestUi(640.0f, 360.0f, 1280, 720, 1280, 720, 1280, 720, 0, true, 640.0f, 480.0f, true);
+    auto p7d = MkbTransformPhysicalToGuestUi(1119.0f, 360.0f, 1280, 720, 1280, 720, 1280, 720, 0, true, 640.0f, 480.0f, true);
+    ok = ok && !p7a.in_viewport && approx_eq(p7a.gx_clamped, 0.0f) &&
+         p7b.in_viewport && approx_eq(p7b.gx, 0.0f) &&
+         p7c.in_viewport && approx_eq(p7c.gx, 320.0f) && approx_eq(p7c.gy, 240.0f) &&
+         p7d.in_viewport && p7d.gx > 639.0f && p7d.gx < 640.0f;
+    // 8. 4:3 pillarboxed menu inside 21:9 ultrawide (3440x1440 -> 2560x1440 @ +440 -> 1920x1440 @ +760)
+    auto p8a = MkbTransformPhysicalToGuestUi(600.0f, 720.0f, 3440, 1440, 2560, 1440, 2560, 1440, 0, true, 640.0f, 480.0f, true);
+    auto p8b = MkbTransformPhysicalToGuestUi(760.0f, 720.0f, 3440, 1440, 2560, 1440, 2560, 1440, 0, true, 640.0f, 480.0f, true);
+    auto p8c = MkbTransformPhysicalToGuestUi(1720.0f, 720.0f, 3440, 1440, 2560, 1440, 2560, 1440, 0, true, 640.0f, 480.0f, true);
+    ok = ok && !p8a.in_viewport && p8b.in_viewport && approx_eq(p8b.gx, 0.0f) &&
+         p8c.in_viewport && approx_eq(p8c.gx, 320.0f) && approx_eq(p8c.gy, 240.0f);
+    // 9. Native 4:3 output must NOT shrink even if menu_pillarboxed_43 is passed true
+    auto p9 = MkbTransformPhysicalToGuestUi(0.0f, 384.0f, 1024, 768, 1024, 768, 640, 480, 0, false, 640.0f, 480.0f, true);
+    ok = ok && p9.in_viewport && approx_eq(p9.gx, 0.0f) && approx_eq(p9.gy, 240.0f);
     return ok;
 }
 

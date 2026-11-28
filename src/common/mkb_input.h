@@ -165,7 +165,7 @@ struct GuestUiPoint {
 GuestUiPoint MkbTransformPhysicalToGuestUi(float phys_x, float phys_y, uint32_t bb_w, uint32_t bb_h, uint32_t vp_w,
                                            uint32_t vp_h, uint32_t render_w, uint32_t render_h,
                                            uint32_t active_upscaler_mode, bool widescreen, float guest_w = 640.0f,
-                                           float guest_h = 480.0f);
+                                           float guest_h = 480.0f, bool menu_pillarboxed_43 = false);
 
 // Per-frame menu mouse snapshot consumed on guest thread by CUIMgr::Update hook in src/game/hooks.cpp.
 struct MenuMouseFrame {

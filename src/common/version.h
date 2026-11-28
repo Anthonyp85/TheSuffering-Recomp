@@ -3,10 +3,10 @@
 
 #define SUFFERING_VERSION_MAJOR 1
 #define SUFFERING_VERSION_MINOR 6
-#define SUFFERING_VERSION_PATCH 2
+#define SUFFERING_VERSION_PATCH 3
 
-#define SUFFERING_VERSION_STR "1.6.2"
-#define SUFFERING_VERSION_TAG "v1.6.2"
+#define SUFFERING_VERSION_STR "1.6.3"
+#define SUFFERING_VERSION_TAG "v1.6.3"
 
 #define SUFFERING_GITHUB_REPO "Anthonyp85/TheSuffering-Recomp"
 #define SUFFERING_REPO_URL "https://github.com/Anthonyp85/TheSuffering-Recomp"

@@ -22,7 +22,7 @@ Use repository-relative paths in shared documentation. Do not assume another too
 - **Supported USA Retail XBE SHA-1s:**
   - `extract-xiso` (`0xEB`): `0a4c4e597da1f3b154099ab432c1326cc3dcb08c`
   - Unpatched Redump (`0x7D`): `55c902f622047484bc6c7ea4b1b1d714da2096fc`
-- **Current Release & License:** `v1.6.2` (`src/common/version.h`). All original code in this repo is **`GPL-2.0-or-later`** with the Runtime Upscaler Plugin Exception (`LICENSE`). Third-party notices live in `THIRD_PARTY_NOTICES.md`.
+- **Current Release & License:** `v1.6.3` (`src/common/version.h`). All original code in this repo is **`GPL-2.0-or-later`** with the Runtime Upscaler Plugin Exception (`LICENSE`). Third-party notices live in `THIRD_PARTY_NOTICES.md`.
 
 ---
 
@@ -143,7 +143,7 @@ cmake --build out/build/linux-release --parallel
 # Package self-contained Linux & Steam Deck tarball (bundles compiler/lib/*.so with $ORIGIN RPATH)
 bash release_linux.sh \
   --build-dir out/build/linux-release \
-  --out-tar .local/dist/TheSuffering-Recomp-v1.6.2-linux-x86_64.tar.gz
+  --out-tar .local/dist/TheSuffering-Recomp-v1.6.3-linux-x86_64.tar.gz
 
 # Headless Pre-Game Launcher smoke test (Xvfb + lavapipe)
 SDL_VIDEODRIVER=x11 SDL_AUDIODRIVER=dummy LIBGL_ALWAYS_SOFTWARE=1 \

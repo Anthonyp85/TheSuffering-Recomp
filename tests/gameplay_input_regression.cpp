@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Standalone: clang++ -std=c++17 -Isrc tests/gameplay_input_regression.cpp -o gameplay_input_regression
 #include "common/mkb_input.h"
+#include "common/ui_aspect.h"
 #include "game/gameplay_input_state.h"
 
 #include <cmath>
@@ -84,12 +85,36 @@ void ReservedHostKeysCannotBeBound() {
         Check(suffering::MkbCanBindKey(vk), "ordinary keys and unreserved F keys remain bindable");
     }
 }
+
+void UiAspectGeometryAndModes() {
+    using namespace suffering::ui_aspect;
+    auto approx = [](float a, float b) { return std::fabs(a - b) < 1.0e-4f; };
+    Check(approx(MapGuestXToPillarbox43(0.0f), 80.0f), "4:3 pillarbox maps left edge 0 -> 80");
+    Check(approx(MapGuestXToPillarbox43(320.0f), 320.0f), "4:3 pillarbox preserves center 320 -> 320");
+    Check(approx(MapGuestXToPillarbox43(640.0f), 560.0f), "4:3 pillarbox maps right edge 640 -> 560");
+    // Centered crosshair [304..336] (width 32) -> [308..332] (width 24 = 0.75x)
+    Check(approx(MapQuadXLocalScale075(304.0f, 320.0f), 308.0f), "1:1 crosshair left edge scales 0.75x around center");
+    Check(approx(MapQuadXLocalScale075(336.0f, 320.0f), 332.0f), "1:1 crosshair right edge scales 0.75x around center");
+    // Off-center world-projected reticle around x=480 [464..496] stays centered at 480 with width 24
+    Check(approx(MapQuadXLocalScale075(464.0f, 480.0f), 468.0f), "off-center reticle stays anchored at 3D aim X");
+    Check(approx(MapQuadXLocalScale075(496.0f, 480.0f), 492.0f), "off-center reticle right edge scales 0.75x");
+    Check(ShouldPillarboxMenus(Mode::AspectCorrect) && ShouldPillarboxHud(Mode::AspectCorrect) &&
+              ShouldCorrectCrosshair(Mode::AspectCorrect),
+          "AspectCorrect enables menus, HUD, and crosshair correction");
+    Check(ShouldPillarboxMenus(Mode::MenusAndCrosshair) && !ShouldPillarboxHud(Mode::MenusAndCrosshair) &&
+              ShouldCorrectCrosshair(Mode::MenusAndCrosshair),
+          "MenusAndCrosshair enables menus and crosshair while keeping 16:9 HUD");
+    Check(!ShouldPillarboxMenus(Mode::Stretched16x9) && !ShouldPillarboxHud(Mode::Stretched16x9) &&
+              !ShouldCorrectCrosshair(Mode::Stretched16x9),
+          "Stretched16x9 disables all aspect adjustments");
+}
 }  // namespace
 
 int main() {
     ClothConservesElapsedTime();
     SliderRoundTripDoesNotSaveStaleValue();
     ReservedHostKeysCannotBeBound();
+    UiAspectGeometryAndModes();
     std::printf("gameplay/input regression: %d failure(s)\n", failures);
     return failures ? 1 : 0;
 }
