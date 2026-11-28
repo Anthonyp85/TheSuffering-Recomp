@@ -224,6 +224,7 @@ Additional runtime flags (non-persistent session overrides unless saved via UI):
 - `--no-shader-cache` (`XBE_NO_SHADER_CACHE=1`) — disable persistent DXBC/PSO cache for diagnostics
 - `--perf-log <path.json>` (`XBE_PERF_LOG`) — opt-in 11-metric performance telemetry (`.json` + `.frames.csv`)
 - `--record-input <file.rec>`, `--replay-input <file.rec>`, `--replay-mode hybrid|frame|time`, `--replay-exit`, `--state-log <file.jsonl>` — deterministic input recording & regression replay
+  Recording (`--record-input` or `XBE_INPUT_RECORD`) uses controller input only: native mouse aim, keyboard gameplay input, menu mouse actions, host guest-option overrides, cheats, and native stair assists are disabled for that session to match replay behavior. Connect a gamepad, or use the scripted controller autotest. A recording notice stays visible in-game; saved input preferences are unchanged. The existing `#TSREC 1` format and older controller recordings remain supported; native mouse/keyboard sessions cannot be recorded in this format.
 
 ---
 

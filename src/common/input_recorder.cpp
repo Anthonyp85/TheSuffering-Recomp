@@ -16,6 +16,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -41,6 +42,10 @@
 namespace suffering {
 
 namespace {
+
+std::atomic<bool> g_recording_active{false};
+// Keep the input contract until shutdown, even after WM_CLOSE finalizes the file.
+std::atomic<bool> g_pad_only_recording_session{false};
 
 // Verified read-only guest .data addresses for The Suffering (USA, Title ID 0x4D570015, XDK 5788.1)
 constexpr uint32_t kVaD3dDeviceSwapCount = 0x00216880u + 0x2478u;  // D3D_Device + CDevice_SwapCount
@@ -435,6 +440,26 @@ void WriteStateCheckpoint(RecorderState& st, uint64_t poll_id, uint64_t raw_us, 
     }
 }
 
+void OpenRecFile(RecorderState& st) {
+    std::error_code ec;
+    std::filesystem::path p(st.record_path);
+    if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path(), ec);
+    st.rec_file = std::fopen(st.record_path.c_str(), "wb");
+    if (st.rec_file) {
+        g_pad_only_recording_session.store(true, std::memory_order_release);
+        g_recording_active.store(true, std::memory_order_release);
+        std::fprintf(st.rec_file,
+                     "#TSREC 1\n"
+                     "# title_id=0x4D570015 game=\"The Suffering (USA)\" xdk=5788 poll_port=0\n"
+                     "# input_contract=controller_only native_mouse_keyboard=disabled\n");
+        std::fflush(st.rec_file);
+        LOGR("input_recorder: recording to %s (controller input only; native mouse/keyboard and guest preference overrides disabled; saved controls unchanged)",
+             st.record_path.c_str());
+    } else {
+        LOGE("input_recorder: cannot open record file %s", st.record_path.c_str());
+    }
+}
+
 void FinalizeLocked(RecorderState& st) {
     if (st.finalized) return;
     st.finalized = true;
@@ -445,6 +470,7 @@ void FinalizeLocked(RecorderState& st) {
         std::fflush(st.rec_file);
         std::fclose(st.rec_file);
         st.rec_file = nullptr;
+        g_recording_active.store(false, std::memory_order_release);
         LOGR("input_recorder: finalized %s (total_polls=%llu duration_us=%llu eff_duration_us=%llu rumble=%llu)",
              st.record_path.c_str(), (unsigned long long)st.poll_id, (unsigned long long)st.last_raw_us,
              (unsigned long long)st.eff_us, (unsigned long long)st.rumble_events);
@@ -550,6 +576,12 @@ gpu::CameraFrameData QueryGuestCamera() {
 }
 
 }  // namespace
+
+bool IsInputRecordingActive() { return g_recording_active.load(std::memory_order_acquire); }
+
+bool IsPadOnlyInputSession() {
+    return app::IsReplayOrAutotestActive() || g_pad_only_recording_session.load(std::memory_order_acquire);
+}
 
 void OnInit() {
     perf::SetPhaseCallback(QueryGuestPerfPhase);
@@ -660,21 +692,7 @@ void OnInit() {
         }
     }
 
-    if (!st.record_path.empty()) {
-        std::error_code ec;
-        std::filesystem::path p(st.record_path);
-        if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path(), ec);
-        st.rec_file = std::fopen(st.record_path.c_str(), "wb");
-        if (st.rec_file) {
-            std::fprintf(st.rec_file,
-                         "#TSREC 1\n"
-                         "# title_id=0x4D570015 game=\"The Suffering (USA)\" xdk=5788 poll_port=0\n");
-            std::fflush(st.rec_file);
-            LOGR("input_recorder: recording to %s", st.record_path.c_str());
-        } else {
-            LOGE("input_recorder: cannot open record file %s", st.record_path.c_str());
-        }
-    }
+    if (!st.record_path.empty()) OpenRecFile(st);
     UiInit();
     MkbInit();
 }
@@ -759,7 +777,7 @@ void OnPad(int port, input::Pad& pad) {
     std::lock_guard<std::mutex> guard(st.lock);
 
     const bool replay_or_auto = st.replay_enabled || st.autotest_enabled;
-    const InputMode mode = MkbGetConfig().input_mode;
+    const InputMode mode = IsPadOnlyInputSession() ? InputMode::ControllerOnly : MkbGetConfig().input_mode;
 
     // Detached 250 ms xapi.cpp poller thread (kernel::Current() == nullptr):
     // report virtual pad presence ONLY; never record, merge, or advance replay state from host poller.

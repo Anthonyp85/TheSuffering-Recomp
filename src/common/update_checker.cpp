@@ -1791,7 +1791,26 @@ UpdateStatusSnapshot PerformNetworkUpdateCheck(bool manual) {
                              latest.error.empty() ? "Could not connect to GitHub to check for updates." : latest.error);
 }
 
-#ifndef _WIN32
+#ifdef _WIN32
+// ASCII expressions avoid code-page decoding and PowerShell metacharacters,
+// including smart quotes, when a path is embedded in a script or command.
+std::string PowerShellPathExpression(fs::path path) {
+    auto text = path.make_preferred().u8string();
+    while (text.size() > 3 && (text.back() == '\\' || text.back() == '/')) text.pop_back();
+    constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string encoded;
+    for (size_t i = 0; i < text.size(); i += 3) {
+        uint32_t bits = uint32_t(static_cast<uint8_t>(text[i])) << 16;
+        if (i + 1 < text.size()) bits |= uint32_t(static_cast<uint8_t>(text[i + 1])) << 8;
+        if (i + 2 < text.size()) bits |= uint32_t(static_cast<uint8_t>(text[i + 2]));
+        encoded += alphabet[(bits >> 18) & 63];
+        encoded += alphabet[(bits >> 12) & 63];
+        encoded += i + 1 < text.size() ? alphabet[(bits >> 6) & 63] : '=';
+        encoded += i + 2 < text.size() ? alphabet[bits & 63] : '=';
+    }
+    return "[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('" + encoded + "'))";
+}
+#else
 std::string ShellQuoteSingle(std::string_view s) {
     std::string out = "'";
     for (char c : s) {
@@ -2296,34 +2315,32 @@ std::string BuildUpdateApplyScript(const fs::path& exe_dir,
                                    const fs::path& staging_dir,
                                    uint32_t wait_pid) {
 #ifdef _WIN32
-    auto norm = [](fs::path p) {
-        std::string s = WideToUtf8Str(p.make_preferred().wstring());
-        while (s.size() > 3 && (s.back() == '\\' || s.back() == '/')) s.pop_back();
-        return s;
-    };
-    std::string target_s = norm(exe_dir);
-    std::string root_s = norm(staged_root);
-    std::string stage_s = norm(staging_dir);
-
     std::ostringstream ss;
-    ss << "@echo off\r\n"
-       << "setlocal EnableExtensions\r\n"
-       << "set \"WAIT_PID=" << wait_pid << "\"\r\n"
-       << "set \"TARGET_DIR=" << target_s << "\"\r\n"
-       << "set \"STAGED_ROOT=" << root_s << "\"\r\n"
-       << "set \"STAGE_DIR=" << stage_s << "\"\r\n"
-       << "cd /d \"%TARGET_DIR%\"\r\n"
-       << "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "
-          "\"try { Wait-Process -Id " << wait_pid << " -Timeout 30 -ErrorAction SilentlyContinue } catch {}\" >nul 2>&1\r\n"
-       << "rem Copy updated application files without touching settings.toml, hdd, assets, cache, textures, or .iso files\r\n"
-       << "robocopy \"%STAGED_ROOT%\" \"%TARGET_DIR%\" /E /IS /IT /IM /NP /NFL /NDL /NJH /NJS /R:8 /W:1 "
-          "/XF \"settings.toml\" \"*.iso\" \"*.xiso\" \"*.xbe\" \"*.7z\" \"built.txt\" "
-          "/XD \"hdd\" \"assets\" \"cache\" \"logs\" \"CrashDumps\" \"crashdumps\" \"textures\" \"update_staging\" \"work\" >nul\r\n"
-       << "if %ERRORLEVEL% GEQ 8 exit /b 1\r\n"
-       << "if not exist \"%TARGET_DIR%\\assets\" mkdir \"%TARGET_DIR%\\assets\" >nul 2>&1\r\n"
-       << "if exist \"%TARGET_DIR%\\compiler\\work\\suffering\\built.txt\" del /f /q \"%TARGET_DIR%\\compiler\\work\\suffering\\built.txt\" >nul 2>&1\r\n"
-       << "start \"\" /D \"%TARGET_DIR%\" \"%TARGET_DIR%\\suffering.exe\"\r\n"
-       << "(rd /s /q \"%STAGE_DIR%\" >nul 2>&1 & exit /b 0)\r\n";
+    ss << "$ErrorActionPreference = 'Stop'\r\n"
+       << "$targetDir = " << PowerShellPathExpression(exe_dir) << "\r\n"
+       << "$stagedRoot = " << PowerShellPathExpression(staged_root) << "\r\n"
+       << "$stageDir = " << PowerShellPathExpression(staging_dir) << "\r\n"
+       << "Set-Location -LiteralPath $targetDir\r\n"
+       << "try { Wait-Process -Id " << wait_pid << " -Timeout 30 -ErrorAction SilentlyContinue } catch {}\r\n"
+       << "# Copy application files while preserving settings, saves, media, and caches.\r\n"
+       << "& (Join-Path $env:SystemRoot 'System32\\robocopy.exe') $stagedRoot $targetDir "
+          "/E /IS /IT /IM /NP /NFL /NDL /NJH /NJS /R:8 /W:1 "
+          "/XF 'settings.toml' '*.iso' '*.xiso' '*.xbe' '*.7z' 'built.txt' "
+          "/XD 'hdd' 'assets' 'cache' 'logs' 'CrashDumps' 'crashdumps' 'textures' 'update_staging' 'work' | Out-Null\r\n"
+       << "if ($LASTEXITCODE -ge 8) { exit 1 }\r\n"
+       << "[System.IO.Directory]::CreateDirectory((Join-Path $targetDir 'assets')) | Out-Null\r\n"
+       << "$builtMarker = Join-Path $targetDir 'compiler\\work\\suffering\\built.txt'\r\n"
+       << "if (Test-Path -LiteralPath $builtMarker) { Remove-Item -LiteralPath $builtMarker -Force }\r\n"
+       // Start-Process resolves wildcard syntax even in its FilePath argument.
+       // ProcessStartInfo preserves literal brackets/backticks in install paths.
+       << "$startInfo = New-Object System.Diagnostics.ProcessStartInfo\r\n"
+       << "$startInfo.FileName = Join-Path $targetDir 'suffering.exe'\r\n"
+       << "$startInfo.WorkingDirectory = $targetDir\r\n"
+       << "$startInfo.UseShellExecute = $false\r\n"
+       << "$startInfo.CreateNoWindow = $true\r\n"
+       << "[System.Diagnostics.Process]::Start($startInfo).Dispose()\r\n"
+       << "Remove-Item -LiteralPath $stageDir -Recurse -Force\r\n"
+       << "exit 0\r\n";
     return ss.str();
 #else
     std::string target_q = ShellQuoteSingle(exe_dir.string());
@@ -2378,6 +2395,16 @@ std::string BuildUpdateApplyScript(const fs::path& exe_dir,
 #endif
 }
 
+#ifdef _WIN32
+std::string BuildUpdateApplyCommand(const fs::path& script_path) {
+    // PowerShell's -File handling also interprets wildcards in certain paths.
+    // Read the file literally and execute its contents instead. This command
+    // contains no double quotes, so it can be quoted once for CreateProcessW.
+    return "& ([ScriptBlock]::Create([System.IO.File]::ReadAllText(" +
+        PowerShellPathExpression(script_path) + ")))";
+}
+#endif
+
 bool ApplyStagedUpdateAndRelaunch() {
     fs::path exe_dir = app::ExeDir();
     fs::path staged_root;
@@ -2401,13 +2428,13 @@ bool ApplyStagedUpdateAndRelaunch() {
     }
     uint32_t pid = static_cast<uint32_t>(GetCurrentProcessId());
     std::string script = BuildUpdateApplyScript(exe_dir, staged_root, staging_dir, pid);
-    fs::path script_path = staging_dir / "update_apply.cmd";
+    fs::path script_path = staging_dir / "update_apply.ps1";
     {
         std::ofstream out(script_path, std::ios::binary);
         if (!out) {
             std::lock_guard<std::mutex> lk(g_state_mutex);
             g_snapshot.state = UpdateState::Error;
-            g_snapshot.status_message = "Could not write update_apply.cmd helper script.";
+            g_snapshot.status_message = "Could not write update_apply.ps1 helper script.";
             return false;
         }
         out.write(script.data(), std::streamsize(script.size()));
@@ -2415,22 +2442,28 @@ bool ApplyStagedUpdateAndRelaunch() {
 
     wchar_t sys_dir[MAX_PATH]{};
     UINT n = GetSystemDirectoryW(sys_dir, MAX_PATH);
-    fs::path cmd_exe = (n > 0) ? (fs::path(sys_dir) / L"cmd.exe") : fs::path(L"cmd.exe");
-    std::wstring cmd_line = L"\"" + cmd_exe.wstring() + L"\" /d /c \"\"" + script_path.wstring() + L"\"\"";
+    fs::path powershell_exe = (n > 0 && n < MAX_PATH)
+        ? (fs::path(sys_dir) / L"WindowsPowerShell/v1.0/powershell.exe") : fs::path(L"powershell.exe");
+    // The ASCII command decodes the script path itself; no cmd.exe expansion or
+    // PowerShell filename wildcard processing is involved.
+    std::string command = BuildUpdateApplyCommand(script_path);
+    std::wstring cmd_line = L"\"" + powershell_exe.wstring() +
+        L"\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"" +
+        std::wstring(command.begin(), command.end()) + L"\"";
 
     STARTUPINFOW si{sizeof(si)};
     PROCESS_INFORMATION pi{};
     DWORD flags = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
-    if (!CreateProcessW(cmd_exe.c_str(), cmd_line.data(), nullptr, nullptr, FALSE,
+    if (!CreateProcessW(powershell_exe.c_str(), cmd_line.data(), nullptr, nullptr, FALSE,
                         flags, nullptr, exe_dir.c_str(), &si, &pi)) {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         g_snapshot.state = UpdateState::Error;
-        g_snapshot.status_message = "Could not launch update_apply.cmd helper process.";
+        g_snapshot.status_message = "Could not launch update_apply.ps1 helper process.";
         return false;
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    LOGR("update_checker: launched update_apply.cmd for PID %u", pid);
+    LOGR("update_checker: launched update_apply.ps1 for PID %u", pid);
     return true;
 #else
     if (!fs::is_regular_file(staged_root / "suffering", ec)) {

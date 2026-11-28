@@ -32,6 +32,9 @@ jobs:
       - name: Bootstrap & patch XboxXBERecomp SDK
         run: bash setup_sdk.sh
 
+      - name: Run asset-free review regression tests
+        run: python3 tools/test_review_fixes.py --compiler clang++
+
       - name: Configure Linux Release (no copyrighted XBE required)
         run: cmake --preset linux-release -DSUFFERING_ALLOW_NO_XBE=ON
 
@@ -84,6 +87,10 @@ jobs:
       - name: Bootstrap & patch XboxXBERecomp SDK
         shell: cmd
         run: call setup_sdk.bat
+
+      - name: Run asset-free review regression tests
+        shell: cmd
+        run: python tools/test_review_fixes.py --compiler clang++
 
       - name: Configure Windows x64 Release (no copyrighted XBE required)
         shell: cmd

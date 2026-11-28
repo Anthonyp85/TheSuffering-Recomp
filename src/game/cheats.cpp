@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "app/app.h"
+#include "common/input_recorder.h"
 #include "core/log.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
@@ -697,7 +698,7 @@ bool GetToggle(CheatToggle toggle) {
 }
 
 bool IsToggleEffective(CheatToggle toggle) {
-    if (app::IsReplayOrAutotestActive()) return false;
+    if (suffering::IsPadOnlyInputSession()) return false;
     return GetToggle(toggle);
 }
 
@@ -718,13 +719,13 @@ void DisableAllCheats() {
 }
 
 uint32_t GetActiveToggleCount() {
-    if (app::IsReplayOrAutotestActive()) return 0u;
+    if (suffering::IsPadOnlyInputSession()) return 0u;
     return CountRawArmedToggles();
 }
 
 void EnqueueAction(CheatAction action) {
     if (static_cast<size_t>(action) >= kCheatActionCount) return;
-    if (app::IsReplayOrAutotestActive()) return;
+    if (suffering::IsPadOnlyInputSession()) return;
     std::lock_guard<std::mutex> lock(g_state_mutex);
     if (g_pending_actions.size() < 32u) {
         g_pending_actions.push_back(action);
@@ -740,7 +741,7 @@ void ClearActionFeedback() {
 CheatRuntimeStatus GetRuntimeStatus() {
     std::lock_guard<std::mutex> lock(g_state_mutex);
     CheatRuntimeStatus snap = g_runtime_status;
-    snap.replay_active = app::IsReplayOrAutotestActive();
+    snap.replay_active = suffering::IsPadOnlyInputSession();
     snap.active_toggle_count = snap.replay_active ? 0u : CountRawArmedToggles();
     snap.last_action_seq = g_feedback_seq;
     snap.last_action_is_warning = g_feedback_is_warning;
@@ -761,7 +762,7 @@ X86_FUNC(sub_000BF6D0) {
 
     using namespace suffering::cheats;
 
-    if (app::IsReplayOrAutotestActive()) {
+    if (suffering::IsPadOnlyInputSession()) {
         std::lock_guard<std::mutex> lock(g_state_mutex);
         g_pending_actions.clear();
         g_runtime_status = CheatRuntimeStatus{};
@@ -927,7 +928,7 @@ X86_FUNC(sub_0003A850) {
 // Flamethrower part crafting (0x0004AFA7) and level-script quest item filters (0x000276xx / 0x0013F79F) untouched.
 X86_FUNC(sub_0005CE80) {
     using namespace suffering::cheats;
-    if (!app::IsReplayOrAutotestActive() && ValidGuest(ctx.esp, 12u) && ValidGuest(ctx.ecx, 12u)) {
+    if (!suffering::IsPadOnlyInputSession() && ValidGuest(ctx.esp, 12u) && ValidGuest(ctx.ecx, 12u)) {
         const uint32_t ret_eip = X86_MEM32(ctx.esp);
         bool prevent_consume = false;
         if (ret_eip == kRetConsumeReserveAmmo) {

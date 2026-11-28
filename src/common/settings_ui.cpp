@@ -12,6 +12,7 @@
 #endif
 
 #include "common/file_browser_ui.h"
+#include "common/input_recorder.h"
 #include "common/mkb_input.h"
 #include "common/settings_ui.h"
 #include "common/ui_common.h"
@@ -234,7 +235,7 @@ void EnsureInGameStyle(float ui_scale) {
     io.FontGlobalScale = std::clamp(ui_scale / base, 0.75f, 2.5f);
 }
 
-void DrawFpsHud(double fps, float ui_scale) {
+void DrawStatusHud(double fps, float ui_scale, bool show_fps, bool recording) {
     float dt_ms = ImGui::GetIO().DeltaTime * 1000.0f;
     if (dt_ms > 0.0f && dt_ms < 2000.0f) {
         g_ft_ring[g_ft_pos] = dt_ms;
@@ -255,16 +256,21 @@ void DrawFpsHud(double fps, float ui_scale) {
                                            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
                                            ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
     if (ImGui::Begin("##SufferingFpsHud", nullptr, kHudFlags)) {
-        gpu::UpscalerStatus us = gpu::GetUpscalerStatus();
-        if (us.render_w > 0 && us.vp_w > 0) {
-            ImGui::Text("FPS: %.1f | %.2f ms (p99: %.2f) | %s %ux%u -> %ux%u",
-                        fps > 0.0 ? fps : (dt_ms > 0.0f ? 1000.0 / dt_ms : 0.0), dt_ms, p99_ms,
-                        us.active_label.empty() ? "FSR 1.0" : us.active_label.c_str(), us.render_w, us.render_h,
-                        us.vp_w, us.vp_h);
-        } else {
-            app::Mode out = app::Output();
-            ImGui::Text("FPS: %.1f | %.2f ms (p99: %.2f) | %ux%u",
-                        fps > 0.0 ? fps : (dt_ms > 0.0f ? 1000.0 / dt_ms : 0.0), dt_ms, p99_ms, out.width, out.height);
+        if (show_fps) {
+            gpu::UpscalerStatus us = gpu::GetUpscalerStatus();
+            if (us.render_w > 0 && us.vp_w > 0) {
+                ImGui::Text("FPS: %.1f | %.2f ms (p99: %.2f) | %s %ux%u -> %ux%u",
+                            fps > 0.0 ? fps : (dt_ms > 0.0f ? 1000.0 / dt_ms : 0.0), dt_ms, p99_ms,
+                            us.active_label.empty() ? "FSR 1.0" : us.active_label.c_str(), us.render_w, us.render_h,
+                            us.vp_w, us.vp_h);
+            } else {
+                app::Mode out = app::Output();
+                ImGui::Text("FPS: %.1f | %.2f ms (p99: %.2f) | %ux%u",
+                            fps > 0.0 ? fps : (dt_ms > 0.0f ? 1000.0 / dt_ms : 0.0), dt_ms, p99_ms, out.width, out.height);
+            }
+        }
+        if (recording) {
+            ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1.0f), "Recording: controller input only");
         }
     }
     ImGui::End();
@@ -379,7 +385,7 @@ void DrawUpdateAvailableToast(const UpdateStatusSnapshot& snap, float alpha, flo
 bool ShouldShowActiveCheatsHud(const SharedUiOptions& o, uint32_t& out_active_count) {
     out_active_count = 0;
     if (!o.show_cheats_hud) return false;
-    if (g_suppress_warmup_toast || !g_capture_ui_path.empty() || app::IsReplayOrAutotestActive()) return false;
+    if (g_suppress_warmup_toast || !g_capture_ui_path.empty() || IsPadOnlyInputSession()) return false;
     uint32_t count = cheats::GetActiveToggleCount();
     if (count == 0) return false;
     out_active_count = count;
@@ -675,6 +681,7 @@ void DrawSettingsWindow(double fps, float ui_scale) {
                 bool show_launcher = !s.skip_launcher;
                 if (ImGui::Checkbox("Show Pre-Game Launcher on Startup", &show_launcher)) {
                     s.skip_launcher = !show_launcher;
+                    app::MarkSkipLauncherUserEdited();
                     app::Save();
                 }
                 ImGui::TextDisabled("Current render FPS: %.1f  |  Guest Core: CPU %u (mask 0x%llX)", fps,
@@ -1008,7 +1015,7 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
                 if (result) *result = 0;
                 return true;
             }
-            if (wp == VK_F2 && !app::IsReplayOrAutotestActive()) {
+            if (wp == VK_F2 && !IsPadOnlyInputSession()) {
                 if ((lp & (1ll << 30)) == 0) {
                     ToggleOrSwitchCheatsOverlay(hwnd);
                 }
@@ -1130,7 +1137,7 @@ bool UiOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intptr
                 if (result) *result = 0;
                 return true;
             }
-            if (ev->key.key == SDLK_F2 && !app::IsReplayOrAutotestActive()) {
+            if (ev->key.key == SDLK_F2 && !IsPadOnlyInputSession()) {
                 ToggleOrSwitchCheatsOverlay(hwnd_ptr);
                 if (result) *result = 0;
                 return true;
@@ -1280,10 +1287,11 @@ void OnUi(double fps) {
     uint32_t active_cheats_count = 0;
     bool show_cheats_hud = ShouldShowActiveCheatsHud(o, active_cheats_count);
     bool show_fps = o.show_fps_hud || g_force_fps_hud_cli;
-    if (show_fps || open || show_warmup || show_update_toast || show_cheats_hud) {
+    bool recording = IsInputRecordingActive();
+    if (show_fps || recording || open || show_warmup || show_update_toast || show_cheats_hud) {
         float ui_scale = ComputeInGameUiScale();
         EnsureInGameStyle(ui_scale);
-        if (show_fps) DrawFpsHud(fps, ui_scale);
+        if (show_fps || recording) DrawStatusHud(fps, ui_scale, show_fps, recording);
         if (show_cheats_hud) DrawActiveCheatsHud(active_cheats_count, ui_scale);
         if (show_warmup) DrawShaderWarmupToast(warmup_ws, warmup_alpha, ui_scale);
         if (show_update_toast) DrawUpdateAvailableToast(toast_upd_snap, update_toast_alpha, ui_scale);

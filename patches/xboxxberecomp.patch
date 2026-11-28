@@ -341,10 +341,10 @@ index d498066..b0ea800 100644
 +    endif()
  endfunction()
 diff --git a/runtime/app/app.h b/runtime/app/app.h
-index 2b0454c..37e2936 100644
+index 2b0454c..36ecee8 100644
 --- a/runtime/app/app.h
 +++ b/runtime/app/app.h
-@@ -14,38 +14,129 @@ struct Pad;
+@@ -14,38 +14,132 @@ struct Pad;
  namespace app {
  
  enum class DisplayMode : uint32_t { Fullscreen, Borderless, Windowed };
@@ -423,6 +423,9 @@ index 2b0454c..37e2936 100644
  Settings& Get();
  void Load();
  void Save();
++void MarkDisplayModeUserEdited();
++void MarkResolutionUserEdited();
++void MarkSkipLauncherUserEdited();
 +void MarkFpsCapUserEdited();
 +void MarkVsyncUserEdited();
 +void MarkPresentModeUserEdited();
@@ -476,7 +479,7 @@ index 2b0454c..37e2936 100644
  // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
  // image (.iso), which it mounts as D:; false after telling the player what is missing
  struct GameFiles {
-@@ -101,10 +192,21 @@ struct GameInfo {
+@@ -101,10 +195,21 @@ struct GameInfo {
      void (*rumble)(int port, uint16_t& left, uint16_t& right);
      // xbe file name, SHA-1: other releases the executable runs, each from its own [xbe] named config
      std::vector<std::pair<const char*, const char*>> releases;
@@ -3855,7 +3858,7 @@ index 0000000..7261d2e
 +
 +#endif  // !_WIN32
 diff --git a/runtime/app/settings.cpp b/runtime/app/settings.cpp
-index 3258a02..2429fa9 100644
+index 3258a02..b727204 100644
 --- a/runtime/app/settings.cpp
 +++ b/runtime/app/settings.cpp
 @@ -1,4 +1,5 @@
@@ -4292,10 +4295,26 @@ index 3258a02..2429fa9 100644
  }  // namespace
  
  Settings& Get() {
-@@ -33,52 +440,158 @@ Settings& Get() {
+@@ -33,52 +440,174 @@ Settings& Get() {
      return s;
  }
  
++void MarkDisplayModeUserEdited() {
++    g_cli_display_mode = false;
++    g_saved_display_mode = Get().display_mode;
++}
++
++void MarkResolutionUserEdited() {
++    g_cli_width = g_cli_height = false;
++    g_saved_width = Get().width;
++    g_saved_height = Get().height;
++}
++
++void MarkSkipLauncherUserEdited() {
++    g_cli_skip_launcher = false;
++    g_saved_skip_launcher = Get().skip_launcher;
++}
++
 +void MarkFpsCapUserEdited() {
 +    g_cli_fps_cap = false;
 +    g_saved_fps_cap = Get().fps_cap;
@@ -4479,7 +4498,7 @@ index 3258a02..2429fa9 100644
      for (const Option& o : kGame.options) {
          if (o.flag) t.insert(o.key, *o.flag);
          else t.insert(o.key, int64_t(*o.value));
-@@ -96,7 +609,14 @@ void Save() {
+@@ -96,7 +625,14 @@ void Save() {
      std::ofstream f(tmp);
      f << Table() << "\n";
      f.close();
@@ -4495,7 +4514,7 @@ index 3258a02..2429fa9 100644
  }
  
  void LogSettings() {
-@@ -108,8 +628,326 @@ void LogSettings() {
+@@ -108,8 +644,326 @@ void LogSettings() {
          if (!line.empty()) LOGR("  %s", line.c_str());
  }
  
@@ -4823,7 +4842,7 @@ index 3258a02..2429fa9 100644
      MONITORINFOEXW mi{};
      mi.cbSize = sizeof(mi);
      DEVMODEW dm{};
-@@ -117,10 +955,21 @@ Mode Desktop() {
+@@ -117,10 +971,21 @@ Mode Desktop() {
      if (GetMonitorInfoW(mon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_REGISTRY_SETTINGS, &dm))
          return {dm.dmPelsWidth, dm.dmPelsHeight};
      return {uint32_t(GetSystemMetrics(SM_CXSCREEN)), uint32_t(GetSystemMetrics(SM_CYSCREEN))};
@@ -4845,7 +4864,7 @@ index 3258a02..2429fa9 100644
      if (s.width && s.height) return {s.width, s.height};
      return Desktop();
  }
-@@ -129,16 +978,17 @@ Mode Output() {
+@@ -129,16 +994,17 @@ Mode Output() {
  // setting or the window's monitor changes
  Mode CachedOutput() {
      struct Key {
@@ -7426,7 +7445,7 @@ index 275980a..aa0eba6 100644
 +
  }  // namespace gpu
 diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
-index 9ddd87b..1f91d6d 100644
+index 9ddd87b..c0a1eae 100644
 --- a/runtime/gpu/d3d12.cpp
 +++ b/runtime/gpu/d3d12.cpp
 @@ -14,16 +14,24 @@
@@ -10724,7 +10743,7 @@ index 9ddd87b..1f91d6d 100644
              }
          }
          if (b.right <= b.left || b.bottom <= b.top || dx >= dst_t.w || dy >= dst_t.h) continue;
-@@ -3164,20 +5415,30 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count,
+@@ -3164,20 +5415,31 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count,
  
  void D3D12Backend::ResizeSwap() {
      HWND hwnd = static_cast<HWND>(app::Window());
@@ -10755,11 +10774,12 @@ index 9ddd87b..1f91d6d 100644
      CreateBackBufferViews();
      bb_w_ = w;
      bb_h_ = h;
-+    ComputeRenderExtents(render_w_, render_h_, vp_x_, vp_y_, vp_w_, vp_h_);
++    // Keep the scene extents until ApplySettings() after this frame is presented.
++    // It detects the resize, waits for GPU use, then rebuilds targets and upscaler history.
  }
  
  void D3D12Backend::FinishCapture(const Surface& front) {
-@@ -3267,6 +5528,7 @@ void D3D12Backend::RenderUi() {
+@@ -3267,6 +5529,7 @@ void D3D12Backend::RenderUi() {
  }
  
  void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
@@ -10767,7 +10787,7 @@ index 9ddd87b..1f91d6d 100644
      D3D12_RESOURCE_STATES bs = D3D12_RESOURCE_STATE_PRESENT;
      Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
      D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), kRtvCount + bi, rtv_inc_);
-@@ -3274,20 +5536,153 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
+@@ -3274,20 +5537,153 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
      cl_->ClearRenderTargetView(rh, black, 0, nullptr);
      cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
      bound_rt_ = bound_ds_ = nullptr;
@@ -10929,7 +10949,7 @@ index 9ddd87b..1f91d6d 100644
              it = textures_.erase(it);
          } else {
              ++it;
-@@ -3302,8 +5697,16 @@ void D3D12Backend::ResetFrame() {
+@@ -3302,8 +5698,16 @@ void D3D12Backend::ResetFrame() {
          WaitFence(f.fence);
          g_perf.wait += PerfMs(perf_wait);
      }
@@ -10946,7 +10966,7 @@ index 9ddd87b..1f91d6d 100644
      f.used = 0;
      f.srv = 0;
      cl_->Reset(f.alloc.Get(), nullptr);
-@@ -3352,6 +5755,7 @@ void LogPerf() {
+@@ -3352,6 +5756,7 @@ void LogPerf() {
               p.targets / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n,
               (unsigned long long)p.shaders, (unsigned long long)p.psos);
          g_perf = Perf{};
@@ -10954,7 +10974,7 @@ index 9ddd87b..1f91d6d 100644
          perf_start = PerfClock::now();
          perf_frames = 0;
      }
-@@ -3371,22 +5775,125 @@ void D3D12Backend::Present(const Surface& front) {
+@@ -3371,22 +5776,125 @@ void D3D12Backend::Present(const Surface& front) {
      if (ramp_dirty_) UploadGammaRamp();
      Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
  
@@ -11083,7 +11103,7 @@ index 9ddd87b..1f91d6d 100644
      if (diag::Perf()) LogPerf();
      ApplySettings();
  }
-@@ -3398,16 +5905,45 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
+@@ -3398,16 +5906,45 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
  }
  
  void D3D12Backend::ApplySettings() {
@@ -11134,7 +11154,7 @@ index 9ddd87b..1f91d6d 100644
      }
  }
  
-@@ -3432,9 +5968,10 @@ bool D3D12Backend::TargetStale(uint32_t data) const {
+@@ -3432,9 +5969,10 @@ bool D3D12Backend::TargetStale(uint32_t data) const {
  }
  
  // the CPU reads a surface the GPU drew: bring the pixels back
@@ -11146,7 +11166,7 @@ index 9ddd87b..1f91d6d 100644
      PerfScope perf_sync{g_perf.sync};
      g_perf.syncs++;
      if (diag::Perf()) {
-@@ -3442,9 +5979,21 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
+@@ -3442,9 +5980,21 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
                    it->second.w, it->second.h);
      }
      Target& t = it->second;
@@ -11169,7 +11189,7 @@ index 9ddd87b..1f91d6d 100644
      std::vector<uint8_t> px;
      if (!ReadBack(src.res, t.gw, t.gh, px)) return;
      // color targets are 32 bit linear in guest memory, the pitch rounds to 64 bytes
-@@ -3458,16 +6007,19 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
+@@ -3458,16 +6008,19 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
  
  // A NOOVERWRITE lock: the console reads whatever the GPU has finished, so a surface locked every frame gets the newest
  // finished copy (a frame or two old) and the CPU never waits on the GPU; one locked now and then still waits in Sync
@@ -11192,7 +11212,7 @@ index 9ddd87b..1f91d6d 100644
      uint64_t done = fence_->GetCompletedValue();
      uint64_t now = presents_seen_.load();
      int best = -1;
-@@ -3491,7 +6043,6 @@ bool D3D12Backend::DeliverLate(uint32_t data) {
+@@ -3491,7 +6044,6 @@ bool D3D12Backend::DeliverLate(uint32_t data) {
          // the last row is not padded to the pitch: a range to the end of the pitch fails to map
          D3D12_RANGE rr{0, size_t(l.row_pitch) * (l.gh - 1) + l.gw * 4};
          if (FAILED(l.rb[best]->Map(0, &rr, reinterpret_cast<void**>(&p)))) return false;
@@ -11200,7 +11220,7 @@ index 9ddd87b..1f91d6d 100644
          uint8_t* dst = static_cast<uint8_t*>(kernel::HostPtr(data));
          for (uint32_t y = 0; y < l.gh; y++) std::memcpy(dst + size_t(y) * pitch, p + size_t(y) * l.row_pitch, l.gw * 4);
          D3D12_RANGE none{0, 0};
-@@ -3501,6 +6052,73 @@ bool D3D12Backend::DeliverLate(uint32_t data) {
+@@ -3501,6 +6053,73 @@ bool D3D12Backend::DeliverLate(uint32_t data) {
      return true;
  }
  
@@ -11274,7 +11294,7 @@ index 9ddd87b..1f91d6d 100644
  // a slot set for another size: its buffers go with the frame
  void D3D12Backend::ResetLate(Late& l, const Target& t) {
      auto& garbage = CurrentFrame().garbage;
-@@ -3610,23 +6228,27 @@ bool D3D12Backend::ReadBack(ID3D12Resource* res, uint32_t w, uint32_t h, std::ve
+@@ -3610,23 +6229,27 @@ bool D3D12Backend::ReadBack(ID3D12Resource* res, uint32_t w, uint32_t h, std::ve
      UINT64 row_size;
      UINT64 bytes;
      dev_->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &rows, &row_size, &bytes);
@@ -11311,7 +11331,7 @@ index 9ddd87b..1f91d6d 100644
      return true;
  }
  
-@@ -3704,4 +6326,53 @@ void D3D12Backend::SetGamma(const uint8_t* ramp) {
+@@ -3704,4 +6327,53 @@ void D3D12Backend::SetGamma(const uint8_t* ramp) {
  
  std::unique_ptr<Backend> CreateBackend() { return std::make_unique<D3D12Backend>(); }
  
@@ -12936,10 +12956,10 @@ index 6bd6d0b..ac627f2 100644
  bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, Assembled& out);
 diff --git a/runtime/gpu/vulkan.cpp b/runtime/gpu/vulkan.cpp
 new file mode 100644
-index 0000000..4c1cbc3
+index 0000000..caa9811
 --- /dev/null
 +++ b/runtime/gpu/vulkan.cpp
-@@ -0,0 +1,7572 @@
+@@ -0,0 +1,7605 @@
 +// Native Vulkan 1.2 backend for Linux x86_64 & Steam Deck (RADV / NVIDIA / Intel ANV / Mesa llvmpipe).
 +// Implements 100% parity with d3d12.cpp: reversed-Z D32_SFLOAT_S8_UINT, SizedTargetKey Swap(2)/Swap(4),
 +// glslang HLSL->SPIR-V compiler with persistent vk_shaders.bin & vk_psos_*.bin caches, negative-height
@@ -15891,11 +15911,22 @@ index 0000000..4c1cbc3
 +        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
 +        sub.colorAttachmentCount = 1;
 +        sub.pColorAttachments = &ref;
++        // Upscaling, fallback blits, and UI can each load/write this attachment in
++        // separate passes without changing its layout. Preserve their memory dependency.
++        VkSubpassDependency dep{};
++        dep.srcSubpass = VK_SUBPASS_EXTERNAL;
++        dep.dstSubpass = 0;
++        dep.srcStageMask = dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++        dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++        dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++        dep.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
 +        VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
 +        rpi.attachmentCount = 1;
 +        rpi.pAttachments = &att;
 +        rpi.subpassCount = 1;
 +        rpi.pSubpasses = &sub;
++        rpi.dependencyCount = 1;
++        rpi.pDependencies = &dep;
 +        if (vk_.create_rp(dev_, &rpi, nullptr, &present_rp_) != VK_SUCCESS) return false;
 +    }
 +
@@ -16750,11 +16781,31 @@ index 0000000..4c1cbc3
 +    sub.pColorAttachments = has_c ? &color_ref : nullptr;
 +    sub.pDepthStencilAttachment = has_d ? &depth_ref : nullptr;
 +
++    // Re-entering a pass with LOAD still needs a memory dependency when the
++    // previous pass left the color/depth attachment in exactly the same layout.
++    VkSubpassDependency dep{};
++    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
++    dep.dstSubpass = 0;
++    if (has_c) {
++        dep.srcStageMask |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++        dep.srcAccessMask |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++        dep.dstAccessMask |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++    }
++    if (has_d) {
++        dep.srcStageMask |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
++        dep.srcAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++        dep.dstAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++    }
++    dep.dstStageMask = dep.srcStageMask;
++    dep.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
++
 +    VkRenderPassCreateInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
 +    ci.attachmentCount = att_count;
 +    ci.pAttachments = atts;
 +    ci.subpassCount = 1;
 +    ci.pSubpasses = &sub;
++    ci.dependencyCount = (has_c || has_d) ? 1u : 0u;
++    ci.pDependencies = &dep;
 +    VkRenderPass rp = VK_NULL_HANDLE;
 +    vk_.create_rp(dev_, &ci, nullptr, &rp);
 +    rp_cache_[key] = rp;
@@ -20111,7 +20162,9 @@ index 0000000..4c1cbc3
 +    vk_.dev_wait_idle(dev_);
 +    if (!CreateSwapchain(uint32_t(w), uint32_t(h))) return;
 +    if (imgui_inited_) ImGui_ImplVulkan_SetMinImageCount(uint32_t(std::max<size_t>(2, swap_images_.size())));
-+    ComputeRenderExtents(render_w_, render_h_, vp_x_, vp_y_, vp_w_, vp_h_);
++    // ApplySettings() after presentation detects the changed extents and safely
++    // releases scene targets, updates coordinate scales, and prewarms the upscaler.
++    // Defer this even on an acquire retry, which can still hold a front Target*.
 +}
 +
 +void VulkanBackend::BlitFrame(Target& t, uint32_t bi) {

@@ -23,6 +23,12 @@ enum class InputMode : uint32_t {
     ControllerOnly = 2,     // Pure gamepad mode; disables all M&K gameplay merging & hooks
 };
 
+// Keys use canonical Win32 VK values on both Windows and SDL platforms.
+constexpr bool MkbCanBindKey(uint16_t vk) {
+    // F1/F2 overlays, F3/F10 host shortcuts, and OS Windows/Super keys.
+    return vk != 0 && vk != 0x70 && vk != 0x71 && vk != 0x72 && vk != 0x79 && vk != 0x5B && vk != 0x5C;
+}
+
 const char* InputModeName(InputMode mode);
 const char* InputModeToken(InputMode mode);
 
