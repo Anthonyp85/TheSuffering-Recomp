@@ -1202,6 +1202,7 @@ bool RunLauncher(void* hinstance) {
             }
 
             if (ImGui::Checkbox("Skip Launcher on Startup (hold Shift to re-open)", &s.skip_launcher)) {
+                app::MarkSkipLauncherUserEdited();
                 app::Save();
             }
 
@@ -1789,6 +1790,7 @@ bool RunLauncher(void* /*hinstance*/) {
             }
 
             if (ImGui::Checkbox("Skip Launcher on Startup (hold Shift to re-open)", &s.skip_launcher)) {
+                app::MarkSkipLauncherUserEdited();
                 app::Save();
             }
 

@@ -41,9 +41,11 @@
 
 #include "app/app.h"
 #include "common/mkb_input.h"
+#include "common/input_recorder.h"
 #include "common/settings_ui.h"
 #include "core/log.h"
 #include "game/guest_settings.h"
+#include "game/gameplay_input_state.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 #include "xdk/d3d8.h"
@@ -667,7 +669,7 @@ uint32_t LookupMapDisplayEntry(X86Context& ctx, uint8_t* base, uint32_t map_disp
 }
 
 // Native Main Menu "Quit Game" button state (injected directly below "Bonus Material" on CMainMenuGui).
-// Strictly disabled when app::IsReplayOrAutotestActive() is true to preserve 0.0 replay drift.
+// Strictly disabled when suffering::IsPadOnlyInputSession() is true to preserve 0.0 replay drift.
 struct MainMenuQuitState {
     uint32_t menu_va = 0u;
     uint32_t btn_va = 0u;
@@ -684,7 +686,7 @@ MainMenuQuitState g_main_menu_quit{};
 std::atomic<bool> g_host_quit_requested{false};
 
 void RequestCleanHostQuit() {
-    if (app::IsReplayOrAutotestActive()) return;
+    if (suffering::IsPadOnlyInputSession()) return;
     if (g_host_quit_requested.exchange(true, std::memory_order_acq_rel)) return;
     LOGR("ui: Main Menu Quit Game activated; requesting clean host window close");
 #ifdef _WIN32
@@ -838,7 +840,7 @@ void SyncMainMenuQuitButtonState(X86Context& ctx, uint8_t* base, uint32_t menu_v
 }
 
 void EnsureAndSyncMainMenuQuitButton(X86Context& ctx, uint8_t* base, uint32_t menu_va, bool from_layout) {
-    if (app::IsReplayOrAutotestActive()) return;
+    if (suffering::IsPadOnlyInputSession()) return;
     if (!ValidGuest(menu_va, 0x160u) || X86_MEM32(menu_va) != kVtMainMenu) return;
     if (!from_layout && (X86_MEM32(menu_va + 0x04u) & 0x01u) == 0u) return;
 
@@ -928,7 +930,7 @@ bool IsScreenStillActiveTop(uint8_t* base, uint32_t ui_mgr, uint32_t expected_to
 }
 
 void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) {
-    if (app::IsReplayOrAutotestActive() ||
+    if (suffering::IsPadOnlyInputSession() ||
         suffering::MkbGetConfig().input_mode == suffering::InputMode::ControllerOnly ||
         suffering::UiIsOverlayOpen() || suffering::MkbIsInActive3DGameplay()) {
         ClearMenuDragAndFlush();
@@ -1220,7 +1222,7 @@ void HandleMenuMousePostUpdate(X86Context& ctx, uint8_t* base, uint32_t ui_mgr) 
         if (hit.kind == HitKind::Button || hit.kind == HitKind::ListboxRow) {
             FocusChainToWidget(ctx, base, ui_mgr, top, hit.widget, false);
             CallOnAction(ctx, base, top, kActGuiSelect);
-            if (!app::IsReplayOrAutotestActive() && g_main_menu_quit.menu_va == top &&
+            if (!suffering::IsPadOnlyInputSession() && g_main_menu_quit.menu_va == top &&
                 hit.widget == g_main_menu_quit.btn_va) {
                 RequestCleanHostQuit();
             }
@@ -1464,14 +1466,7 @@ bool IsSyncSrscAcquireCallSite(const X86Context& ctx, uint8_t* base) {
 }
 
 // 60 Hz Cloth::Update accumulator for native >60 FPS gameplay (sub_001A6480).
-struct ClothAccumulatorState {
-    uint32_t last_frame_id = UINT32_MAX;
-    float accum = 0.0f;
-    float step_dt = 1.0f / 60.0f;
-    bool step_this_frame = true;
-};
-
-ClothAccumulatorState g_cloth_accum{};
+suffering::gameplay_input::ClothAccumulator g_cloth_accum{};
 
 // Uniquely identifies `English/Levels/2 Cellblocks/2 Cellblocks.lvl` via bounded case-insensitive
 // substring match on CLevelMgr::m_levelPath ([0x002D0D88] / 0x002DEF40, 0x104 bytes).
@@ -1546,7 +1541,7 @@ bool IsDallasAlive(uint8_t* base) {
 }
 
 // Host-persisted CUserSettings (0x002DB218) runtime state & bidirectional sync helpers.
-// Strictly bypassed whenever app::IsReplayOrAutotestActive() is true so recorded traces keep 0.0 drift.
+// Strictly bypassed whenever suffering::IsPadOnlyInputSession() is true so recorded traces keep 0.0 drift.
 struct GuestSettingsRuntimeState {
     std::mutex mtx;
     suffering::guest_settings::GuestUserSettings current{};
@@ -1565,18 +1560,7 @@ bool g_boot_settings_initialized = false;
 bool g_applying_host_to_guest = false;
 bool g_save_pending_after_drag = false;
 
-bool SettingsValuesEqual(const suffering::guest_settings::GuestUserSettings& a,
-                         const suffering::guest_settings::GuestUserSettings& b) {
-    auto feq = [](float x, float y) { return std::fabs(x - y) <= 1.0e-5f; };
-    return a.control_scheme == b.control_scheme && a.invert_pitch == b.invert_pitch && a.vibration == b.vibration &&
-           feq(a.turn_sensitivity, b.turn_sensitivity) && feq(a.pitch_sensitivity, b.pitch_sensitivity) &&
-           a.auto_targeting == b.auto_targeting && a.auto_pitch_correction == b.auto_pitch_correction &&
-           a.checkpoints == b.checkpoints && a.help_text == b.help_text &&
-           a.screen_offset_x == b.screen_offset_x && a.screen_offset_y == b.screen_offset_y &&
-           feq(a.effects_volume, b.effects_volume) && feq(a.dialog_volume, b.dialog_volume) &&
-           feq(a.music_volume, b.music_volume) && a.stereo == b.stereo && a.surround == b.surround &&
-           a.subtitles == b.subtitles;
-}
+using suffering::gameplay_input::SettingsValuesEqual;
 
 suffering::guest_settings::GuestUserSettings ReadSettingsFromGuestRam(uint8_t* base, uint32_t va) {
     suffering::guest_settings::GuestUserSettings s = suffering::guest_settings::MakeDefaultSettings();
@@ -1626,7 +1610,7 @@ void WriteSettingsToGuestRam(uint8_t* base, uint32_t va, const suffering::guest_
 }
 
 void TriggerOrQueueGuestSettingsSave() {
-    if (app::IsReplayOrAutotestActive()) return;
+    if (suffering::IsPadOnlyInputSession()) return;
     GuestSettingsRuntimeState& rt = GuestSettingsRt();
     if (!suffering::UiIsOverlayOpen()) {
         rt.pending_host_save.store(false, std::memory_order_release);
@@ -1639,17 +1623,13 @@ void TriggerOrQueueGuestSettingsSave() {
 void FlushPendingDragSettingsSave() {
     if (!g_save_pending_after_drag) return;
     g_save_pending_after_drag = false;
-    if (app::IsReplayOrAutotestActive()) return;
+    if (suffering::IsPadOnlyInputSession()) return;
 
     bool should_save = false;
     {
         GuestSettingsRuntimeState& rt = GuestSettingsRt();
         std::lock_guard<std::mutex> lock(rt.mtx);
-        if (!SettingsValuesEqual(rt.current, rt.last_saved)) {
-            rt.current.has_saved_values = true;
-            rt.last_saved = rt.current;
-            should_save = true;
-        }
+        should_save = suffering::gameplay_input::FlushMenuSettings(rt.current, rt.last_saved);
     }
     if (should_save) {
         TriggerOrQueueGuestSettingsSave();
@@ -1657,7 +1637,7 @@ void FlushPendingDragSettingsSave() {
 }
 
 void OnGuestSettingsCommittedFromMenu(uint8_t* base) {
-    if (app::IsReplayOrAutotestActive() || !ValidGuest(kVaUserSettings, 0x44u)) return;
+    if (suffering::IsPadOnlyInputSession() || !ValidGuest(kVaUserSettings, 0x44u)) return;
     suffering::guest_settings::GuestUserSettings snap = ReadSettingsFromGuestRam(base, kVaUserSettings);
     snap.has_saved_values = true;
 
@@ -1665,19 +1645,9 @@ void OnGuestSettingsCommittedFromMenu(uint8_t* base) {
     {
         GuestSettingsRuntimeState& rt = GuestSettingsRt();
         std::lock_guard<std::mutex> lock(rt.mtx);
-        if (!SettingsValuesEqual(snap, rt.last_saved) || !rt.current.has_saved_values) {
-            const bool values_changed = !SettingsValuesEqual(snap, rt.last_saved);
-            rt.current = snap;
-            if (values_changed) {
-                if (g_menu_drag.kind == DragKind::AudioSlider || g_menu_drag.kind == DragKind::GameplaySlider) {
-                    g_save_pending_after_drag = true;
-                } else {
-                    rt.last_saved = snap;
-                    g_save_pending_after_drag = false;
-                    should_save_now = true;
-                }
-            }
-        }
+        const bool dragging = g_menu_drag.kind == DragKind::AudioSlider || g_menu_drag.kind == DragKind::GameplaySlider;
+        should_save_now = suffering::gameplay_input::CommitMenuSettings(
+            snap, rt.current, rt.last_saved, dragging, g_save_pending_after_drag);
     }
     if (should_save_now) {
         TriggerOrQueueGuestSettingsSave();
@@ -1754,7 +1724,7 @@ void SyncOpenOptionsScreenFromSettings(X86Context& ctx, uint8_t* base,
 }
 
 void SyncHostSettingsToGuestIfDirty(X86Context& ctx, uint8_t* base) {
-    if (app::IsReplayOrAutotestActive() || !g_boot_settings_initialized) return;
+    if (suffering::IsPadOnlyInputSession() || !g_boot_settings_initialized) return;
     GuestSettingsRuntimeState& rt = GuestSettingsRt();
 
     if (!suffering::UiIsOverlayOpen() && rt.pending_host_save.exchange(false, std::memory_order_acq_rel)) {
@@ -1829,7 +1799,7 @@ void ResetToDefaults(bool push_to_guest) {
 }
 
 bool ConsumePendingHostSaveRequest() {
-    if (app::IsReplayOrAutotestActive()) return false;
+    if (suffering::IsPadOnlyInputSession()) return false;
     return GuestSettingsRt().pending_host_save.exchange(false, std::memory_order_acq_rel);
 }
 
@@ -1920,7 +1890,7 @@ void SetSubtitles(bool enabled) {
 // (0x002BE8E0, 100% identical to Scheme 0 plus R3 -> action 1054 Flashlight Toggle) so the F key
 // toggles the flashlight natively without touching D-Pad or affecting existing controller bindings.
 X86_FUNC(sub_0014E1F0) {
-    if (!app::IsReplayOrAutotestActive() &&
+    if (!suffering::IsPadOnlyInputSession() &&
         suffering::MkbGetConfig().input_mode != suffering::InputMode::ControllerOnly &&
         ValidGuest(ctx.esp + 0x04u, 4u)) {
         if (X86_MEM32(ctx.esp + 0x04u) == 0x002BE260u) {
@@ -1934,11 +1904,11 @@ X86_FUNC(sub_0014E1F0) {
 // 2. CXboxInputDevice::Poll (__thiscall) — post-deadzone framerate-independent linear mouse injection
 // and per-frame live host-to-guest CUserSettings synchronization (even in ControllerOnly mode).
 X86_FUNC(sub_001B09A0) {
-    if (!app::IsReplayOrAutotestActive()) {
+    if (!suffering::IsPadOnlyInputSession()) {
         SyncHostSettingsToGuestIfDirty(ctx, base);
     }
 
-    if (app::IsReplayOrAutotestActive() ||
+    if (suffering::IsPadOnlyInputSession() ||
         suffering::MkbGetConfig().input_mode == suffering::InputMode::ControllerOnly) {
         __imp__sub_001B09A0(ctx, base);
         return;
@@ -1972,7 +1942,7 @@ X86_FUNC(sub_001B09A0) {
 // and optionally bypass controller sticky slowdown ([ent + 0x664]) when mouse_raw_aim is enabled.
 X86_FUNC(sub_000576A0) {
     const uint32_t ent = ctx.ecx;
-    if (app::IsReplayOrAutotestActive() || !suffering::MkbIsMouseLookActive() || !ValidGuest(ent, 0x666u)) {
+    if (suffering::IsPadOnlyInputSession() || !suffering::MkbIsMouseLookActive() || !ValidGuest(ent, 0x666u)) {
         __imp__sub_000576A0(ctx, base);
         return;
     }
@@ -1999,7 +1969,7 @@ X86_FUNC(sub_000576A0) {
 // bypass controller sticky slowdown ([ent + 0x664]).
 X86_FUNC(sub_000505D0) {
     const uint32_t ent = ctx.ecx;
-    if (app::IsReplayOrAutotestActive() || !suffering::MkbIsMouseLookActive() || !ValidGuest(ent, 0x666u) ||
+    if (suffering::IsPadOnlyInputSession() || !suffering::MkbIsMouseLookActive() || !ValidGuest(ent, 0x666u) ||
         !ValidGuest(0x002DB248u, 4u)) {
         __imp__sub_000505D0(ctx, base);
         return;
@@ -2024,7 +1994,7 @@ X86_FUNC(sub_000505D0) {
 // Apply identical yaw slew bypass and decoupled PC pitch polarity during mouse look.
 X86_FUNC(sub_000465F0) {
     const uint32_t ent = ctx.ecx;
-    if (app::IsReplayOrAutotestActive() || !suffering::MkbIsMouseLookActive() || !ValidGuest(ent, 0x186u) ||
+    if (suffering::IsPadOnlyInputSession() || !suffering::MkbIsMouseLookActive() || !ValidGuest(ent, 0x186u) ||
         !ValidGuest(0x002DB248u, 4u)) {
         __imp__sub_000465F0(ctx, base);
         return;
@@ -2057,7 +2027,7 @@ X86_FUNC(sub_00265C7B) {
 // Runs native PC menu mouse hover, click, slider drag/step, wheel scroll, and RMB cancel on the
 // guest thread immediately after CUIMgr flushes deferred pushes and aligns active screens.
 X86_FUNC(sub_0005F9A0) {
-    if (!app::IsReplayOrAutotestActive()) {
+    if (!suffering::IsPadOnlyInputSession()) {
         SyncHostSettingsToGuestIfDirty(ctx, base);
     }
     const uint32_t ui_mgr = ctx.ecx;
@@ -2066,7 +2036,7 @@ X86_FUNC(sub_0005F9A0) {
 }
 
 // 7a. Host-persisted CUserSettings (0x002DB218) lifecycle & persistence hooks
-// (strictly bypassed when app::IsReplayOrAutotestActive() is true so replay traces keep 0.0 drift):
+// (strictly bypassed when suffering::IsPadOnlyInputSession() is true so replay traces keep 0.0 drift):
 //  - sub_00016CA0: CUserSettings::ResetDefaults (__thiscall, ret 0)
 //  - sub_00016B60: CUserSettings::Apply(int apply_audio) (__thiscall, ret 4)
 //  - sub_00016D00: CUserSettings::CopyFrom(const CUserSettings*) (__thiscall, ret 4)
@@ -2074,7 +2044,7 @@ X86_FUNC(sub_0005F9A0) {
 X86_FUNC(sub_00016CA0) {
     const uint32_t self_va = ctx.ecx;
     __imp__sub_00016CA0(ctx, base);
-    if (!app::IsReplayOrAutotestActive() && !g_applying_host_to_guest && self_va == kVaUserSettings &&
+    if (!suffering::IsPadOnlyInputSession() && !g_applying_host_to_guest && self_va == kVaUserSettings &&
         ValidGuest(kVaUserSettings, 0x44u)) {
         const suffering::guest_settings::GuestUserSettings s = suffering::guest_settings::GetSettings();
         if (s.has_saved_values) {
@@ -2085,7 +2055,7 @@ X86_FUNC(sub_00016CA0) {
 
 X86_FUNC(sub_00016B60) {
     const uint32_t self_va = ctx.ecx;
-    if (!app::IsReplayOrAutotestActive() && !g_applying_host_to_guest && self_va == kVaUserSettings &&
+    if (!suffering::IsPadOnlyInputSession() && !g_applying_host_to_guest && self_va == kVaUserSettings &&
         !g_boot_settings_initialized && ValidGuest(kVaUserSettings, 0x44u)) {
         g_boot_settings_initialized = true;
         GuestSettingsRuntimeState& rt = GuestSettingsRt();
@@ -2119,7 +2089,7 @@ X86_FUNC(sub_00016B60) {
 
     __imp__sub_00016B60(ctx, base);
 
-    if (!app::IsReplayOrAutotestActive() && !g_applying_host_to_guest && self_va == kVaUserSettings &&
+    if (!suffering::IsPadOnlyInputSession() && !g_applying_host_to_guest && self_va == kVaUserSettings &&
         g_save_pending_after_drag) {
         FlushPendingDragSettingsSave();
     }
@@ -2128,7 +2098,7 @@ X86_FUNC(sub_00016B60) {
 X86_FUNC(sub_00016D00) {
     const uint32_t dst_va = ctx.ecx;
     __imp__sub_00016D00(ctx, base);
-    if (!app::IsReplayOrAutotestActive() && !g_applying_host_to_guest && dst_va == kVaUserSettings) {
+    if (!suffering::IsPadOnlyInputSession() && !g_applying_host_to_guest && dst_va == kVaUserSettings) {
         OnGuestSettingsCommittedFromMenu(base);
     }
 }
@@ -2137,7 +2107,7 @@ X86_FUNC(sub_00016F10) {
     const uint32_t dst_va = ctx.ecx;
     const bool post_boot_explicit_load = g_boot_settings_initialized;
     __imp__sub_00016F10(ctx, base);
-    if (!app::IsReplayOrAutotestActive() && !g_applying_host_to_guest && dst_va == kVaUserSettings &&
+    if (!suffering::IsPadOnlyInputSession() && !g_applying_host_to_guest && dst_va == kVaUserSettings &&
         ValidGuest(kVaUserSettings, 0x44u)) {
         if (!post_boot_explicit_load) {
             // Cold-boot LoadFromXboxSaveContainer(1, 0) at 0x000BFD3C: keep unlocked Archive/Prelude flags
@@ -2154,7 +2124,7 @@ X86_FUNC(sub_00016F10) {
 }
 
 // 7b. CMainMenuGui "Quit Game" lifecycle, layout, state/cross-fade sync, and activation hooks
-// (strictly bypassed when app::IsReplayOrAutotestActive() is true so replay traces have 0.0 drift):
+// (strictly bypassed when suffering::IsPadOnlyInputSession() is true so replay traces have 0.0 drift):
 //  - sub_0006F2A0: CMainMenuGui::~CMainMenuGui (__thiscall, ret 0)
 //  - sub_0006F450: CMainMenuGui::Layout (__thiscall, ret 0, returns 1 in eax once ready)
 //  - sub_00071B00: CMainMenuGui::Update (__thiscall, ret 0)
@@ -2170,7 +2140,7 @@ X86_FUNC(sub_0006F2A0) {
 X86_FUNC(sub_0006F450) {
     const uint32_t menu_va = ctx.ecx;
     __imp__sub_0006F450(ctx, base);
-    if (!app::IsReplayOrAutotestActive() && ctx.eax != 0u) {
+    if (!suffering::IsPadOnlyInputSession() && ctx.eax != 0u) {
         const uint32_t saved_eax = ctx.eax;
         EnsureAndSyncMainMenuQuitButton(ctx, base, menu_va, true);
         ctx.eax = saved_eax;
@@ -2180,7 +2150,7 @@ X86_FUNC(sub_0006F450) {
 X86_FUNC(sub_00071B00) {
     const uint32_t menu_va = ctx.ecx;
     __imp__sub_00071B00(ctx, base);
-    if (!app::IsReplayOrAutotestActive()) {
+    if (!suffering::IsPadOnlyInputSession()) {
         const uint32_t saved_eax = ctx.eax;
         EnsureAndSyncMainMenuQuitButton(ctx, base, menu_va, false);
         ctx.eax = saved_eax;
@@ -2191,7 +2161,7 @@ X86_FUNC(sub_00072120) {
     const uint32_t listener_va = ctx.ecx;
     const uint32_t sender_va = ValidGuest(ctx.esp + 0x04u, 4u) ? X86_MEM32(ctx.esp + 0x04u) : 0u;
     __imp__sub_00072120(ctx, base);
-    if (!app::IsReplayOrAutotestActive() && listener_va >= 0x60u &&
+    if (!suffering::IsPadOnlyInputSession() && listener_va >= 0x60u &&
         (listener_va - 0x60u) == g_main_menu_quit.menu_va && sender_va != 0u &&
         sender_va == g_main_menu_quit.btn_va) {
         RequestCleanHostQuit();
@@ -2303,37 +2273,22 @@ X86_FUNC(sub_001A3470) {
 // At <= ~71 FPS (g_dt >= 0.014f) passes straight through untouched.
 X86_FUNC(sub_001A6480) {
     const float g_dt = X86_MEMF32(kVaGlobalDt);
+    const uint32_t frame_id = X86_MEM32(kVaFrameCount);
+    const float step_dt = g_cloth_accum.StepForFrame(frame_id, g_dt);
     if (g_dt >= 0.014f || !(g_dt > 0.0f && std::isfinite(g_dt))) {
-        g_cloth_accum.last_frame_id = UINT32_MAX;
-        g_cloth_accum.accum = 0.0f;
-        g_cloth_accum.step_this_frame = true;
         __imp__sub_001A6480(ctx, base);
         return;
     }
 
-    const uint32_t frame_id = X86_MEM32(kVaFrameCount);
-    if (frame_id != g_cloth_accum.last_frame_id) {
-        g_cloth_accum.last_frame_id = frame_id;
-        g_cloth_accum.accum += g_dt;
-        constexpr float kStep60 = 1.0f / 60.0f;
-        if (g_cloth_accum.accum >= kStep60) {
-            g_cloth_accum.step_this_frame = true;
-            g_cloth_accum.step_dt = std::min(g_cloth_accum.accum, 1.0f / 30.0f);
-            g_cloth_accum.accum = std::fmod(g_cloth_accum.accum, kStep60);
-        } else {
-            g_cloth_accum.step_this_frame = false;
-        }
-    }
-
-    if (!g_cloth_accum.step_this_frame) {
+    if (step_dt == 0.0f) {
         ctx.esp += 8u;  // __thiscall ret 0x04
         return;
     }
 
     const float saved_dt = X86_MEMF32(kVaGlobalDt);
     const float saved_inv_dt = X86_MEMF32(kVaGlobalInvDt);
-    X86_MEMF32(kVaGlobalDt) = g_cloth_accum.step_dt;
-    X86_MEMF32(kVaGlobalInvDt) = 1.0f / g_cloth_accum.step_dt;
+    X86_MEMF32(kVaGlobalDt) = step_dt;
+    X86_MEMF32(kVaGlobalInvDt) = 1.0f / step_dt;
     __imp__sub_001A6480(ctx, base);
     X86_MEMF32(kVaGlobalDt) = saved_dt;
     X86_MEMF32(kVaGlobalInvDt) = saved_inv_dt;

@@ -19,4 +19,10 @@ bool OnMessage(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* re
 void OnPad(int port, input::Pad& pad);
 void OnRumble(int port, uint16_t& left, uint16_t& right);
 
+// TSREC 1 serializes Pad only. Successful recording sessions disable native M&K
+// input and guest preference overrides without changing saved controls settings.
+bool IsInputRecordingActive();
+// Also true during legacy replay/autotest; use at native-input hook boundaries.
+bool IsPadOnlyInputSession();
+
 }  // namespace suffering

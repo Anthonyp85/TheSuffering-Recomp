@@ -15,8 +15,8 @@
 #include "common/version.h"
 #include "game/guest_settings.h"
 
-static_assert(SUFFERING_VERSION_MAJOR == 1 && SUFFERING_VERSION_MINOR == 6 && SUFFERING_VERSION_PATCH == 1,
-              "Keep game_info.cpp and suffering.rc synchronized with version.h (v1.6.1)");
+static_assert(SUFFERING_VERSION_MAJOR == 1 && SUFFERING_VERSION_MINOR == 6 && SUFFERING_VERSION_PATCH == 2,
+              "Keep game_info.cpp and suffering.rc synchronized with version.h (v1.6.2)");
 
 namespace {
 
@@ -131,7 +131,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 #endif
 
-// Host application metadata for The Suffering (USA, Original Xbox, Title ID 0x4D570015, Recomp v1.6.1).
+// Host application metadata for The Suffering (USA, Original Xbox, Title ID 0x4D570015, Recomp v1.6.2).
 const app::GameInfo app::kGame = {
     .title = L"The Suffering",
     .short_title = L"The Suffering",

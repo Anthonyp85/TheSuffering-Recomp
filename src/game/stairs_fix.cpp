@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "app/app.h"
+#include "common/input_recorder.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 
@@ -760,7 +761,7 @@ struct ScopedGuestFloatRestore {
 //         when standing on a flat landing) as allow_step, dropping CGroundSupport on welded landing->ramp seams.
 // ---------------------------------------------------------------------------
 X86_FUNC(sub_00179D60) {
-    if (app::IsReplayOrAutotestActive() || g_active_torque_va == 0u ||
+    if (suffering::IsPadOnlyInputSession() || g_active_torque_va == 0u ||
         !ValidGuest(ctx.esp + 0x04u, 0x24u)) {
         __imp__sub_00179D60(ctx, base);
         return;
@@ -845,7 +846,7 @@ X86_FUNC(sub_00179D60) {
 //     preserving upper-body sphere & underside collision.
 // ---------------------------------------------------------------------------
 X86_FUNC(sub_001709C0) {
-    if (app::IsReplayOrAutotestActive() || ctx.ecx == 0u || ctx.ecx != g_active_collider_va ||
+    if (suffering::IsPadOnlyInputSession() || ctx.ecx == 0u || ctx.ecx != g_active_collider_va ||
         !ValidGuest(ctx.ecx, 0x19Eu) || !ValidGuest(ctx.esp + 0x04u, 4u)) {
         __imp__sub_001709C0(ctx, base);
         return;
@@ -966,7 +967,7 @@ X86_FUNC(sub_001709C0) {
 //      (0x001744D5) instead of blindly adding the unswept post-collision slide vector into solid geometry.
 // ---------------------------------------------------------------------------
 X86_FUNC(sub_00174340) {
-    if (app::IsReplayOrAutotestActive() || ctx.ecx == 0u || ctx.ecx != g_active_collider_va ||
+    if (suffering::IsPadOnlyInputSession() || ctx.ecx == 0u || ctx.ecx != g_active_collider_va ||
         !ValidGuest(ctx.ecx, 0x19Eu)) {
         __imp__sub_00174340(ctx, base);
         return;
@@ -1061,7 +1062,7 @@ X86_FUNC(sub_00174340) {
 //    60/120/240 FPS so Torque always gets >= 8 spatial substeps per frame (matching 30 FPS precision).
 // ---------------------------------------------------------------------------
 X86_FUNC(sub_00174530) {
-    if (app::IsReplayOrAutotestActive() || ctx.ecx == 0u || ctx.ecx != g_active_collider_va ||
+    if (suffering::IsPadOnlyInputSession() || ctx.ecx == 0u || ctx.ecx != g_active_collider_va ||
         !ValidGuest(ctx.ecx, 0x19Eu)) {
         __imp__sub_00174530(ctx, base);
         return;
@@ -1090,7 +1091,7 @@ X86_FUNC(sub_00174530) {
 //    so Docks & Quarry 40..57 deg staircases do not leave Torque stuck in State 9 (Fall).
 // ---------------------------------------------------------------------------
 X86_FUNC(sub_0003CE90) {
-    if (app::IsReplayOrAutotestActive() || ctx.ecx == 0u || ctx.ecx != g_active_torque_va ||
+    if (suffering::IsPadOnlyInputSession() || ctx.ecx == 0u || ctx.ecx != g_active_torque_va ||
         !ValidGuest(ctx.ecx, 0x790u)) {
         __imp__sub_0003CE90(ctx, base);
         return;
@@ -1123,7 +1124,7 @@ X86_FUNC(sub_0003CE90) {
 //     D. Staircase V-crease / railing anti-wedge recovery in both State 9 (Fall) and ON_GROUND pinches.
 // ---------------------------------------------------------------------------
 X86_FUNC(sub_0005BF60) {
-    if (app::IsReplayOrAutotestActive() || !ValidGuest(ctx.ecx, 0x790u) ||
+    if (suffering::IsPadOnlyInputSession() || !ValidGuest(ctx.ecx, 0x790u) ||
         X86_MEM32(ctx.ecx) != kVtTorquePrimary) {
         __imp__sub_0005BF60(ctx, base);
         return;

@@ -16,6 +16,7 @@
 
 #include "common/mkb_input.h"
 #include "common/ui_common.h"
+#include "common/input_recorder.h"
 #include "game/cheats.h"
 #include "game/guest_settings.h"
 
@@ -509,6 +510,9 @@ void ResetAllSettingsToDefaults() {
     app::MarkUpscalerUserEdited();
     app::MarkGpuAdapterUserEdited();
     app::MarkHardwarePresetUserEdited();
+    app::MarkDisplayModeUserEdited();
+    app::MarkResolutionUserEdited();
+    app::MarkSkipLauncherUserEdited();
     guest_settings::ResetToDefaults(true);
     MkbResetDefaults();
     app::Save();
@@ -865,6 +869,7 @@ void DrawDisplayGpuPanel(const UiPanelContext& ctx) {
     int mode_idx = std::clamp(int(s.display_mode), 0, 2);
     if (ImGui::Combo("Display Mode", &mode_idx, mode_names, 3)) {
         s.display_mode = app::DisplayMode(mode_idx);
+        app::MarkDisplayModeUserEdited();
         app::Save();
         if (ctx.on_display_changed) ctx.on_display_changed();
     }
@@ -920,6 +925,7 @@ void DrawDisplayGpuPanel(const UiPanelContext& ctx) {
             if (ImGui::Selectable("Desktop Native", s.width == 0 && s.height == 0)) {
                 s.width = 0;
                 s.height = 0;
+                app::MarkResolutionUserEdited();
                 app::Save();
                 if (ctx.on_display_changed) ctx.on_display_changed();
             }
@@ -932,6 +938,7 @@ void DrawDisplayGpuPanel(const UiPanelContext& ctx) {
                     if (ImGui::Selectable(opt, s.width == r.width && s.height == r.height)) {
                         s.width = r.width;
                         s.height = r.height;
+                        app::MarkResolutionUserEdited();
                         app::Save();
                         if (ctx.on_display_changed) ctx.on_display_changed();
                     }
@@ -1777,7 +1784,7 @@ void DrawCheatsPanel(float ui_scale, const std::function<void(const std::string&
     const float s = std::clamp(ui_scale, 1.0f, 2.5f);
     SharedUiOptions& ui_opts = GetSharedUiOptions();
     const cheats::CheatRuntimeStatus st = cheats::GetRuntimeStatus();
-    const bool replay_locked = st.replay_active;
+    const bool replay_locked = st.replay_active || IsPadOnlyInputSession();
     const bool has_active_cheats = !replay_locked && st.active_toggle_count > 0;
     const bool can_run_actions = !replay_locked && st.in_level && st.player_alive;
 
@@ -1819,7 +1826,7 @@ void DrawCheatsPanel(float ui_scale, const std::function<void(const std::string&
         ImGui::AlignTextToFramePadding();
         if (replay_locked) {
             ImGui::TextColored(ImVec4(0.96f, 0.44f, 0.42f, 1.0f),
-                               "Deterministic Replay / Autotest Active - All cheats & actions are suppressed.");
+                               "Recording / Replay / Autotest Active - All cheats & actions are suppressed.");
         } else if (st.in_level) {
             if (!st.player_alive) {
                 ImGui::TextColored(ImVec4(0.96f, 0.38f, 0.38f, 1.0f), "[PLAYER DOWN]");

@@ -12,6 +12,7 @@
 #endif
 
 #include "common/mkb_input.h"
+#include "common/input_recorder.h"
 #include "common/settings_ui.h"
 
 #include <algorithm>
@@ -75,9 +76,7 @@ constexpr uint16_t VK_RWIN = 0x5C;
 constexpr uint16_t VK_NUMPAD0 = 0x60;
 constexpr uint16_t VK_NUMPAD9 = 0x69;
 constexpr uint16_t VK_F1 = 0x70;
-constexpr uint16_t VK_F3 = 0x72;
 constexpr uint16_t VK_F4 = 0x73;
-constexpr uint16_t VK_F10 = 0x79;
 constexpr uint16_t VK_F12 = 0x7B;
 constexpr uint16_t VK_LSHIFT = 0xA0;
 constexpr uint16_t VK_RSHIFT = 0xA1;
@@ -559,7 +558,7 @@ void AdvanceWheelQueue(int& queue, int& hold, int& gap) {
 #ifdef _WIN32
 void ApplyClipRect(HWND hwnd, bool capture) {
     MkbRuntimeState& rt = Rt();
-    if (app::IsReplayOrAutotestActive()) return;
+    if (suffering::IsPadOnlyInputSession()) return;
     if (capture && hwnd && IsWindow(hwnd)) {
         ReleaseMenuDragCapture(rt, hwnd);
         RECT cr{};
@@ -597,7 +596,7 @@ void ApplyClipRect(HWND hwnd, bool capture) {
 #else
 void ApplyClipRect(void* win_ptr, bool capture) {
     MkbRuntimeState& rt = Rt();
-    if (app::IsReplayOrAutotestActive()) return;
+    if (suffering::IsPadOnlyInputSession()) return;
     SDL_Window* win = static_cast<SDL_Window*>(win_ptr);
     if (capture && win) {
         ReleaseMenuDragCapture(rt, win_ptr);
@@ -1160,7 +1159,7 @@ bool MkbHandleRebindMessage(uint32_t msg, uintptr_t wp, intptr_t lp) {
             if (vk == VK_DELETE) {
                 captured = BindSlot{};
                 commit = true;
-            } else if (vk != VK_F1 && vk != VK_F3 && vk != VK_LWIN && vk != VK_RWIN) {
+            } else if (MkbCanBindKey(vk)) {
                 captured = MakeKey(vk);
                 commit = true;
             } else {
@@ -1218,7 +1217,7 @@ bool MkbHandleRebindMessage(uint32_t msg, uintptr_t wp, intptr_t lp) {
             if (vk == VK_DELETE) {
                 captured = BindSlot{};
                 commit = true;
-            } else if (vk != 0 && vk != VK_F1 && vk != VK_F3 && vk != VK_LWIN && vk != VK_RWIN) {
+            } else if (MkbCanBindKey(vk)) {
                 captured = MakeKey(vk);
                 commit = true;
             } else {
@@ -1338,7 +1337,7 @@ bool MkbIsInActive3DGameplay() { return MkbSampleGuestContext().in_active_3d_gam
 
 bool MkbShouldCaptureCursor() {
     MkbRuntimeState& rt = Rt();
-    if (app::IsReplayOrAutotestActive()) return false;
+    if (suffering::IsPadOnlyInputSession()) return false;
     if (rt.cfg.input_mode == InputMode::ControllerOnly) return false;
     if (UiIsOverlayOpen()) return false;
     if (!rt.focused.load(std::memory_order_acquire)) return false;
@@ -1460,7 +1459,7 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
             break;
     }
 
-    if (app::IsReplayOrAutotestActive() || rt.cfg.input_mode == InputMode::ControllerOnly || UiIsOverlayOpen()) {
+    if (suffering::IsPadOnlyInputSession() || rt.cfg.input_mode == InputMode::ControllerOnly || UiIsOverlayOpen()) {
         return false;
     }
 
@@ -1506,7 +1505,7 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
         }
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN: {
-            if (wp == VK_F1 || wp == VK_F3 || wp == VK_F10) return false;
+            if (!MkbCanBindKey(uint16_t(wp))) return false;
             // Allow Alt+Enter / Alt+F4 to flow to Windows/host
             if ((GetKeyState(VK_MENU) & 0x8000) != 0 && (wp == VK_RETURN || wp == VK_F4)) return false;
             uint16_t vk = NormalizeVirtualKey(wp, lp);
@@ -1703,7 +1702,7 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
             break;
     }
 
-    if (app::IsReplayOrAutotestActive() || rt.cfg.input_mode == InputMode::ControllerOnly || UiIsOverlayOpen()) {
+    if (suffering::IsPadOnlyInputSession() || rt.cfg.input_mode == InputMode::ControllerOnly || UiIsOverlayOpen()) {
         return false;
     }
 
@@ -1728,7 +1727,7 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
         }
         case SDL_EVENT_KEY_DOWN: {
             uint16_t vk = SdlScancodeToVk(ev->key.scancode);
-            if (vk == 0 || vk == VK_F1 || vk == VK_F3 || vk == VK_F10) return false;
+            if (!MkbCanBindKey(vk)) return false;
             if ((ev->key.mod & SDL_KMOD_ALT) != 0 && (vk == VK_RETURN || vk == VK_F4)) return false;
             std::lock_guard<std::mutex> lock(rt.input_lock);
             if (vk < 256) rt.keys[vk] = true;
@@ -1841,7 +1840,7 @@ bool MkbOnMessage(void* hwnd_ptr, uint32_t msg, uintptr_t wp, intptr_t lp, intpt
 
 void MkbMergeGameplayPad(input::Pad& pad) {
     MkbRuntimeState& rt = Rt();
-    if (app::IsReplayOrAutotestActive() || rt.cfg.input_mode == InputMode::ControllerOnly) return;
+    if (suffering::IsPadOnlyInputSession() || rt.cfg.input_mode == InputMode::ControllerOnly) return;
 
     GuestContext gc = MkbSampleGuestContext();
 
@@ -1979,7 +1978,7 @@ void MkbNotifyScheme1HookApplied() { Rt().scheme1_applied.store(true, std::memor
 
 bool MkbIsMouseLookActive() {
     MkbRuntimeState& rt = Rt();
-    if (app::IsReplayOrAutotestActive() || rt.cfg.input_mode == InputMode::ControllerOnly) return false;
+    if (suffering::IsPadOnlyInputSession() || rt.cfg.input_mode == InputMode::ControllerOnly) return false;
     return rt.mouse_look_active.load(std::memory_order_acquire);
 }
 
@@ -1987,7 +1986,7 @@ bool MkbConsumeMouseLook(float dt, float guest_sens_x, float guest_sens_y, float
     MkbRuntimeState& rt = Rt();
     out_look_x = 0.0f;
     out_look_y = 0.0f;
-    if (app::IsReplayOrAutotestActive() || rt.cfg.input_mode == InputMode::ControllerOnly) return false;
+    if (suffering::IsPadOnlyInputSession() || rt.cfg.input_mode == InputMode::ControllerOnly) return false;
 
     double dx = 0.0, dy = 0.0;
     {
@@ -2075,7 +2074,7 @@ GuestUiPoint MkbTransformPhysicalToGuestUi(float phys_x, float phys_y, uint32_t 
 MenuMouseFrame MkbConsumeMenuMouse(float guest_w, float guest_h) {
     MkbRuntimeState& rt = Rt();
     MenuMouseFrame f{};
-    if (app::IsReplayOrAutotestActive() || rt.cfg.input_mode == InputMode::ControllerOnly || UiIsOverlayOpen() ||
+    if (suffering::IsPadOnlyInputSession() || rt.cfg.input_mode == InputMode::ControllerOnly || UiIsOverlayOpen() ||
         !rt.focused.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(rt.input_lock);
         rt.menu_lmb_pressed = false;

@@ -57,10 +57,15 @@ int CompareSemVer(const SemVer& a, const SemVer& b);
 bool IsRemoteVersionNewer(const std::string& local_ver, const std::string& remote_tag_or_ver);
 std::string ComputeSha256Hex(const void* data, size_t size);
 UpdateStatusSnapshot EvaluateReleaseJson(const std::string& json_text, bool manual_check = false);
+// Windows: ASCII PowerShell script with encoded Unicode path literals; Linux: POSIX shell script.
 std::string BuildUpdateApplyScript(const std::filesystem::path& exe_dir,
                                    const std::filesystem::path& staged_root,
                                    const std::filesystem::path& staging_dir,
                                    uint32_t wait_pid);
+#ifdef _WIN32
+// ASCII PowerShell command that reads a script using its literal Unicode path.
+std::string BuildUpdateApplyCommand(const std::filesystem::path& script_path);
+#endif
 
 // Returns false when headless test/CI flags (--launcher-exit, --capture-launcher-bmp, --replay, --record, etc.)
 // are present in GetProcessArgsUtf8(), UNLESS SUFFERING_UPDATE_MOCK_JSON is set in the environment.
@@ -81,7 +86,7 @@ void OpenReleasePageInBrowser(const std::string& url = "");
 // Transitions state -> Downloading -> ReadyToRestart (or Error on failure).
 bool StartDownloadAndStageUpdate();
 
-// Writes update_apply.cmd (Win32) or update_apply.sh (Linux) and spawns the detached updater helper process
+// Writes update_apply.ps1 (Win32) or update_apply.sh (Linux) and spawns the detached updater helper process
 // to wait for current PID exit, copy app files while preserving user data/settings/saves/ISO, clear built.txt,
 // relaunch the updated executable, and clean up update_staging/. Caller should exit cleanly when this returns true.
 bool ApplyStagedUpdateAndRelaunch();
