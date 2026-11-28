@@ -4,13 +4,12 @@ Updated: 2026-11-27. This is the shared resume document for Gemini/Antigravity, 
 
 ## Current work
 
-All eight repository-review findings are fixed and verified as described below. The base is release `v1.6.1`, commit `83ed39a`; the SDK remains pinned to `cc9edda3a821a4204dc28783f429b88a27ade4f9`. No release bump, push, or publication was made.
+Release `v1.6.2` prepares and delivers all eight repository-review fixes on top of `v1.6.1` (`83ed39a`), while keeping the `XboxXBERecomp` SDK pinned to `cc9edda3a821a4204dc28783f429b88a27ade4f9` and carrying all SDK runtime changes in `patches/xboxxberecomp.patch`.
 
-The fixes, regression tests, and shared context files are committed together on `main` in the commit containing this update, titled `Fix eight review findings and add shared coding-tool handoff`. Use `git log -1 --format='%h %s' -- docs/PROJECT_STATE.md` to identify it. The review worktree and original checkout have matching source and patched SDK files. The original checkout's previous files were backed up under `.local/review_fix_backup_<UTC timestamp>/`, with a SHA-256 manifest.
+- Commit `5876e4c07c98724719d3d1d5d9f3d1b8d6d85b75` (*"Fix eight review findings and add shared coding-tool handoff"*) contains the eight fixes, regression tests, CI regression step additions, and shared coding-tool entry points (`AGENTS.md`, `GEMINI.md`, `CLAUDE.md`, `docs/PROJECT_STATE.md`).
+- The `release/v1.6.2` branch preserves `5876e4c` and adds the synchronized `v1.6.2` version bump (`version.h`, `game_info.cpp`, `suffering.rc`, `suffering.manifest`, `release_linux.sh`, `tools/audit_release.py`, `.github/workflows/build.yml`, `AGENTS.md`, `README.md`, and this handoff).
 
-The original checkout's Windows Release binaries have now been rebuilt from these sources. Build outputs, private assets, dependency caches, and test captures remain ignored local data; a fresh checkout still needs its own build.
-
-## Fix record
+## Fix record (`v1.6.2`)
 
 | Finding | Result | Main code |
 | --- | --- | --- |
@@ -23,41 +22,32 @@ The original checkout's Windows Release binaries have now been rebuilt from thes
 | Reserved F2/F10 keys can be bound but never work | A shared key policy rejects host-reserved keys in both Win32 and SDL rebinding/input paths. | `src/common/mkb_input.*` |
 | Windows updater breaks non-ASCII paths | An ASCII PowerShell helper decodes UTF-8 paths, uses literal filesystem operations, and launches via .NET without wildcard expansion. Existing settings, saves, media, and caches are preserved. | `src/common/update_checker.*` |
 
-Recording native mouse/keyboard input would require a new recording format and matching replay hooks. This change deliberately retains the existing controller format and makes its limitation visible.
+Recording native mouse/keyboard input would require a new recording format and matching replay hooks. `v1.6.2` deliberately retains the existing `#TSREC 1` controller format and makes its controller-only contract visible.
 
-## Validation record (2026-11-27)
+## Validation record (`v1.6.2` candidate, 2026-11-27)
 
-- `python tools/test_review_fixes.py`: PASS. Compiles/exercises production gameplay helpers, recorder/parser and cheat/stair guards, SDK renderer/settings function bodies, and the production updater translation unit. Renderer tests use GPU-call doubles; they are not live GPU validation. Updater tests execute Windows PowerShell and robocopy against disposable folders with Unicode and shell metacharacters, verifying preservation, relaunch, cleanup, and copy-failure behavior.
-- `python tools/test_input_recording.py --check-regression`: PASS. The old recording-selection/guard behavior fails the targeted checks; the final code passes, including legacy recording samples.
-- Windows Release: PASS for both the host-only configuration and the final full build using a private local XBE. Built `suffering.exe` and `suffering.dll` with C++20/LLVM and the MSVC development environment.
-- Linux x86_64 cross-build: PASS for the host-only configuration and the final full build, using LLVM and the existing Ubuntu 22.04 sysroot. Built the ELF host and guest library. This was a Windows-hosted cross-build, not a native Linux execution test.
-- `python -u tools/run_regression.py --single release_warm`: PASS against the final Windows build and the read-only ISO via `XBE_ISO_PATH`. Clean exit after 115.891 seconds; 9,689 polls and 164 state checkpoints; measured deadzone drift `0.0` and revert-to-spawn error `0.0`; no new crash dumps. The harness verified protected media metadata before/after. This was one release replay, not the full nine-pass/debug matrix.
-- `python -u tools/audit_release.py --allow-remote --allow-dirty --skip-zips --skip-linux-tar --skip-media`: PASS for history, source hygiene/SDK patch parity, and binary hygiene. Release archives were not built or audited. Media integrity was checked by the replay harness separately.
-- `git diff --check`: PASS. SDK patch is LF-only and byte-identical to the initialized SDK's diff; forward/reverse applicability was checked.
+- `python -u tools/test_review_fixes.py`: **PASS**. Compiles and exercises production gameplay helpers (`ClothAccumulator`, slider commit/flush, reserved-key policy), controller-only recording/parser and cheat/stair guards, SDK D3D12/Vulkan resize & Vulkan subpass dependency & CLI-override function bodies (using GPU-call doubles, not live Vulkan GPU validation), and the production Windows updater translation unit against disposable folders with Unicode and shell metacharacters.
+- `python -u tools/test_input_recording.py --check-regression`: **PASS**. Confirmed old recording behavior fails (`6` failures) and current code passes (`0` failures), including legacy `#TSREC 1` samples.
+- `cmd /c build.bat --no-prompt`: **PASS**. Rebuilt Windows x64 Release `out/build/release/suffering.exe` and `suffering.dll` (`v1.6.2`, LLVM Clang `23.1.6`, `-O3 -DNDEBUG`) and verified staged official vendor upscaler DLLs.
+- Native Linux `x86_64` (WSL2 Ubuntu 22.04.5 LTS / Clang 14.0.0 / `glibc 2.35`): **PASS**. Configured `linux-release`, built `./suffering`, `./compiler/xbe_recomp`, and `libsuffering.so`, packaged `.local/dist/TheSuffering-Recomp-v1.6.2-linux-x86_64.tar.gz` via `release_linux.sh`, and passed the headless Pre-Game Launcher smoke test under `xvfb-run` + `llvmpipe` (`920x630` capture).
+- Isolated Windows live hybrid replay (`tests/m3_full_regression.rec`): **PASS** against SHA-256-verified copies of the rebuilt `v1.6.2` binaries under `.local/original_verify_*`. Exit code `0`, wall time `113.969s`, `10,498` polls, `171` checkpoints, `deadzone_drift = 0.0`, `revert_err_from_spawn = 0.0`, `rumble_events = 1`, `0` crash dumps; protected media, original settings, and saves unchanged.
+- Isolated Windows M&K + Menu Mouse + UI suite (`tools/test_mkb_controls.py` with default `settings.toml`): **PASS**. Verified Launcher (`920x630`) and in-game `F1` (`1280x720`) Controls captures, 1px micro-aim, 300px flick (`0.0000 deg` coasting), invert-Y polarity, diagonal-normalized WASD (`1.0000`), `F` flashlight, `WheelUp`/`WheelDown` pulses, `Tab`/`Esc` Archives & Pause, all 4 cursor capture states, and all 15 Menu Mouse & Click-Through Suppression checks (`0` crash dumps).
+- Pre-archive hygiene & binary/tarball audit (`tools/audit_release.py` + `git diff --check`): **PASS** across `gate1_git_history`, `gate2_head_hygiene` (exact SDK patch parity, pure LF patch/scripts), `gate2b_binary_hygiene` (zero leaks across Windows & Linux build outputs), `gate4b_linux_tar_gz` (ELF64 / `GLIBC_2.35` / `$ORIGIN` RPATH), and `gate5_protected_media`.
 
-The new aggregate regression command is included in both Windows and Linux CI jobs after SDK setup. Hosted CI has not been run for this change set. Live Vulkan validation layers, physical-controller recording, and interactive widget checks on both platforms remain follow-up coverage; the automated checks and live replay above do not claim those results.
+### Remaining limitations & follow-up coverage
 
-Local review evidence is under `.local/review_*` and `.local/captures_m3/` in the review worktree. These ignored files are not part of the portable handoff. To reproduce elsewhere, initialize the SDK and run the aggregate test, then use the normal README/CMake presets; supply your own local ISO/XBE only for full builds and live replay. Never commit generated game code or assets.
-
-## Original checkout verification before commit
-
-The user requested rebuilding the original checkout, verifying it, and committing all fixes and shared handoff files. The following checks were run in the original checkout on 2026-11-27:
-
-- `build.bat --no-prompt`: PASS. Recompiled affected production code and linked the original checkout's `out/build/release/suffering.exe` and `suffering.dll`. The normal build also staged and verified the cached vendor upscaler plugins.
-- `python tools/test_review_fixes.py`: PASS for all applicable gameplay/input, recorder, renderer/settings, and Windows updater regression checks.
-- Live hybrid replay of `tests/m3_full_regression.rec`: PASS using SHA-256-verified copies of those rebuilt binaries, copied plugins/settings, and fresh test save storage under `.local/original_verify_<suffix>/`. The existing `tools/run_regression.py` harness checked the full state sequence. Exit code `0`, wall time `116.656` seconds, `9,680` polls, `163` checkpoints, deadzone drift `0.0`, revert-to-spawn error `0.0`, and no new crash dumps. Original settings/save contents and metadata, executable/library hashes, and ISO metadata were unchanged by the replay.
-- `python -u tools/audit_release.py --allow-remote --allow-dirty --skip-zips --skip-linux-tar`: PASS for source/history hygiene, SDK patch parity, built binary hygiene, and protected media checks.
-- `git diff --check`: PASS; the SDK pin is unchanged and its full working diff exactly matches the committed patch.
-
-Original-checkout logs are `.local/original_rebuild.log`, `.local/original_live_replay.log`, and `.local/original_audit.log`; replay results/captures are inside the isolated runtime directory. The ignored convenience runner can repeat that isolated check with `python .local/verify_original_runtime.py --repo .` on this machine. Portable verification remains the committed regression suite and replay harness; the convenience runner is not required project source.
+- **Live Vulkan GPU / validation-layer testing:** Renderer synchronization and resize fixes were tested with production-code unit/double harnesses and a headless `xvfb-run` + `llvmpipe` launcher smoke test; live hardware Vulkan 1.2 gameplay with Khronos validation layers remains follow-up coverage.
+- **Physical-controller live recording & DualSense 5 hardware playtest:** Controller-only `#TSREC 1` recording was verified by automated regressions and legacy replay; live recording with a plugged-in physical controller remains follow-up coverage.
+- **Interactive UI edge checks:** Manual interactive testing of every launcher/overlay control combination across platforms remains follow-up coverage.
+- **Hosted GitHub Actions CI & final release archive audits:** Run via PR CI (`release/v1.6.2 -> main`), post-merge `main` CI, and final full-archive `audit_release.py` before tagging/publishing `v1.6.2`.
 
 ## Resume procedure
 
-1. Inspect `git status --short`, `git branch --show-current`, and `git worktree list`. Preserve any subsequent uncommitted changes and verify that the review-fix commit is present in the checkout being resumed.
-2. Read the change and validation record below, then inspect the actual diff. Shared source and this handoff take precedence over stale tool-specific conversation summaries.
-3. The SDK runtime changes are carried in `patches/xboxxberecomp.patch`, not a new submodule revision. On a fresh checkout, run `setup_sdk.bat` or `bash setup_sdk.sh`. If an older patch is already applied, preserve any independent SDK edits before updating it; do not blindly reset the SDK.
-4. Check that no `suffering*` process is running before building or launching tests. Keep the user's ISO/archive and save data untouched. Use `SUFFERING_ALLOW_NO_XBE=ON` for host-only builds without game assets.
-5. After further work, update this document with changes, exact reproducible validation commands, outcomes, and remaining limitations. Keep local paths, credentials, generated game code, and binary artifacts out of Git.
+1. Inspect `git status --short`, `git branch --show-current`, and `git worktree list`. Preserve any uncommitted changes.
+2. Read `AGENTS.md` and this handoff before making changes. Shared tracked files take precedence over stale local notes under `.local/docs_private/`.
+3. SDK runtime changes live in `patches/xboxxberecomp.patch`, not a new submodule revision. On a fresh checkout, run `setup_sdk.bat` or `bash setup_sdk.sh`.
+4. Verify no `suffering*` process is running before building or launching tests. Keep the user's disc image and save data untouched. Use `-DSUFFERING_ALLOW_NO_XBE=ON` for host-only builds without local game media.
+5. After further work, update this document with exact commands, outcomes, and remaining limitations. Keep local paths, credentials, generated game code, and binary artifacts out of Git.
 
 ## Context entry points
 
@@ -65,5 +55,3 @@ Original-checkout logs are `.local/original_rebuild.log`, `.local/original_live_
 - `GEMINI.md`: Gemini context imports plus explicit instructions for Antigravity to read guidance and this state.
 - `CLAUDE.md`: imports the same files for Claude.
 - `README.md`: user-facing behavior and normal build instructions.
-
-The entry points use the documented context mechanisms: [Gemini context files](https://geminicli.com/docs/cli/gemini-md/), [Antigravity rules](https://antigravity.google/docs/rules/), and [Claude project memory](https://code.claude.com/docs/en/memory). Repository files carry project context; they do not transfer private chat history or credentials.
